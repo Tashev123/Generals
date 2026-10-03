@@ -1,0 +1,15 @@
+# Unreal Engine build and temporary folders
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+.vs/
+
+# User-specific configuration files
+Contains/
+*.sln
+*.suo
+*.user
+*.userosscache
+*.sln.docusers
