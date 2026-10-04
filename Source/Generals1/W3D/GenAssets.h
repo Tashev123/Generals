@@ -20,6 +20,12 @@ struct FGenSectionMaterial
 	FLinearColor Emissive = FLinearColor::Black;
 	float Opacity = 1.f;
 	uint8 HouseColorMode = 0;        // 0 none, 1 HOUSECOLOR mesh (tint), 2 ZHC texture (hue shift)
+
+	// Two-pass "W3D Reflectivity" meshes: Texture is alpha-blended over an opaque first pass, which
+	// therefore shows wherever the texture's alpha is below 1 (windows, glass).
+	bool bUnderlay = false;
+	FString UnderTexture;            // environment map of that first pass ("" = plain color)
+	FLinearColor UnderTint = FLinearColor::White;
 };
 
 /** A W3D mesh converted to a runtime UStaticMesh, positioned in its bone's local space (Unreal units). */
@@ -71,6 +77,13 @@ public:
 
 	/** Hierarchy for an HLOD: in the same file, or in <HierarchyName>.w3d. */
 	TSharedPtr<const FGenW3DHierarchy> FindHierarchy(const FString& HierarchyName, const FGenW3DFile* SameFile = nullptr);
+
+	/**
+	 * Drawable::getPristineBonePositions: bones of a model in its base pose (model space, W3D frame),
+	 * untouched by animation. StartIndex 0 looks up the bone called exactly Prefix; otherwise
+	 * "<Prefix>NN" from NN = StartIndex until one is missing (or MaxBones). Returns how many were found.
+	 */
+	int32 GetPristineBones(const FString& ModelName, const FString& Prefix, int32 StartIndex, int32 MaxBones, TArray<FTransform3f>& OutBones);
 
 	/**
 	 * Builds (or returns cached) render mesh for one W3D mesh. Skins are baked into model space

@@ -50,11 +50,95 @@ namespace
 
 	FLinearColor ToLinear(const FColor& C) { return FLinearColor::FromSRGBColor(C); }
 
-	/** First-pass UVs (stage 0) and per-vertex diffuse colors, when present for every vertex. */
+	/** True when every triangle of the pass is drawn with the given blend mode. */
+	bool PassBlendIs(const FGenW3DMesh& M, const FGenW3DMaterialPass& Pass, EGenW3DBlend Blend)
+	{
+		if (Pass.ShaderIds.Num() == 0)
+		{
+			return FGenW3DShader().GetBlend() == Blend;
+		}
+		for (const uint32 Id : Pass.ShaderIds)
+		{
+			if ((M.Shaders.IsValidIndex(Id) ? M.Shaders[Id] : FGenW3DShader()).GetBlend() != Blend)
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool PassIsTextured(const FGenW3DMesh& M, const FGenW3DMaterialPass& Pass)
+	{
+		if (Pass.Stages.Num() == 0 || Pass.Stages[0].TextureIds.Num() == 0)
+		{
+			return false;
+		}
+		for (const uint32 Id : Pass.ShaderIds)
+		{
+			if (M.Shaders.IsValidIndex(Id) && M.Shaders[Id].Texturing != 0)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool PassIsEnvironmentMapped(const FGenW3DMesh& M, const FGenW3DMaterialPass& Pass)
+	{
+		for (const uint32 Id : Pass.VertexMaterialIds)
+		{
+			if (!M.VertexMaterials.IsValidIndex(Id) || !M.VertexMaterials[Id].IsEnvironmentMapped())
+			{
+				return false;
+			}
+		}
+		return Pass.VertexMaterialIds.Num() > 0;
+	}
+
+	/** Which material pass carries the mesh's own texture, and the opaque pass it is blended over (if any). */
+	struct FGenPassLayout
+	{
+		int32 Base = 0;
+		int32 Under = INDEX_NONE;
+	};
+
+	/**
+	 * W3D draws a mesh once per material pass, in order, so what ends up on screen is:
+	 *  - an opaque pass replaces everything drawn before it (CBEuroCnd2: plain color, then the texture);
+	 *  - "W3D Reflectivity" materials (CBIndWhs01 and ~2400 other meshes) draw an opaque environment map
+	 *    (LAKEDUSK, EnvironmentMapperClass) or a plain color first and alpha-blend the real texture over it,
+	 *    so the first pass only shows where the texture's alpha is below 1.
+	 * Any other combination (additive night lights, detail passes, ...) keeps showing pass 0 alone.
+	 */
+	FGenPassLayout GetPassLayout(const FGenW3DMesh& M)
+	{
+		FGenPassLayout L;
+		for (int32 p = 1; p < M.Passes.Num(); ++p)
+		{
+			const FGenW3DMaterialPass& Pass = M.Passes[p];
+			if (PassBlendIs(M, Pass, EGenW3DBlend::Opaque))
+			{
+				L.Base = p;
+				L.Under = INDEX_NONE;
+			}
+			else if (L.Under == INDEX_NONE && p == L.Base + 1 && PassBlendIs(M, Pass, EGenW3DBlend::Alpha) && PassIsTextured(M, Pass))
+			{
+				const FGenW3DMaterialPass& Below = M.Passes[L.Base];
+				if (PassBlendIs(M, Below, EGenW3DBlend::Opaque) && (PassIsEnvironmentMapped(M, Below) || !PassIsTextured(M, Below)))
+				{
+					L.Under = L.Base;
+					L.Base = p;
+				}
+			}
+		}
+		return L;
+	}
+
+	/** Base-pass UVs (stage 0) and per-vertex diffuse colors, when present for every vertex. */
 	void GetVertexStreams(const FGenW3DMesh& M, const TArray<FVector2f>*& OutUVs, const TArray<FColor>*& OutColors)
 	{
 		const int32 NumVerts = M.Vertices.Num();
-		const FGenW3DMaterialPass* Pass = M.Passes.Num() > 0 ? &M.Passes[0] : nullptr;
+		const FGenW3DMaterialPass* Pass = M.Passes.Num() > 0 ? &M.Passes[GetPassLayout(M).Base] : nullptr;
 		const FGenW3DTextureStage* Stage = Pass && Pass->Stages.Num() > 0 ? &Pass->Stages[0] : nullptr;
 		OutUVs = Stage && Stage->TexCoords.Num() == NumVerts ? &Stage->TexCoords : nullptr;
 		OutColors = Pass && Pass->DiffuseColors.Num() == NumVerts ? &Pass->DiffuseColors : nullptr;
@@ -63,22 +147,28 @@ namespace
 	/** Groups triangles into sections by (shader, texture, vertex material) and derives their materials. */
 	void BuildSections(const FGenW3DMesh& M, TArray<FGenSectionMaterial>& OutSections, TArray<int32>& OutTriSection)
 	{
-		const FGenW3DMaterialPass* Pass = M.Passes.Num() > 0 ? &M.Passes[0] : nullptr;
+		const FGenPassLayout Layout = GetPassLayout(M);
+		const FGenW3DMaterialPass* Pass = M.Passes.Num() > 0 ? &M.Passes[Layout.Base] : nullptr;
 		const FGenW3DTextureStage* Stage = Pass && Pass->Stages.Num() > 0 ? &Pass->Stages[0] : nullptr;
+		const FGenW3DMaterialPass* Under = M.Passes.IsValidIndex(Layout.Under) ? &M.Passes[Layout.Under] : nullptr;
+		const FGenW3DTextureStage* UnderStage = Under && Under->Stages.Num() > 0 ? &Under->Stages[0] : nullptr;
 		auto PickId = [](const TArray<uint32>& Ids, int32 Index) -> int32
 		{
 			if (Ids.Num() == 0) { return INDEX_NONE; }
 			return int32(Ids.Num() > 1 && Ids.IsValidIndex(Index) ? Ids[Index] : Ids[0]);
 		};
 
-		TMap<FIntVector, int32> SectionOf;
+		TMap<TPair<FIntVector, FIntVector>, int32> SectionOf;
 		OutTriSection.SetNumUninitialized(M.Triangles.Num());
 		for (int32 t = 0; t < M.Triangles.Num(); ++t)
 		{
 			const int32 ShaderId = Pass ? PickId(Pass->ShaderIds, t) : INDEX_NONE;
 			const int32 TexId = Stage ? PickId(Stage->TextureIds, t) : INDEX_NONE;
 			const int32 VMatId = Pass ? PickId(Pass->VertexMaterialIds, M.Triangles[t].X) : INDEX_NONE;
-			const FIntVector SKey(ShaderId, TexId, VMatId);
+			const int32 UnderShaderId = Under ? PickId(Under->ShaderIds, t) : INDEX_NONE;
+			const int32 UnderTexId = UnderStage ? PickId(UnderStage->TextureIds, t) : INDEX_NONE;
+			const int32 UnderVMatId = Under ? PickId(Under->VertexMaterialIds, M.Triangles[t].X) : INDEX_NONE;
+			const TPair<FIntVector, FIntVector> SKey(FIntVector(ShaderId, TexId, VMatId), FIntVector(UnderShaderId, UnderTexId, UnderVMatId));
 			int32* Existing = SectionOf.Find(SKey);
 			if (!Existing)
 			{
@@ -96,6 +186,20 @@ namespace
 					S.Diffuse = ToLinear(VM.Diffuse);
 					S.Emissive = ToLinear(VM.Emissive);
 					S.Opacity = VM.Opacity;
+				}
+				if (Under)
+				{
+					// The two passes become one opaque material that blends them by the texture's alpha.
+					S.bUnderlay = true;
+					S.Blend = EGenW3DBlend::Opaque;
+					if (M.Textures.IsValidIndex(UnderTexId) && M.Shaders.IsValidIndex(UnderShaderId) && M.Shaders[UnderShaderId].Texturing != 0)
+					{
+						S.UnderTexture = M.Textures[UnderTexId].Name;
+					}
+					if (M.VertexMaterials.IsValidIndex(UnderVMatId))
+					{
+						S.UnderTint = ToLinear(M.VertexMaterials[UnderVMatId].Diffuse);
+					}
 				}
 				S.bTwoSided = M.IsTwoSided();
 				if (M.Name.StartsWith(TEXT("HOUSECOLOR"), ESearchCase::IgnoreCase))
@@ -183,6 +287,52 @@ TSharedPtr<const FGenW3DHierarchy> UGenAssetSubsystem::FindHierarchy(const FStri
 	return File ? File->Hierarchy : nullptr;
 }
 
+int32 UGenAssetSubsystem::GetPristineBones(const FString& ModelName, const FString& Prefix, int32 StartIndex, int32 MaxBones, TArray<FTransform3f>& OutBones)
+{
+	OutBones.Reset();
+	TSharedPtr<const FGenW3DFile> File = LoadW3D(ModelName);
+	if (!File || Prefix.IsEmpty())
+	{
+		return 0;
+	}
+	TSharedPtr<const FGenW3DHierarchy> Hierarchy = File->HLod ? FindHierarchy(File->HLod->HierarchyName, File.Get()) : File->Hierarchy;
+	if (!Hierarchy)
+	{
+		return 0;
+	}
+	// Base pose in model space: each pivot's own transform on top of its parent's.
+	auto ModelSpace = [&Hierarchy](int32 Pivot)
+	{
+		FTransform3f Xf = FTransform3f::Identity;
+		for (int32 Guard = 0; Hierarchy->Pivots.IsValidIndex(Pivot) && Guard < 256; ++Guard)
+		{
+			const FGenW3DPivot& P = Hierarchy->Pivots[Pivot];
+			Xf = Xf * FTransform3f(P.Rotation.GetNormalized(), P.Translation);
+			Pivot = P.Parent;
+		}
+		return Xf;
+	};
+	if (StartIndex == 0)
+	{
+		const int32 Pivot = Hierarchy->FindPivot(Prefix);
+		if (Pivot != INDEX_NONE)
+		{
+			OutBones.Add(ModelSpace(Pivot));
+		}
+		return OutBones.Num();
+	}
+	for (int32 i = StartIndex; OutBones.Num() < MaxBones; ++i)
+	{
+		const int32 Pivot = Hierarchy->FindPivot(FString::Printf(TEXT("%s%02d"), *Prefix, i));
+		if (Pivot == INDEX_NONE)
+		{
+			break;
+		}
+		OutBones.Add(ModelSpace(Pivot));
+	}
+	return OutBones.Num();
+}
+
 UTexture2D* UGenAssetSubsystem::GetTexture(const FString& TextureName)
 {
 	const FString Key = FPaths::GetBaseFilename(TextureName).ToLower();
@@ -251,6 +401,10 @@ UMaterialInterface* UGenAssetSubsystem::GetSectionMaterial(const FGenSectionMate
 	{
 		Key += TEXT("|") + HouseColor.ToString();
 	}
+	if (S.bUnderlay)
+	{
+		Key += FString::Printf(TEXT("|under:%s|%s"), *S.UnderTexture.ToLower(), *S.UnderTint.ToString());
+	}
 	if (TObjectPtr<UMaterialInstanceDynamic>* Found = Materials.Find(Key))
 	{
 		return *Found;
@@ -270,6 +424,16 @@ UMaterialInterface* UGenAssetSubsystem::GetSectionMaterial(const FGenSectionMate
 	MID->SetVectorParameterValue(TEXT("Emissive"), S.Emissive);
 	MID->SetVectorParameterValue(TEXT("HouseColor"), HouseColor);
 	MID->SetScalarParameterValue(TEXT("HouseColorMode"), float(S.HouseColorMode));
+	if (S.bUnderlay)
+	{
+		// Without an environment map the first pass is a plain color: EnvTexture stays white.
+		if (UTexture2D* Env = S.UnderTexture.IsEmpty() ? nullptr : GetTexture(S.UnderTexture))
+		{
+			MID->SetTextureParameterValue(TEXT("EnvTexture"), Env);
+		}
+		MID->SetVectorParameterValue(TEXT("UnderTint"), S.UnderTint);
+		MID->SetScalarParameterValue(TEXT("UnderlayMode"), 1.f);
+	}
 	Materials.Add(Key, MID);
 	return MID;
 }

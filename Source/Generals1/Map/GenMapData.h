@@ -140,6 +140,16 @@ public:
 	const FGenMapObject* FindWaypoint(const FString& Name) const;
 	const FGenMapLighting* GetCurrentLighting() const;
 
+	/** WaypointsList: directed links (from waypoint ID, to waypoint ID) that chain waypoints into paths. */
+	TArray<FIntPoint> WaypointLinks;
+
+	const FGenPolygonTrigger* FindTrigger(const FString& Name) const;
+	const FGenMapObject* FindWaypointByID(int32 Id) const;
+	/** TerrainLogic::getClosestWaypointOnPath: nearest waypoint carrying that path label (case-insensitive), or null. */
+	const FGenMapObject* GetClosestWaypointOnPath(const FVector2f& Pos, const FString& Label) const;
+	/** The positions of a waypoint and of those its links lead to, in order (ground height not applied). */
+	void GetWaypointPath(const FGenMapObject& Start, TArray<FVector2f>& OutPath) const;
+
 	/** Cliff flag of a height map cell (array indices, border included). */
 	bool IsCliffCellIndex(int32 X, int32 Y) const;
 

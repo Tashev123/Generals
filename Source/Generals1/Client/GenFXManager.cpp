@@ -264,6 +264,14 @@ void UGenFXManager::OnObjectDestroyed(FGenObjectID Object)
 	Particles.DestroyAttachedTo(Object);
 }
 
+void UGenFXManager::DestroySystem(uint32 SystemID)
+{
+	if (FGenParticleSystem* Sys = Particles.Find(SystemID))
+	{
+		Sys->Destroy();
+	}
+}
+
 void UGenFXManager::AddLightPulse(const FVector3f& Pos, const FLinearColor& Color, float Radius, int32 IncreaseFrames, int32 DecreaseFrames)
 {
 	if (Radius <= 0.f || IncreaseFrames + DecreaseFrames <= 0)

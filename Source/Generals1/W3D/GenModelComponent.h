@@ -47,7 +47,7 @@ public:
 	 * Plays one animation picked at random from a condition state's list. With bIdle, a new one is
 	 * picked each time the current one finishes (IdleAnimation behaviour).
 	 */
-	void PlayAnimationSet(const TArray<FString>& Animations, EGenAnimMode Mode, float Speed, bool bIdle);
+	void PlayAnimationSet(const TArray<FString>& Animations, EGenAnimMode Mode, float Speed, bool bIdle, bool bStartAtEnd = false);
 
 	/** Restores every sub-object's visibility to its mesh default (before a state's hide/show list). */
 	void ResetSubObjectVisibility();
@@ -76,6 +76,9 @@ public:
 	 * Used for weapon fire-FX and projectile launch points.
 	 */
 	bool GetBoneTransformW3D(const FString& BoneName, FTransform3f& OutTransform) const;
+
+	/** Poses of bones "<Prefix>01", "<Prefix>02", ... (or just "<Prefix>" if there are none); returns how many. */
+	int32 GetNumberedBoneTransformsW3D(const FString& Prefix, TArray<FTransform3f>& OutTransforms) const;
 
 	/** Overrides a bone's local rotation (e.g. turret yaw), applied after animation. */
 	void SetBoneRotationOverride(const FString& BoneName, const FQuat& RotationInW3DSpace);

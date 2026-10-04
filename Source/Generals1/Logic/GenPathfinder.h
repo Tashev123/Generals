@@ -41,6 +41,8 @@ public:
 	bool AdjustDestination(const FVector2f& Pos, uint32 Surfaces, FVector2f& OutPos, int32 MaxRadiusCells = 30) const;
 
 	bool IsPassable(const FVector2f& WorldPos, uint32 Surfaces) const;
+	/** True if every cell under an oriented box (or circle) footprint is open ground: no cliff, water, building or map edge. */
+	bool IsAreaClear(const FVector2f& Center, float Angle, float Major, float Minor, bool bBox) const;
 	bool IsLineClear(const FVector2f& A, const FVector2f& B, uint32 Surfaces) const;
 
 	// --- units (Pathfinder::updatePos / updateGoal / checkDestination / adjustDestination) ---

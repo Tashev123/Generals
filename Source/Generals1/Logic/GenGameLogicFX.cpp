@@ -46,6 +46,27 @@ void UGenGameLogic::AttachParticleSystem(const FString& TemplateName, FGenObject
 	}
 }
 
+void UGenGameLogic::DoTransitionDamageFX(const FGenObject& Obj, int32 State)
+{
+	// The particle systems of the module sit on model bones and are handled with the drawable (UpdateDrawables).
+	const FTransform3f Xf = Obj.GetTransform();
+	for (const FGenTransitionFX& X : Obj.GetTemplate()->TransitionFX)
+	{
+		if (X.State != State)
+		{
+			continue;
+		}
+		if (X.Kind == FGenTransitionFX::FXList)
+		{
+			DoFXPos(X.Name, Xf.TransformPositionNoScale(X.Loc), &Xf, 0.f, nullptr, 0.f);
+		}
+		else if (X.Kind == FGenTransitionFX::OCL)
+		{
+			DoOCL(X.Name, Obj);
+		}
+	}
+}
+
 bool UGenGameLogic::GetWeaponBoneTransform(const FGenObject& Obj, int32 Slot, bool bLaunchBone, FTransform3f& OutWorld) const
 {
 	// The original also asks the drawable for bone positions (W3DModelDraw::handleWeaponFireFX,

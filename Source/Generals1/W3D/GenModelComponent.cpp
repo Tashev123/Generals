@@ -326,7 +326,7 @@ void UGenModelComponent::StopAnimation()
 	UpdatePose();
 }
 
-void UGenModelComponent::PlayAnimationSet(const TArray<FString>& Animations, EGenAnimMode Mode, float Speed, bool bIdle)
+void UGenModelComponent::PlayAnimationSet(const TArray<FString>& Animations, EGenAnimMode Mode, float Speed, bool bIdle, bool bStartAtEnd)
 {
 	IdlePool.Reset();
 	if (Animations.Num() == 0)
@@ -334,7 +334,12 @@ void UGenModelComponent::PlayAnimationSet(const TArray<FString>& Animations, EGe
 		StopAnimation();
 		return;
 	}
-	PlayAnimation(Animations[FMath::RandRange(0, Animations.Num() - 1)], Mode, Speed);
+	if (PlayAnimation(Animations[FMath::RandRange(0, Animations.Num() - 1)], Mode, Speed) && bStartAtEnd && Mode == EGenAnimMode::Manual)
+	{
+		// START_FRAME_LAST: the pose at the end of the animation is held.
+		AnimFrame = float(Animation->NumFrames - 1);
+		UpdatePose();
+	}
 	if (bIdle)
 	{
 		IdlePool = Animations;
@@ -397,6 +402,33 @@ bool UGenModelComponent::GetBoneTransformW3D(const FString& BoneName, FTransform
 	}
 	OutTransform = PoseW3D[Idx];
 	return true;
+}
+
+int32 UGenModelComponent::GetNumberedBoneTransformsW3D(const FString& Prefix, TArray<FTransform3f>& OutTransforms) const
+{
+	OutTransforms.Reset();
+	if (!Hierarchy || Prefix.IsEmpty())
+	{
+		return 0;
+	}
+	for (int32 i = 1; i <= 99; ++i)
+	{
+		const int32 Idx = Hierarchy->FindPivot(FString::Printf(TEXT("%s%02d"), *Prefix, i));
+		if (!PoseW3D.IsValidIndex(Idx))
+		{
+			break;
+		}
+		OutTransforms.Add(PoseW3D[Idx]);
+	}
+	if (OutTransforms.Num() == 0)
+	{
+		const int32 Idx = Hierarchy->FindPivot(Prefix);
+		if (PoseW3D.IsValidIndex(Idx))
+		{
+			OutTransforms.Add(PoseW3D[Idx]);
+		}
+	}
+	return OutTransforms.Num();
 }
 
 void UGenModelComponent::SetBoneOffsetOnPrefix(const FString& Prefix, const FVector3f& OffsetW3D)

@@ -23,6 +23,9 @@ class AGenMapActor;
  *   -GenEnemyObject=T1,T2      spawn units for the enemy player (at -GenEnemyAt=X,Y)
  *   -GenTestAttack             after 1 s, order all local armed units to attack the first enemy unit
  *   -GenTestFX=Name[,Name]     after 1 s, play FX lists / particle systems at the camera target
+ *   -GenTestBuild=Building     at logic frame 30, the first local dozer constructs it at the camera target
+ *   -GenTestQueue=Unit[,Unit]  at logic frame 30, queue units at the local building that produces them
+ *   -GenTestSelect=Template    at logic frame 30, select the first local object of that type
  *   -GenTrace                  log unit state once per second
  *   -GenSeed=N                 fixed simulation random seed
  *   -GenPauseFrame=N           freeze the simulation at logic frame N (and take the -GenShot there)
@@ -58,6 +61,10 @@ private:
 	uint32 ShotFrame = 0;        // -GenPauseFrame: screenshot at this logic frame
 	int32 FramesAtShotFrame = 0;
 	bool bTestFXDone = false;
+	bool bTestEconomyDone = false;
+	bool bTestGatherDone = false;
+	int32 TestJetOrdersDone = 0;
+	int32 TestPowerOrdersDone = 0;
 	bool bTestAttackPending = false;
 	uint32 TestAttackTarget = 0; // first -GenEnemyObject unit
 };

@@ -238,10 +238,50 @@ namespace
 
 	void ParseOCLNugget(const FString& Keyword, const FGenIniBlock& B, FGenOCL& List)
 	{
+		if (Keyword.Equals(TEXT("DeliverPayload"), ESearchCase::IgnoreCase))
+		{
+			FGenDeliverPayload& P = List.Payloads.AddDefaulted_GetRef();
+			for (const FGenIniEntry& E : B.Entries)
+			{
+				auto Is = [&](const TCHAR* Key) { return E.Key.Equals(Key, ESearchCase::IgnoreCase); };
+				if (Is(TEXT("Transport"))) { P.Transport = E.Value(); }
+				else if (Is(TEXT("FormationSize"))) { P.FormationSize = FMath::Max(1, E.AsInt(0, 1)); }
+				else if (Is(TEXT("FormationSpacing"))) { P.FormationSpacing = E.AsFloat(); }
+				else if (Is(TEXT("WeaponConvergenceFactor"))) { P.WeaponConvergenceFactor = E.AsFloat(); }
+				else if (Is(TEXT("StartAtPreferredHeight"))) { P.bStartAtPreferredHeight = E.AsBool(); }
+				else if (Is(TEXT("StartAtMaxSpeed"))) { P.bStartAtMaxSpeed = E.AsBool(); }
+				else if (Is(TEXT("MaxAttempts"))) { P.MaxAttempts = E.AsInt(0, 1); }
+				else if (Is(TEXT("DropDelay"))) { P.DropDelay = GenLogic::MsecToFrames(E.AsFloat()); }
+				else if (Is(TEXT("DeliveryDistance"))) { P.DeliveryDistance = E.AsFloat(); }
+				else if (Is(TEXT("PreOpenDistance"))) { P.PreOpenDistance = E.AsFloat(); }
+				else if (Is(TEXT("DropOffset"))) { P.DropOffset = Coord(E); }
+				else if (Is(TEXT("DropVariance"))) { P.DropVariance = Coord(E); }
+				else if (Is(TEXT("Payload")) && E.Values.Num() > 0) { P.Payload.Emplace(E.Values[0], E.Values.Num() > 1 ? FMath::Max(1, FCString::Atoi(*E.Values[1])) : 1); }
+				else if (Is(TEXT("PutInContainer"))) { P.PutInContainer = E.Value(); }
+				else if (Is(TEXT("ParachuteDirectly"))) { P.bParachuteDirectly = E.AsBool(); }
+				else if (Is(TEXT("VisibleItemsDroppedPerInterval"))) { P.VisibleItemsDroppedPerInterval = E.AsInt(); }
+				else if (Is(TEXT("VisibleDropBoneBaseName"))) { P.VisibleDropBoneBaseName = E.Value(); }
+				else if (Is(TEXT("VisibleSubObjectBaseName"))) { P.VisibleSubObjectBaseName = E.Value(); }
+				else if (Is(TEXT("VisibleNumBones"))) { P.VisibleNumBones = E.AsInt(); }
+				else if (Is(TEXT("VisiblePayloadTemplateName"))) { P.VisiblePayloadTemplateName = E.Value(); }
+				else if (Is(TEXT("VisiblePayloadWeaponTemplate"))) { P.VisiblePayloadWeaponTemplate = E.Value(); }
+				else if (Is(TEXT("WeaponErrorRadius"))) { P.WeaponErrorRadius = E.AsFloat(); }
+				else if (Is(TEXT("DelayDeliveryMax"))) { P.DelayDeliveryMax = GenLogic::MsecToFrames(E.AsFloat()); }
+				else if (Is(TEXT("SelfDestructObject"))) { P.bSelfDestructObject = E.AsBool(); }
+				else if (Is(TEXT("InheritTransportVelocity"))) { P.bInheritTransportVelocity = E.AsBool(); }
+				else if (Is(TEXT("DiveStartDistance"))) { P.DiveStartDistance = E.AsFloat(); }
+				else if (Is(TEXT("DiveEndDistance"))) { P.DiveEndDistance = E.AsFloat(); }
+				else if (Is(TEXT("StrafingWeaponSlot"))) { P.StrafingWeaponSlot = E.Value(); }
+				else if (Is(TEXT("StrafeLength"))) { P.StrafeLength = E.AsFloat(); }
+				else if (Is(TEXT("StrafeWeaponFX"))) { P.StrafeWeaponFX = E.Value(); }
+				else if (Is(TEXT("DeliveryDecalRadius"))) { P.DeliveryDecalRadius = E.AsFloat(); }
+			}
+			return;
+		}
 		const bool bDebris = Keyword.Equals(TEXT("CreateDebris"), ESearchCase::IgnoreCase);
 		if (!bDebris && !Keyword.Equals(TEXT("CreateObject"), ESearchCase::IgnoreCase))
 		{
-			return; // DeliverPayload, FireWeapon, Attack, ApplyRandomForce: not ported yet
+			return; // FireWeapon, Attack, ApplyRandomForce: not ported yet
 		}
 		FGenOCLNugget& N = List.Nuggets.AddDefaulted_GetRef();
 		N.bDebris = bDebris;
@@ -285,6 +325,8 @@ namespace
 			else if (Is(TEXT("OkToChangeModelColor"))) { N.bOkToChangeModelColor = E.AsBool(); }
 			else if (Is(TEXT("OrientInForceDirection"))) { N.bOrientInForceDirection = E.AsBool(); }
 			else if (Is(TEXT("SkipIfSignificantlyAirborne"))) { N.bSkipIfSignificantlyAirborne = E.AsBool(); }
+			else if (Is(TEXT("SpreadFormation"))) { N.bSpreadFormation = E.AsBool(); }
+			else if (Is(TEXT("MinDistanceAFormation"))) { N.MinDistanceFormation = E.AsFloat(); }
 		}
 	}
 
@@ -347,6 +389,7 @@ bool FGenFXData::Initialize()
 			FGenOCL& L = OCLs.FindOrAdd(B->Name().ToLower());
 			L.Name = B->Name();
 			L.Nuggets.Reset();
+			L.Payloads.Reset();
 			for (const FGenIniEntry& E : B->Entries)
 			{
 				if (E.Block) { ParseOCLNugget(E.Key, *E.Block, L); }

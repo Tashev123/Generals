@@ -155,6 +155,29 @@ void FGenPathfinder::RasterizeFootprint(const FGenObject& Obj, int32 Delta)
 	}
 }
 
+bool FGenPathfinder::IsAreaClear(const FVector2f& Center, float Angle, float Major, float Minor, bool bBox) const
+{
+	const float CosA = FMath::Cos(Angle), SinA = FMath::Sin(Angle);
+	const float R = bBox ? FMath::Sqrt(Major * Major + Minor * Minor) : Major;
+	const FIntPoint Lo = WorldToCell(Center - FVector2f(R, R));
+	const FIntPoint Hi = WorldToCell(Center + FVector2f(R, R));
+	for (int32 Y = Lo.Y; Y <= Hi.Y; ++Y)
+	{
+		for (int32 X = Lo.X; X <= Hi.X; ++X)
+		{
+			const FVector2f D = CellCenter(X, Y) - Center;
+			const bool bInside = bBox
+				? FMath::Abs(D.X * CosA + D.Y * SinA) <= Major && FMath::Abs(-D.X * SinA + D.Y * CosA) <= Minor
+				: D.SizeSquared() <= Major * Major;
+			if (bInside && GetCell(X, Y) != ECell::Clear)
+			{
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
 void FGenPathfinder::AddObstacle(const FGenObject& Obj)
 {
 	RasterizeFootprint(Obj, +1);

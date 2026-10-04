@@ -19,6 +19,22 @@ namespace GenW3D
 		MeshGeometrySkin = 0x00020000,
 		MeshGeometryCameraOriented = 0x00060000,
 	};
+
+	// Vertex material attributes: how stage 0 gets its texture coordinates (W3DVERTMAT_STAGE0_MAPPING_*).
+	enum : uint32
+	{
+		VertMatStage0MappingMask = 0x00FF0000,
+		VertMatStage0MappingShift = 16,
+		MappingUV = 0x00,
+		MappingEnvironment = 0x01,          // camera-space reflection vector
+		MappingCheapEnvironment = 0x02,     // camera-space normal
+		MappingWSClassicEnv = 0x0C,
+		MappingWSEnvironment = 0x0D,
+		MappingGridClassicEnv = 0x0E,
+		MappingGridEnvironment = 0x0F,
+		MappingGridWSClassicEnv = 0x13,
+		MappingGridWSEnvironment = 0x14,
+	};
 }
 
 enum class EGenW3DBlend : uint8
@@ -58,6 +74,10 @@ struct FGenW3DVertexMaterial
 	float Opacity = 1.f;
 	float Translucency = 0.f;
 	FString MapperArgs0;
+
+	uint32 Stage0Mapping() const { return (Attributes & GenW3D::VertMatStage0MappingMask) >> GenW3D::VertMatStage0MappingShift; }
+	/** Stage 0 is an environment map: its coordinates come from the view, not from the mesh's UVs. */
+	bool IsEnvironmentMapped() const;
 };
 
 struct FGenW3DTexture

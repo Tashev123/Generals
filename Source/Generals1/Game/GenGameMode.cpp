@@ -4,8 +4,10 @@
 #include "Game/GenCameraPawn.h"
 #include "Game/GenHUD.h"
 #include "Game/GenPlayerController.h"
+#include "Logic/GenCommandData.h"
 #include "Logic/GenGameData.h"
 #include "Logic/GenGameLogic.h"
+#include "Logic/GenUpgrades.h"
 #include "Map/GenMapActor.h"
 #include "Map/GenMapData.h"
 #include "W3D/GenModelComponent.h"
@@ -179,8 +181,8 @@ void AGenGameMode::StartPlay()
 	}
 	bTestAttackPending = FParse::Param(FCommandLine::Get(), TEXT("GenTestAttack")) && TestAttackTarget != GenInvalidObjectID;
 
-	// Until units can be produced, both sides get a battle group to play with. Scripted test runs
-	// (which place their own units or only take a screenshot) and -GenNoTestUnits skip it.
+	// The human starts with a battle group to play with (and so does a passive -GenNoAI enemy).
+	// Scripted test runs (which place their own units or only take a screenshot) and -GenNoTestUnits skip it.
 	FString Scripted;
 	const bool bScriptedRun = !ObjectList.IsEmpty() || !EnemyList.IsEmpty()
 		|| FParse::Value(FCommandLine::Get(), TEXT("GenShot="), Scripted) || FParse::Value(FCommandLine::Get(), TEXT("GenTestFX="), Scripted)
@@ -299,7 +301,8 @@ void AGenGameMode::SpawnTestUnits(UGenGameLogic* Logic)
 	SpawnGroup(Local, 260.f, Facing);
 	for (const FGenPlayer& P : Players)
 	{
-		if (Logic->GetRelationship(Local, P.Index) == EGenRelationship::Enemies)
+		// A computer opponent raises its own army; only a passive enemy (-GenNoAI) gets a group to shoot at.
+		if (Logic->GetRelationship(Local, P.Index) == EGenRelationship::Enemies && !P.bSkirmishAI)
 		{
 			SpawnGroup(P.Index, 560.f, Facing + PI);
 			break;
@@ -356,6 +359,468 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 		}
 	}
 
+	// Economy test hooks, run once at logic frame 30:
+	//   -GenTestBuild=Building       the first local dozer constructs it at the camera target
+	//   -GenTestQueue=Unit[,Unit]    each is queued at the first local building whose command set builds it
+	//   -GenTestSelect=Template      selects the first local object of that type (shows its command bar)
+	if (!bTestEconomyDone && Logic && Logic->GetFrame() >= 30)
+	{
+		bTestEconomyDone = true;
+		const int32 Local = Logic->GetLocalPlayer();
+		APlayerController* PC = GetWorld()->GetFirstPlayerController();
+		const AGenCameraPawn* Cam = PC ? Cast<AGenCameraPawn>(PC->GetPawn()) : nullptr;
+		FString Arg;
+		if (Cam && FParse::Value(FCommandLine::Get(), TEXT("GenTestBuild="), Arg, false))
+		{
+			const FGenThingTemplate* T = FGenGameData::Get().FindTemplate(Arg);
+			const FVector Gen = GenCoords::FromUE(Cam->GetTarget());
+			for (FGenObjectID Id : Logic->GetObjectIDs())
+			{
+				const FGenObject* O = Logic->FindObject(Id);
+				if (T && O && O->GetOwner() == Local && O->GetTemplate()->bIsDozer && !O->IsDead())
+				{
+					const FVector3f Pos(float(Gen.X), float(Gen.Y), Logic->GetGroundHeight(float(Gen.X), float(Gen.Y)));
+					UE_LOG(LogGenerals, Log, TEXT("Test build: %s at (%.0f, %.0f) by #%u, legal=%d, can make=%d"), *Arg, Pos.X, Pos.Y, Id,
+						Logic->IsLocationLegalToBuild(*T, Pos, T->PlacementViewAngle) ? 1 : 0, Logic->CanMake(Local, *T) ? 1 : 0);
+					Logic->IssueConstruct(Id, Arg, Pos, T->PlacementViewAngle);
+					break;
+				}
+			}
+		}
+		if (FParse::Value(FCommandLine::Get(), TEXT("GenTestQueue="), Arg, false))
+		{
+			TArray<FString> Units;
+			Arg.ParseIntoArray(Units, TEXT(","));
+			for (const FString& Unit : Units)
+			{
+				bool bQueued = false;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					const FGenCommandSet* Set = (O && O->GetOwner() == Local && O->GetTemplate()->bHasProduction && !O->IsUnderConstruction())
+						? FGenCommandData::Get().FindSet(O->GetCommandSet()) : nullptr;
+					for (int32 s = 0; Set && s < FGenCommandSet::NumSlots && !bQueued; ++s)
+					{
+						const FGenCommandButton* Btn = FGenCommandData::Get().FindButton(Set->Slots[s]);
+						if (Btn && Btn->Command == EGenCommand::UnitBuild && Btn->Object.Equals(Unit, ESearchCase::IgnoreCase))
+						{
+							Logic->IssueQueueUnit(Id, Unit);
+							bQueued = true;
+						}
+					}
+					if (bQueued) { break; }
+				}
+				UE_LOG(LogGenerals, Log, TEXT("Test queue: %s %s"), *Unit, bQueued ? TEXT("queued") : TEXT("has no factory"));
+			}
+		}
+		AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC);
+		if (GenPC && FParse::Value(FCommandLine::Get(), TEXT("GenTestSelect="), Arg, false))
+		{
+			// The first local object of that type; failing that, anybody's that is nearest the camera target.
+			FGenObjectID Pick = GenInvalidObjectID;
+			float BestDistSq = FLT_MAX;
+			const FVector CamGen = Cam ? GenCoords::FromUE(Cam->GetTarget()) : FVector::ZeroVector;
+			for (FGenObjectID Id : Logic->GetObjectIDs())
+			{
+				const FGenObject* O = Logic->FindObject(Id);
+				if (!O || !O->GetTemplate()->Name.Equals(Arg, ESearchCase::IgnoreCase))
+				{
+					continue;
+				}
+				if (O->GetOwner() == Local)
+				{
+					Pick = Id;
+					break;
+				}
+				const float DistSq = FVector2f::DistSquared(FVector2f(O->GetPosition().X, O->GetPosition().Y), FVector2f(float(CamGen.X), float(CamGen.Y)));
+				if (DistSq < BestDistSq)
+				{
+					BestDistSq = DistSq;
+					Pick = Id;
+				}
+			}
+			if (Pick != GenInvalidObjectID)
+			{
+				GenPC->SetSelection({ Pick });
+			}
+		}
+	}
+
+	//   -GenTestGather=Frame         at that logic frame every local gatherer is sent to the supply pile nearest the camera target
+	int32 GatherFrame = 0;
+	if (!bTestGatherDone && Logic && FParse::Value(FCommandLine::Get(), TEXT("GenTestGather="), GatherFrame) && Logic->GetFrame() >= uint32(FMath::Max(GatherFrame, 1)))
+	{
+		bTestGatherDone = true;
+		APlayerController* PC = GetWorld()->GetFirstPlayerController();
+		const AGenCameraPawn* Cam = PC ? Cast<AGenCameraPawn>(PC->GetPawn()) : nullptr;
+		const FVector CamGen = Cam ? GenCoords::FromUE(Cam->GetTarget()) : FVector::ZeroVector;
+		FGenObjectID Pile = GenInvalidObjectID;
+		float BestDistSq = FLT_MAX;
+		TArray<FGenObjectID> Gatherers;
+		for (FGenObjectID Id : Logic->GetObjectIDs())
+		{
+			const FGenObject* O = Logic->FindObject(Id);
+			if (O && O->GetOwner() == Logic->GetLocalPlayer() && O->GetTemplate()->bIsSupplyTruck && !O->IsDead())
+			{
+				Gatherers.Add(Id);
+			}
+			if (O && O->GetTemplate()->bSupplyWarehouse && O->GetBoxes() > 0)
+			{
+				const float DistSq = FVector2f::DistSquared(FVector2f(O->GetPosition().X, O->GetPosition().Y), FVector2f(float(CamGen.X), float(CamGen.Y)));
+				if (DistSq < BestDistSq)
+				{
+					BestDistSq = DistSq;
+					Pile = Id;
+				}
+			}
+		}
+		UE_LOG(LogGenerals, Log, TEXT("Test gather: %d gatherers sent to #%u"), Gatherers.Num(), Pile);
+		Logic->IssueDock(Gatherers, Pile);
+	}
+
+	//   -GenTestJets=Frame,order[,x,y]   at that logic frame every local aircraft is given the order:
+	//        attack (the enemy object nearest x,y, or nearest the camera target), move (to x,y), land (at the
+	//        nearest airfield of ours), stop. Several, separated by ';', run in turn: "900,attack;2400,move,900,700"
+	FString JetSpec;
+	if (Logic && FParse::Value(FCommandLine::Get(), TEXT("GenTestJets="), JetSpec, false))
+	{
+		TArray<FString> Orders;
+		JetSpec.ParseIntoArray(Orders, TEXT(";"));
+		while (TestJetOrdersDone < Orders.Num())
+		{
+			TArray<FString> Parts;
+			Orders[TestJetOrdersDone].ParseIntoArray(Parts, TEXT(","));
+			if (Parts.Num() < 2 || Logic->GetFrame() < uint32(FMath::Max(1, FCString::Atoi(*Parts[0]))))
+			{
+				break;
+			}
+			++TestJetOrdersDone;
+			APlayerController* PC = GetWorld()->GetFirstPlayerController();
+			const AGenCameraPawn* Cam = PC ? Cast<AGenCameraPawn>(PC->GetPawn()) : nullptr;
+			const FVector CamGen = Cam ? GenCoords::FromUE(Cam->GetTarget()) : FVector::ZeroVector;
+			const FVector2f At = Parts.Num() >= 4 ? FVector2f(FCString::Atof(*Parts[2]), FCString::Atof(*Parts[3])) : FVector2f(float(CamGen.X), float(CamGen.Y));
+			const int32 Local = Logic->GetLocalPlayer();
+			TArray<FGenObjectID> Jets;
+			FGenObjectID Victim = GenInvalidObjectID, Airfield = GenInvalidObjectID;
+			float VictimDistSq = FLT_MAX, AirfieldDistSq = FLT_MAX;
+			for (FGenObjectID Id : Logic->GetObjectIDs())
+			{
+				const FGenObject* O = Logic->FindObject(Id);
+				if (!O || O->IsDead())
+				{
+					continue;
+				}
+				const float DistSq = FVector2f::DistSquared(FVector2f(O->GetPosition().X, O->GetPosition().Y), At);
+				if (O->GetOwner() == Local && O->GetTemplate()->bJetAI)
+				{
+					Jets.Add(Id);
+				}
+				else if (O->GetOwner() == Local && O->GetParking() && DistSq < AirfieldDistSq)
+				{
+					AirfieldDistSq = DistSq;
+					Airfield = Id;
+				}
+				else if (O->IsTargetable() && Logic->GetRelationship(Local, O->GetOwner()) == EGenRelationship::Enemies && DistSq < VictimDistSq)
+				{
+					VictimDistSq = DistSq;
+					Victim = Id;
+				}
+			}
+			const FString& Order = Parts[1];
+			UE_LOG(LogGenerals, Log, TEXT("Test jets f%u: %d aircraft, order '%s' (victim #%u, airfield #%u, at %.0f,%.0f)"), Logic->GetFrame(), Jets.Num(),
+				*Order, Victim, Airfield, At.X, At.Y);
+			if (Order.Equals(TEXT("attack"), ESearchCase::IgnoreCase)) { Logic->IssueAttack(Jets, Victim); }
+			else if (Order.Equals(TEXT("move"), ESearchCase::IgnoreCase)) { Logic->IssueMove(Jets, FVector3f(At.X, At.Y, Logic->GetGroundHeight(At.X, At.Y))); }
+			else if (Order.Equals(TEXT("land"), ESearchCase::IgnoreCase)) { Logic->IssueLand(Jets, Airfield); }
+			else if (Order.Equals(TEXT("stop"), ESearchCase::IgnoreCase)) { Logic->IssueStop(Jets); }
+		}
+	}
+
+	//   -GenTestPowers=Frame,what[,args];...   upgrades, promotions and special powers of the local player, in turn:
+	//        upgrade,Name       queued at the first building of ours that can research it
+	//        skill,Points       experience towards the next rank (as if that much had been destroyed)
+	//        aiskill,Points     the same for every computer player
+	//        science,Name       bought with general's points, like a click in the promotions panel
+	//        power,Name[,x,y]   fired at x,y (or the camera target) from whichever building has it ready
+	//        money,Amount       cash
+	//        generals           opens the promotions panel (for a screenshot)
+	//        click,Button       a left click on that command button, wherever the interface shows it
+	//        target,x,y         the left click on the ground that fires the power being aimed
+	//        rally,Type,x,y     sets the rally point of our first building of that type
+	//        damage,Type,Pct    leaves our first object of that type with that percentage of its health
+	//        repair,Type        our dozers go and mend our first object of that type
+	//        fix,Type           our damaged vehicles drive to our first building of that type for repairs
+	//        attackmove,x,y     everything of ours that can move and fight attack-moves there
+	//        guard,x,y          ... guards that spot
+	//        vet,Type,Level     our units of that type are set to veterancy level 1..3
+	//        destroy,Type,x,y   anybody's object of that type nearest that spot is destroyed
+	//        enter,Unit,Type    our units of that type get into the container of that type nearest the camera target
+	//                           (anybody's: a civilian building can be garrisoned); Unit "*" = everything of ours that can
+	//        evacuate,Type      everybody out of the container of that type nearest the camera target
+	FString PowerSpec;
+	if (Logic && FParse::Value(FCommandLine::Get(), TEXT("GenTestPowers="), PowerSpec, false))
+	{
+		TArray<FString> Orders;
+		PowerSpec.ParseIntoArray(Orders, TEXT(";"));
+		while (TestPowerOrdersDone < Orders.Num())
+		{
+			TArray<FString> Parts;
+			Orders[TestPowerOrdersDone].ParseIntoArray(Parts, TEXT(","));
+			if (Parts.Num() < 2 || Logic->GetFrame() < uint32(FMath::Max(1, FCString::Atoi(*Parts[0]))))
+			{
+				break;
+			}
+			++TestPowerOrdersDone;
+			const int32 Local = Logic->GetLocalPlayer();
+			APlayerController* PC = GetWorld()->GetFirstPlayerController();
+			const AGenCameraPawn* Cam = PC ? Cast<AGenCameraPawn>(PC->GetPawn()) : nullptr;
+			const FVector CamGen = Cam ? GenCoords::FromUE(Cam->GetTarget()) : FVector::ZeroVector;
+			const FString& What = Parts[1];
+			const FString Arg = Parts.Num() >= 3 ? Parts[2] : FString();
+			if (What.Equals(TEXT("upgrade"), ESearchCase::IgnoreCase))
+			{
+				const FGenUpgradeTemplate* Upgrade = FGenUpgradeData::Get().FindUpgrade(Arg);
+				FString Why = TEXT("no such upgrade");
+				bool bQueued = false;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (Upgrade && O && O->GetOwner() == Local && O->GetTemplate()->bHasProduction)
+					{
+						FString WhyNot;
+						if (Logic->CanQueueUpgrade(*O, *Upgrade, &WhyNot))
+						{
+							Logic->IssueQueueUpgrade(Id, Arg);
+							bQueued = true;
+							break;
+						}
+						if (WhyNot != TEXT("Not available here")) { Why = WhyNot; }
+						else if (Why == TEXT("no such upgrade")) { Why = TEXT("no building of ours offers it"); }
+					}
+				}
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: upgrade %s %s"), Logic->GetFrame(), *Arg, bQueued ? TEXT("queued") : *Why);
+			}
+			else if (What.Equals(TEXT("skill"), ESearchCase::IgnoreCase))
+			{
+				Logic->AddSkillPoints(Local, FCString::Atoi(*Arg));
+				const FGenPlayer& P = Logic->GetPlayers()[Local];
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: +%s skill points -> rank %d, %d skill points, %d general's points"), Logic->GetFrame(), *Arg,
+					P.RankLevel, P.SkillPoints, P.SciencePurchasePoints);
+			}
+			else if (What.Equals(TEXT("aiskill"), ESearchCase::IgnoreCase))
+			{
+				// The same for every computer player (they then spend the points on their skill set).
+				for (const FGenPlayer& P : Logic->GetPlayers())
+				{
+					if (Logic->GetAI(P.Index))
+					{
+						Logic->AddSkillPoints(P.Index, FCString::Atoi(*Arg));
+					}
+				}
+			}
+			else if (What.Equals(TEXT("science"), ESearchCase::IgnoreCase))
+			{
+				FString Why;
+				const bool bCan = Logic->CanPurchaseScience(Local, Arg, &Why);
+				Logic->IssuePurchaseScience(Local, Arg);
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: science %s %s"), Logic->GetFrame(), *Arg, bCan ? TEXT("purchased") : *Why);
+			}
+			else if (What.Equals(TEXT("power"), ESearchCase::IgnoreCase))
+			{
+				const FVector2f At = Parts.Num() >= 5 ? FVector2f(FCString::Atof(*Parts[3]), FCString::Atof(*Parts[4])) : FVector2f(float(CamGen.X), float(CamGen.Y));
+				int32 Module = INDEX_NONE;
+				const FGenObject* Source = Logic->FindPowerSource(Local, Arg, false, &Module);
+				FString Why = TEXT("no building of ours has it");
+				const bool bReady = Source && Logic->IsPowerReady(*Source, Module, nullptr, &Why);
+				// A power aimed at a building takes the enemy building nearest that spot.
+				FGenObjectID Target = GenInvalidObjectID;
+				float BestDistSq = FLT_MAX;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					const float DistSq = O ? FVector2f::DistSquared(FVector2f(O->GetPosition().X, O->GetPosition().Y), At) : 0.f;
+					if (O && !O->IsDead() && O->IsKindOf(TEXT("FS_SUPPLY_CENTER")) && Logic->GetRelationship(Local, O->GetOwner()) == EGenRelationship::Enemies && DistSq < BestDistSq)
+					{
+						BestDistSq = DistSq;
+						Target = Id;
+					}
+				}
+				const bool bAtObject = Source && Source->GetTemplate()->PowerModules[Module].Type == EGenPowerModule::CashHack;
+				if (bReady)
+				{
+					Logic->IssueSpecialPower(Source->GetID(), Arg, FVector3f(At.X, At.Y, Logic->GetGroundHeight(At.X, At.Y)), bAtObject ? Target : GenInvalidObjectID);
+				}
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: power %s at (%.0f, %.0f) %s"), Logic->GetFrame(), *Arg, At.X, At.Y, bReady ? TEXT("fired") : *Why);
+			}
+			else if (What.Equals(TEXT("rally"), ESearchCase::IgnoreCase) || What.Equals(TEXT("damage"), ESearchCase::IgnoreCase)
+				|| What.Equals(TEXT("repair"), ESearchCase::IgnoreCase) || What.Equals(TEXT("fix"), ESearchCase::IgnoreCase))
+			{
+				// These act on our first living object of the named type.
+				FGenObject* Subject = nullptr;
+				TArray<FGenObjectID> Dozers, Vehicles;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					FGenObject* O = Logic->FindObject(Id);
+					if (!O || O->GetOwner() != Local || O->IsDead())
+					{
+						continue;
+					}
+					if (!Subject && O->GetTemplate()->Canonical()->Name.Equals(Arg, ESearchCase::IgnoreCase)) { Subject = O; }
+					if (O->GetTemplate()->bIsDozer) { Dozers.Add(Id); }
+					else if (O->CanMove() && O->GetHealth() < O->GetMaxHealth()) { Vehicles.Add(Id); }
+				}
+				if (!Subject)
+				{
+					UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: %s: we have no %s"), Logic->GetFrame(), *What, *Arg);
+				}
+				else if (What.Equals(TEXT("rally"), ESearchCase::IgnoreCase) && Parts.Num() >= 5)
+				{
+					const FVector2f At(FCString::Atof(*Parts[3]), FCString::Atof(*Parts[4]));
+					Logic->IssueSetRallyPoint({ Subject->GetID() }, FVector3f(At.X, At.Y, 0.f));
+					UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: rally point of #%u %s -> (%.0f, %.0f)"), Logic->GetFrame(), Subject->GetID(), *Arg, At.X, At.Y);
+				}
+				else if (What.Equals(TEXT("damage"), ESearchCase::IgnoreCase) && Parts.Num() >= 4)
+				{
+					const float Keep = Subject->GetMaxHealth() * FCString::Atof(*Parts[3]) / 100.f;
+					Subject->AttemptDamage(FMath::Max(0.f, Subject->GetHealth() - Keep), TEXT("UNRESISTABLE"), TEXT("NORMAL"), GenInvalidObjectID);
+					UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: #%u %s damaged to %.0f / %.0f"), Logic->GetFrame(), Subject->GetID(), *Arg,
+						Subject->GetHealth(), Subject->GetMaxHealth());
+				}
+				else if (What.Equals(TEXT("repair"), ESearchCase::IgnoreCase))
+				{
+					Logic->IssueRepair(Dozers, Subject->GetID());
+					UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: %d dozer(s) told to mend #%u %s (%.0f / %.0f)"), Logic->GetFrame(), Dozers.Num(), Subject->GetID(),
+						*Arg, Subject->GetHealth(), Subject->GetMaxHealth());
+				}
+				else if (What.Equals(TEXT("fix"), ESearchCase::IgnoreCase))
+				{
+					Logic->IssueGetRepaired(Vehicles, Subject->GetID());
+					UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: %d damaged unit(s) sent to #%u %s for repairs"), Logic->GetFrame(), Vehicles.Num(), Subject->GetID(), *Arg);
+				}
+			}
+			else if (What.Equals(TEXT("enter"), ESearchCase::IgnoreCase) || What.Equals(TEXT("evacuate"), ESearchCase::IgnoreCase))
+			{
+				const bool bEnter = What.Equals(TEXT("enter"), ESearchCase::IgnoreCase);
+				const FString ContainerType = bEnter ? (Parts.Num() >= 4 ? Parts[3] : FString()) : Arg;
+				// (Nearest the camera target, or nearest the spot given after the type: "enter,Unit,Type,x,y", "evacuate,Type,x,y".)
+				const int32 XY = bEnter ? 4 : 3;
+				const FVector2f Near = Parts.Num() >= XY + 2 ? FVector2f(FCString::Atof(*Parts[XY]), FCString::Atof(*Parts[XY + 1])) : FVector2f(float(CamGen.X), float(CamGen.Y));
+				const FGenObject* Container = nullptr;
+				float BestDistSq = FLT_MAX;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					const float DistSq = O ? FVector2f::DistSquared(FVector2f(O->GetPosition().X, O->GetPosition().Y), Near) : 0.f;
+					if (O && !O->IsDead() && O->GetContain() && O->GetTemplate()->Canonical()->Name.Equals(ContainerType, ESearchCase::IgnoreCase) && DistSq < BestDistSq)
+					{
+						BestDistSq = DistSq;
+						Container = O;
+					}
+				}
+				if (!Container)
+				{
+					UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: %s: no container of type %s"), Logic->GetFrame(), *What, *ContainerType);
+				}
+				else if (bEnter)
+				{
+					TArray<FGenObjectID> Units;
+					for (FGenObjectID Id : Logic->GetObjectIDs())
+					{
+						const FGenObject* O = Logic->FindObject(Id);
+						if (O && O->GetOwner() == Local && (Arg == TEXT("*") || O->GetTemplate()->Canonical()->Name.Equals(Arg, ESearchCase::IgnoreCase))
+							&& Logic->CanEnterObject(*O, *Container, false))
+						{
+							Units.Add(Id);
+						}
+					}
+					Logic->IssueEnter(Units, Container->GetID());
+					UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: %d unit(s) told to enter #%u %s"), Logic->GetFrame(), Units.Num(), Container->GetID(), *ContainerType);
+				}
+				else
+				{
+					Logic->IssueEvacuate(Container->GetID());
+					UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: #%u %s evacuates %d rider(s)"), Logic->GetFrame(), Container->GetID(), *ContainerType,
+						Logic->GetRiders(*Container).Num());
+				}
+			}
+			else if ((What.Equals(TEXT("attackmove"), ESearchCase::IgnoreCase) || What.Equals(TEXT("guard"), ESearchCase::IgnoreCase)) && Parts.Num() >= 4)
+			{
+				TArray<FGenObjectID> Units;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (O && O->GetOwner() == Local && !O->IsDead() && O->CanMove() && O->HasWeapons() && !O->GetTemplate()->bJetAI)
+					{
+						Units.Add(Id);
+					}
+				}
+				const FVector3f At(FCString::Atof(*Parts[2]), FCString::Atof(*Parts[3]), 0.f);
+				if (What.Equals(TEXT("guard"), ESearchCase::IgnoreCase)) { Logic->IssueGuard(Units, At, GenInvalidObjectID, EGenGuardMode::Normal); }
+				else { Logic->IssueAttackMove(Units, At); }
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: %d unit(s) told to %s (%.0f, %.0f)"), Logic->GetFrame(), Units.Num(), *What, At.X, At.Y);
+			}
+			else if (What.Equals(TEXT("destroy"), ESearchCase::IgnoreCase) && Parts.Num() >= 5)
+			{
+				const FVector2f Near(FCString::Atof(*Parts[3]), FCString::Atof(*Parts[4]));
+				FGenObject* Victim = nullptr;
+				float BestDistSq = FLT_MAX;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					FGenObject* O = Logic->FindObject(Id);
+					const float DistSq = O ? FVector2f::DistSquared(FVector2f(O->GetPosition().X, O->GetPosition().Y), Near) : 0.f;
+					if (O && !O->IsDead() && O->GetTemplate()->Canonical()->Name.Equals(Arg, ESearchCase::IgnoreCase) && DistSq < BestDistSq)
+					{
+						BestDistSq = DistSq;
+						Victim = O;
+					}
+				}
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: destroy %s: %s"), Logic->GetFrame(), *Arg, Victim ? TEXT("done") : TEXT("none found"));
+				if (Victim)
+				{
+					Victim->Kill();
+				}
+			}
+			else if (What.Equals(TEXT("vet"), ESearchCase::IgnoreCase) && Parts.Num() >= 4)
+			{
+				int32 Count = 0;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					FGenObject* O = Logic->FindObject(Id);
+					if (O && O->GetOwner() == Local && !O->IsDead() && O->GetTemplate()->Canonical()->Name.Equals(Arg, ESearchCase::IgnoreCase))
+					{
+						O->SetVeterancyLevel(FCString::Atoi(*Parts[3]));
+						++Count;
+					}
+				}
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: %d %s set to veterancy level %s"), Logic->GetFrame(), Count, *Arg, *Parts[3]);
+			}
+			else if (What.Equals(TEXT("money"), ESearchCase::IgnoreCase))
+			{
+				Logic->AddMoney(Local, FCString::Atoi(*Arg));
+			}
+			else if (What.Equals(TEXT("generals"), ESearchCase::IgnoreCase))
+			{
+				if (AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC))
+				{
+					GenPC->SetGeneralsOpen(true);
+				}
+			}
+			else if (What.Equals(TEXT("click"), ESearchCase::IgnoreCase))
+			{
+				AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC);
+				const bool bClicked = GenPC && GenPC->TestClickButton(Arg);
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: click %s %s"), Logic->GetFrame(), *Arg, bClicked ? TEXT("done") : TEXT("NOT POSSIBLE (not shown, or greyed out)"));
+			}
+			else if (What.Equals(TEXT("target"), ESearchCase::IgnoreCase) && Parts.Num() >= 4)
+			{
+				AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC);
+				const FVector2f At(FCString::Atof(*Parts[2]), FCString::Atof(*Parts[3]));
+				const bool bFired = GenPC && GenPC->TestFireAt(FVector3f(At.X, At.Y, Logic->GetGroundHeight(At.X, At.Y)));
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: target (%.0f, %.0f) %s"), Logic->GetFrame(), At.X, At.Y, bFired ? TEXT("fired") : TEXT("NOTHING BEING AIMED"));
+			}
+		}
+	}
+
 	if (bTestAttackPending && Elapsed > 1.f && Logic)
 	{
 		bTestAttackPending = false;
@@ -377,6 +842,32 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 	if (Logic && FParse::Param(FCommandLine::Get(), TEXT("GenTrace")) && FPlatformTime::Seconds() - LastTrace >= 1.0)
 	{
 		LastTrace = FPlatformTime::Seconds();
+		{
+			// Economy: money, power, and what the local player's buildings are doing.
+			const int32 Local = Logic->GetLocalPlayer();
+			int32 Produced = 0, Consumed = 0;
+			Logic->GetEnergy(Local, Produced, Consumed);
+			const FGenPlayer& LocalPlayer = Logic->GetPlayers()[Local];
+			UE_LOG(LogGenerals, Log, TEXT("  [econ f%u] money=%d power=%d/%d rank=%d skill=%d points=%d sciences=%d upgrades=%d"), Logic->GetFrame(), Logic->GetMoney(Local),
+				Produced, Consumed, LocalPlayer.RankLevel, LocalPlayer.SkillPoints, LocalPlayer.SciencePurchasePoints, LocalPlayer.Sciences.Num(), LocalPlayer.UpgradesComplete.Num());
+		TArray<FString> AILines;
+		Logic->DescribeAI(AILines);
+		for (const FString& Line : AILines)
+		{
+			UE_LOG(LogGenerals, Log, TEXT("  [ai f%u] %s"), Logic->GetFrame(), *Line);
+		}
+			for (FGenObjectID Id : Logic->GetObjectIDs())
+			{
+				const FGenObject* O = Logic->FindObject(Id);
+				if (O && O->GetOwner() == Local && (O->IsUnderConstruction() || O->GetProductionQueue().Num() > 0
+					|| (O->IsKindOf(TEXT("STRUCTURE")) && O->GetHealth() < O->GetMaxHealth() && !O->IsDead())))
+				{
+					UE_LOG(LogGenerals, Log, TEXT("  [econ f%u] #%u %s construction=%.0f%% hp=%.0f queue=%d first=%.0f frames"), Logic->GetFrame(), Id,
+						*O->GetTemplate()->Name, O->GetConstructionPercent(), O->GetHealth(), O->GetProductionQueue().Num(),
+						O->GetProductionQueue().Num() > 0 ? O->GetProductionQueue()[0].FramesDone : 0.f);
+				}
+			}
+		}
 		const bool bCombat = FParse::Param(FCommandLine::Get(), TEXT("GenTestAttack")) || TestAttackTarget != GenInvalidObjectID;
 		for (FGenObjectID Id : Logic->GetObjectIDs())
 		{
@@ -385,10 +876,21 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 			{
 				continue;
 			}
-			UE_LOG(LogGenerals, Log, TEXT("  [trace f%u] #%u p%d %s pos=(%.1f, %.1f) angle=%.0f moving=%d blocked=%u hp=%.0f/%.0f target=%u turret=%.0f shots=%u%s"),
+			FString Inside;
+			if (O->GetVeterancyLevel() > 0 || O->GetExperience() > 0) { Inside = FString::Printf(TEXT(" vet=%d xp=%d"), O->GetVeterancyLevel(), O->GetExperience()); }
+			if (O->GetAIMode() != EGenAIMode::None) { Inside += FString::Printf(TEXT(" mode=%d"), int32(O->GetAIMode())); }
+			if (O->IsContained()) { Inside += FString::Printf(TEXT(" in=#%u"), O->GetContainedBy()); }
+			else if (O->GetContain()) { Inside += FString::Printf(TEXT(" riders=%d"), Logic->GetRiders(*O).Num()); }
+			const FString Jet = O->GetTemplate()->bJetAI ? FString::Printf(TEXT(" jet=%d%s ammo=%d speed=%.0f"), int32(O->GetJetState()),
+				O->IsParked() ? TEXT(" parked") : TEXT(""), O->GetWeapon(0).AmmoInClip,
+				FVector2f(O->GetVelocity().X, O->GetVelocity().Y).Size() * float(GenLogic::GetLogicFPS())) : FString();
+			UE_LOG(LogGenerals, Log, TEXT("  [trace f%u] #%u p%d %s pos=(%.1f, %.1f) alt=%.0f angle=%.0f moving=%d blocked=%u hp=%.0f/%.0f target=%u turret=%.0f shots=%u boxes=%d supply=%d/%d%s%s%s%s w=%s|%s"),
 				Logic->GetFrame(), O->GetID(), O->GetOwner(), *O->GetTemplate()->Name, O->GetPosition().X, O->GetPosition().Y,
+				O->GetPosition().Z - Logic->GetGroundHeight(O->GetPosition().X, O->GetPosition().Y),
 				FMath::RadiansToDegrees(O->GetOrientation()), O->IsMoving() ? 1 : 0, O->GetBlockedFrames(), O->GetHealth(), O->GetMaxHealth(), O->GetTargetID(),
-				FMath::RadiansToDegrees(O->GetTurretAngle(0)), O->GetWeapon(0).FireCount + O->GetWeapon(1).FireCount, O->IsDead() ? TEXT(" DEAD") : TEXT(""));
+				FMath::RadiansToDegrees(O->GetTurretAngle(0)), O->GetWeapon(0).FireCount + O->GetWeapon(1).FireCount, O->GetBoxes(),
+				int32(O->GetSupplyState()), int32(O->GetDockStage()), *Jet, *Inside, O->IsDead() ? TEXT(" DEAD") : TEXT(""), O->IsDisabled() ? TEXT(" DISABLED") : TEXT(""),
+				O->GetWeapon(0).Template ? *O->GetWeapon(0).Template->Name : TEXT("-"), O->GetWeapon(1).Template ? *O->GetWeapon(1).Template->Name : TEXT("-"));
 		}
 	}
 

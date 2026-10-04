@@ -47,7 +47,7 @@ void GenDrawable::ApplyState(UGenModelComponent* Model, const FGenDrawModule& Dr
 	{
 		const float Speed = FMath::FRandRange(S.AnimSpeedMin, FMath::Max(S.AnimSpeedMin, S.AnimSpeedMax));
 		const EGenAnimMode Mode = ParseMode(S.AnimationMode);
-		Model->PlayAnimationSet(S.Animations, S.bIdleAnimations ? EGenAnimMode::Once : Mode, Speed, S.bIdleAnimations);
+		Model->PlayAnimationSet(S.Animations, S.bIdleAnimations ? EGenAnimMode::Once : Mode, Speed, S.bIdleAnimations, S.bStartFrameLast);
 	}
 	else if (bModelChanged)
 	{

@@ -158,12 +158,52 @@ struct GENERALS1_API FGenOCLNugget
 	bool bOkToChangeModelColor = false;
 	bool bOrientInForceDirection = false;
 	bool bSkipIfSignificantlyAirborne = false;
+	bool bSpreadFormation = false;        // several objects stand apart instead of on one spot
+	float MinDistanceFormation = 20.f;
+};
+
+/** DeliverPayload nugget: an aircraft comes in from the map edge and drops (or fires) its load at the target. */
+struct GENERALS1_API FGenDeliverPayload
+{
+	FString Transport;
+	int32 FormationSize = 1;
+	float FormationSpacing = 25.f;
+	float WeaponConvergenceFactor = 0.f;
+	bool bStartAtPreferredHeight = true;
+	bool bStartAtMaxSpeed = false;
+	int32 MaxAttempts = 1;
+	int32 DropDelay = 0;                   // frames between items
+	float DeliveryDistance = 0.f;          // the drop begins this far from the target
+	float PreOpenDistance = 0.f;           // ... plus this while still flying towards it
+	FVector3f DropOffset = FVector3f::ZeroVector;
+	FVector3f DropVariance = FVector3f::ZeroVector;
+	TArray<TPair<FString, int32>> Payload; // (object, count)
+	FString PutInContainer;                // every item comes down in one of these (a parachute)
+	bool bParachuteDirectly = false;
+	// "Visible payload": a weapon fired from the aircraft's own bones instead of objects pushed out of it.
+	int32 VisibleItemsDroppedPerInterval = 0;
+	FString VisibleDropBoneBaseName;
+	FString VisibleSubObjectBaseName;
+	int32 VisibleNumBones = 0;
+	FString VisiblePayloadTemplateName;
+	FString VisiblePayloadWeaponTemplate;
+	float WeaponErrorRadius = 0.f;         // all but the first aircraft of a formation miss by up to this much
+	int32 DelayDeliveryMax = 0;            // frames: each aircraft waits a random time up to this before it starts
+	bool bSelfDestructObject = false;      // gone the moment it has delivered (it was only a launcher)
+	bool bInheritTransportVelocity = false;
+	float DiveStartDistance = 0.f;
+	float DiveEndDistance = 0.f;
+	FString StrafingWeaponSlot;            // fires this weapon along the ground during the dive
+	float StrafeLength = 0.f;
+	FString StrafeWeaponFX;
+	float DeliveryDecalRadius = 0.f;
 };
 
 struct GENERALS1_API FGenOCL
 {
 	FString Name;
 	TArray<FGenOCLNugget> Nuggets;
+	TArray<FGenDeliverPayload> Payloads;
 };
 
 /** Registry of effect definitions: ParticleSystem.ini, FXList.ini, ObjectCreationList.ini. */

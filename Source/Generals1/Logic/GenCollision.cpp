@@ -217,7 +217,7 @@ void FGenObject::MoveToFreeGround()
 	// (one we can still shoot from, if we are attacking something).
 	const FGenObject* Target = TargetID != GenInvalidObjectID ? Logic->FindObject(TargetID) : nullptr;
 	const int32 Slot = Target ? ChooseWeapon(*Target) : INDEX_NONE;
-	const float Range = Slot != INDEX_NONE ? Weapons[Slot].Template->AttackRange : 0.f;
+	const float Range = Slot != INDEX_NONE ? GetAttackRange(*Weapons[Slot].Template) : 0.f;
 	const TFunction<bool(const FVector2f&)> Accept = [this, Target, Slot, Range](const FVector2f& P)
 	{
 		// Not where we are: the point is to get off this spot.

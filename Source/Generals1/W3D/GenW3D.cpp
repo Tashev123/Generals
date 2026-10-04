@@ -109,7 +109,8 @@ namespace
 		TConstArrayView<uint8> Data;
 	};
 
-	FColor RGB(const FReader& R, int32 Pos) { return FColor(R.U8(Pos), R.U8(Pos + 1), R.U8(Pos + 2), 255); }
+	// (Not "RGB": that is a Windows macro, and unity builds can put a Windows header in front of this file.)
+	FColor ReadColor3(const FReader& R, int32 Pos) { return FColor(R.U8(Pos), R.U8(Pos + 1), R.U8(Pos + 2), 255); }
 
 	void ParseVertexMaterial(const FReader& R, const FChunk& C, FGenW3DVertexMaterial& Out)
 	{
@@ -120,10 +121,10 @@ namespace
 			case W3D_VERTEX_MATERIAL_NAME: Out.Name = R.Str(S.Start, S.End - S.Start); break;
 			case W3D_VERTEX_MATERIAL_INFO:
 				Out.Attributes = R.U32(S.Start);
-				Out.Ambient = RGB(R, S.Start + 4);
-				Out.Diffuse = RGB(R, S.Start + 8);
-				Out.Specular = RGB(R, S.Start + 12);
-				Out.Emissive = RGB(R, S.Start + 16);
+				Out.Ambient = ReadColor3(R, S.Start + 4);
+				Out.Diffuse = ReadColor3(R, S.Start + 8);
+				Out.Specular = ReadColor3(R, S.Start + 12);
+				Out.Emissive = ReadColor3(R, S.Start + 16);
 				Out.Shininess = R.F32(S.Start + 20);
 				Out.Opacity = R.F32(S.Start + 24);
 				Out.Translucency = R.F32(S.Start + 28);
@@ -626,6 +627,24 @@ EGenW3DBlend FGenW3DShader::GetBlend() const
 	if (SrcBlend == 0 && DestBlend == 2) { return EGenW3DBlend::Multiply; }
 	if (DestBlend == 3) { return EGenW3DBlend::Multiply; } // ONE, ONE_MINUS_SRC_COLOR (rare)
 	return AlphaTest ? EGenW3DBlend::AlphaTest : EGenW3DBlend::Opaque;
+}
+
+bool FGenW3DVertexMaterial::IsEnvironmentMapped() const
+{
+	switch (Stage0Mapping())
+	{
+	case GenW3D::MappingEnvironment:
+	case GenW3D::MappingCheapEnvironment:
+	case GenW3D::MappingWSClassicEnv:
+	case GenW3D::MappingWSEnvironment:
+	case GenW3D::MappingGridClassicEnv:
+	case GenW3D::MappingGridEnvironment:
+	case GenW3D::MappingGridWSClassicEnv:
+	case GenW3D::MappingGridWSEnvironment:
+		return true;
+	default:
+		return false;
+	}
 }
 
 int32 FGenW3DHierarchy::FindPivot(const FString& PivotName) const

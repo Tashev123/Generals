@@ -1,9 +1,12 @@
 #include "Game/GenPlayerController.h"
 #include "Core/GenCoords.h"
 #include "Game/GenCameraPawn.h"
+#include "Logic/GenCommandData.h"
 #include "Logic/GenGameData.h"
 #include "Logic/GenGameLogic.h"
+#include "Logic/GenUpgrades.h"
 #include "Map/GenMapActor.h"
+#include "W3D/GenModelComponent.h"
 #include "InputCoreTypes.h"
 
 namespace
@@ -46,6 +49,9 @@ bool AGenPlayerController::GetDragBox(FVector2D& OutA, FVector2D& OutB) const
 void AGenPlayerController::PlayerTick(float DeltaTime)
 {
 	Super::PlayerTick(DeltaTime);
+	int32 ViewX = 0, ViewY = 0;
+	GetViewportSize(ViewX, ViewY);
+	ControlBar.Layout(UGenGameLogic::Get(this), Selection, FVector2D(ViewX, ViewY));
 	if (!bGenInputEnabled)
 	{
 		return;
@@ -60,7 +66,305 @@ void AGenPlayerController::PlayerTick(float DeltaTime)
 	{
 		UpdateCamera(DeltaTime, Cam, MX, MY, bHasMouse);
 	}
+	UpdatePlacement(MX, MY, bHasMouse);
+	UpdateTargeting(MX, MY, bHasMouse);
 	UpdateSelectionInput(MX, MY, bHasMouse);
+}
+
+// ---- command bar and building placement ---------------------------------------------------------
+
+const FGenThingTemplate* AGenPlayerController::GetPlacement(FVector3f& OutPos, float& OutAngle, bool& bOutLegal) const
+{
+	if (!PlacingTemplate || !bPlacementValid)
+	{
+		return nullptr;
+	}
+	OutPos = PlacementPos;
+	OutAngle = PlacingTemplate->PlacementViewAngle;
+	bOutLegal = bPlacementLegal;
+	return PlacingTemplate;
+}
+
+void AGenPlayerController::ExecuteBarButton(const FGenBarButton& Button)
+{
+	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	if (!Logic)
+	{
+		return;
+	}
+	if (Button.bGeneralsToggle)
+	{
+		ControlBar.bGeneralsOpen = !ControlBar.bGeneralsOpen;
+		return;
+	}
+	if (Button.QueueIndex != INDEX_NONE)
+	{
+		Logic->IssueCancelUnit(Button.Source, Button.QueueIndex); // clicking a queued unit or upgrade cancels it
+		return;
+	}
+	if (!Button.bEnabled || !Button.Button)
+	{
+		return;
+	}
+	switch (Button.Button->Command)
+	{
+	case EGenCommand::UnitBuild:
+		Logic->IssueQueueUnit(Button.Source, Button.Thing->Name);
+		break;
+	case EGenCommand::DozerConstruct:
+		// Pick the spot next: the building follows the cursor until it is placed or cancelled.
+		EndPlacement();
+		EndTargeting();
+		PlacingTemplate = Button.Thing;
+		PlacingDozer = Button.Source;
+		break;
+	case EGenCommand::Sell:
+		Logic->IssueSell(Button.Source);
+		break;
+	case EGenCommand::Stop:
+		Logic->IssueStop(Selection);
+		break;
+	case EGenCommand::PlayerUpgrade:
+	case EGenCommand::ObjectUpgrade:
+		if (Button.Upgrade)
+		{
+			Logic->IssueQueueUpgrade(Button.Source, Button.Upgrade->Name);
+		}
+		break;
+	case EGenCommand::PurchaseScience:
+		Logic->IssuePurchaseScience(Logic->GetLocalPlayer(), Button.Science);
+		break;
+	case EGenCommand::ExitContainer:
+		Logic->IssueExit(Button.Rider);
+		break;
+	case EGenCommand::AttackMove:
+	case EGenCommand::Guard:
+	case EGenCommand::GuardWithoutPursuit:
+	case EGenCommand::GuardFlyingOnly:
+		BeginOrderTargeting(Button.Button);
+		break;
+	case EGenCommand::Evacuate:
+		Logic->IssueEvacuate(Button.Source);
+		break;
+	case EGenCommand::SpecialPower:
+		EndPlacement();
+		EndTargeting();
+		if (Button.Button->bNeedTargetPos || Button.Button->bNeedTargetObject)
+		{
+			// Pick the target next.
+			TargetingButton = Button.Button;
+			TargetingSource = Button.Source;
+			TargetingPower = Button.Power;
+			ControlBar.bGeneralsOpen = false;
+		}
+		else if (const FGenObject* Source = Logic->FindObject(Button.Source))
+		{
+			Logic->IssueSpecialPower(Button.Source, Button.Power, Source->GetPosition(), GenInvalidObjectID);
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+// ---- aiming a special power ---------------------------------------------------------------------
+
+const FGenCommandButton* AGenPlayerController::GetTargeting(FVector3f& OutPos, float& OutRadius, bool& bOutValid) const
+{
+	if (!TargetingButton)
+	{
+		return nullptr;
+	}
+	const FGenSpecialPowerTemplate* Power = FGenUpgradeData::Get().FindPower(TargetingPower);
+	OutPos = TargetingPos;
+	OutRadius = FMath::Max(TargetingButton->RadiusCursor, Power ? Power->RadiusCursorRadius : 0.f);
+	bOutValid = bTargetingValid;
+	return TargetingButton;
+}
+
+bool AGenPlayerController::TestClickButton(const FString& CommandButtonName)
+{
+	auto Find = [&CommandButtonName](const TArray<FGenBarButton>& List)
+	{
+		return List.FindByPredicate([&CommandButtonName](const FGenBarButton& B)
+		{
+			return B.Button && B.QueueIndex == INDEX_NONE && B.Button->Name.Equals(CommandButtonName, ESearchCase::IgnoreCase);
+		});
+	};
+	const FGenBarButton* Button = Find(ControlBar.Sciences);
+	if (!Button) { Button = Find(ControlBar.Shortcuts); }
+	if (!Button) { Button = Find(ControlBar.Buttons); }
+	if (!Button || !Button->bEnabled)
+	{
+		return false;
+	}
+	const FGenBarButton Copy = *Button;
+	ExecuteBarButton(Copy);
+	return true;
+}
+
+bool AGenPlayerController::TestFireAt(const FVector3f& Pos)
+{
+	if (!TargetingButton)
+	{
+		return false;
+	}
+	TargetingPos = Pos;
+	bTargetingValid = true;
+	const bool bFired = FireTargetedPower(0.f, 0.f);
+	if (bFired)
+	{
+		EndTargeting();
+	}
+	return bFired;
+}
+
+void AGenPlayerController::BeginOrderTargeting(const FGenCommandButton* Button)
+{
+	// Pick the spot next (no building fires this: the selection carries it out).
+	EndPlacement();
+	EndTargeting();
+	TargetingButton = Button;
+	ControlBar.bGeneralsOpen = false;
+}
+
+void AGenPlayerController::EndTargeting()
+{
+	TargetingButton = nullptr;
+	TargetingSource = GenInvalidObjectID;
+	TargetingPower.Reset();
+	bTargetingValid = false;
+}
+
+void AGenPlayerController::UpdateTargeting(float MX, float MY, bool bHasMouse)
+{
+	if (!TargetingButton)
+	{
+		return;
+	}
+	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	if (!Logic)
+	{
+		EndTargeting();
+		return;
+	}
+	if (TargetingPower.IsEmpty())
+	{
+		if (Selection.Num() == 0)
+		{
+			EndTargeting(); // an order with nobody left to give it to
+			return;
+		}
+	}
+	else
+	{
+		const FGenObject* Source = Logic->FindObject(TargetingSource);
+		if (!Source || Source->IsDead() || Source->GetOwner() != Logic->GetLocalPlayer())
+		{
+			EndTargeting(); // the building that would fire it is gone
+			return;
+		}
+	}
+	bTargetingValid = bHasMouse && !ControlBar.IsOverPanel(FVector2D(MX, MY)) && GetTerrainUnderCursor(MX, MY, TargetingPos);
+	if (bTargetingValid)
+	{
+		TargetingPos.Z = Logic->GetGroundHeight(TargetingPos.X, TargetingPos.Y);
+	}
+}
+
+bool AGenPlayerController::FireTargetedPower(float MX, float MY)
+{
+	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	if (!Logic || !TargetingButton)
+	{
+		return false;
+	}
+	FGenObjectID Target = GenInvalidObjectID;
+	FVector3f Pos = TargetingPos;
+	if (TargetingPower.IsEmpty())
+	{
+		// An order for the selection: attack-move to the spot, or guard the spot / the object clicked.
+		if (!bTargetingValid)
+		{
+			return false;
+		}
+		if (TargetingButton->Command == EGenCommand::AttackMove)
+		{
+			Logic->IssueAttackMove(Selection, Pos);
+			return true;
+		}
+		const FGenObjectID Hit = PickObject(MX, MY);
+		const FGenObject* HitObj = Hit != GenInvalidObjectID ? Logic->FindObject(Hit) : nullptr;
+		const bool bEscort = HitObj && Logic->GetRelationship(Logic->GetLocalPlayer(), HitObj->GetOwner()) != EGenRelationship::Enemies;
+		const EGenGuardMode Mode = TargetingButton->Command == EGenCommand::GuardWithoutPursuit ? EGenGuardMode::WithoutPursuit
+			: TargetingButton->Command == EGenCommand::GuardFlyingOnly ? EGenGuardMode::FlyingOnly : EGenGuardMode::Normal;
+		Logic->IssueGuard(Selection, bEscort ? HitObj->GetPosition() : Pos, bEscort ? Hit : GenInvalidObjectID, Mode);
+		return true;
+	}
+	if (TargetingButton->bNeedTargetObject && !TargetingButton->bNeedTargetPos)
+	{
+		// A power aimed at something (the cash hack at an enemy supply center).
+		Target = PickObject(MX, MY);
+		const FGenObject* Victim = Target != GenInvalidObjectID ? Logic->FindObject(Target) : nullptr;
+		if (!Victim || Victim->IsDead())
+		{
+			return false;
+		}
+		Pos = Victim->GetPosition();
+	}
+	else if (!bTargetingValid)
+	{
+		return false;
+	}
+	Logic->IssueSpecialPower(TargetingSource, TargetingPower, Pos, Target);
+	return true;
+}
+
+void AGenPlayerController::EndPlacement()
+{
+	PlacingTemplate = nullptr;
+	PlacingDozer = GenInvalidObjectID;
+	bPlacementValid = false;
+	if (PlacementGhost)
+	{
+		PlacementGhost->DestroyComponent();
+		PlacementGhost = nullptr;
+	}
+}
+
+void AGenPlayerController::UpdatePlacement(float MX, float MY, bool bHasMouse)
+{
+	if (!PlacingTemplate)
+	{
+		return;
+	}
+	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	const FGenObject* Dozer = Logic ? Logic->FindObject(PlacingDozer) : nullptr;
+	if (!Dozer || Dozer->IsDead() || !Selection.Contains(PlacingDozer) || !Logic->GetMapActor())
+	{
+		EndPlacement(); // the builder is gone or no longer selected
+		return;
+	}
+	bPlacementValid = bHasMouse && !ControlBar.IsOverPanel(FVector2D(MX, MY)) && GetTerrainUnderCursor(MX, MY, PlacementPos);
+	if (bPlacementValid)
+	{
+		PlacementPos.Z = Logic->GetGroundHeight(PlacementPos.X, PlacementPos.Y);
+		bPlacementLegal = Logic->CanMake(Logic->GetLocalPlayer(), *PlacingTemplate)
+			&& Logic->IsLocationLegalToBuild(*PlacingTemplate, PlacementPos, PlacingTemplate->PlacementViewAngle);
+	}
+	// A preview of the finished building under the cursor.
+	if (!PlacementGhost)
+	{
+		const TArray<FGenPlayer>& Players = Logic->GetPlayers();
+		const int32 Local = Logic->GetLocalPlayer();
+		PlacementGhost = Logic->GetMapActor()->CreateObjectVisual(*PlacingTemplate, Players.IsValidIndex(Local) ? Players[Local].Color : FLinearColor::White);
+	}
+	if (PlacementGhost)
+	{
+		PlacementGhost->SetVisibility(bPlacementValid, true);
+		PlacementGhost->SetRelativeLocationAndRotation(GenCoords::ToUE(PlacementPos.X, PlacementPos.Y, PlacementPos.Z),
+			FRotator(0.f, GenCoords::AngleToYaw(PlacingTemplate->PlacementViewAngle), 0.f));
+	}
 }
 
 void AGenPlayerController::UpdateCamera(float DeltaTime, AGenCameraPawn* Cam, float MX, float MY, bool bHasMouse)
@@ -111,7 +415,12 @@ void AGenPlayerController::UpdateCamera(float DeltaTime, AGenCameraPawn* Cam, fl
 		bRightDown = false;
 		if (!bRightScrolling)
 		{
-			Selection.Reset();
+			// Right click: back out of placing a building or aiming a power, close the promotions,
+			// otherwise clear the selection.
+			if (PlacingTemplate) { EndPlacement(); }
+			else if (TargetingButton) { EndTargeting(); }
+			else if (ControlBar.bGeneralsOpen) { ControlBar.bGeneralsOpen = false; }
+			else { Selection.Reset(); }
 		}
 		bRightScrolling = false;
 	}
@@ -158,8 +467,10 @@ void AGenPlayerController::UpdateSelectionInput(float MX, float MY, bool bHasMou
 			bLeftDown = true;
 			bBoxSelecting = false;
 			LeftStart = FVector2D(MX, MY);
+			bLeftOnUI = ControlBar.IsOverPanel(LeftStart);
 		}
-		if (!bBoxSelecting && FVector2D::Distance(LeftStart, FVector2D(MX, MY)) > DragThreshold)
+		// No drag box from the command bar, while placing a building or while aiming a power.
+		if (!bBoxSelecting && !bLeftOnUI && !PlacingTemplate && !TargetingButton && FVector2D::Distance(LeftStart, FVector2D(MX, MY)) > DragThreshold)
 		{
 			bBoxSelecting = true;
 		}
@@ -167,7 +478,31 @@ void AGenPlayerController::UpdateSelectionInput(float MX, float MY, bool bHasMou
 	else if (bLeftDown)
 	{
 		bLeftDown = false;
-		if (bBoxSelecting)
+		if (bLeftOnUI)
+		{
+			// A click on the command bar never reaches the world.
+			if (const FGenBarButton* Button = ControlBar.HitTest(FVector2D(MX, MY)))
+			{
+				const FGenBarButton Copy = *Button;
+				ExecuteBarButton(Copy);
+			}
+		}
+		else if (PlacingTemplate)
+		{
+			if (bPlacementValid && bPlacementLegal)
+			{
+				Logic->IssueConstruct(PlacingDozer, PlacingTemplate->Name, PlacementPos, PlacingTemplate->PlacementViewAngle);
+				EndPlacement();
+			}
+		}
+		else if (TargetingButton)
+		{
+			if (FireTargetedPower(MX, MY))
+			{
+				EndTargeting();
+			}
+		}
+		else if (bBoxSelecting)
 		{
 			BoxSelect(LeftStart, FVector2D(MX, MY), bShift);
 		}
@@ -185,7 +520,109 @@ void AGenPlayerController::UpdateSelectionInput(float MX, float MY, bool bHasMou
 				const FGenObject* O = Logic->FindObject(Id);
 				return O && O->GetOwner() == Local && (O->CanMove() || O->HasWeapons());
 			});
-			if (bOwn)
+			// Dozers of ours in the selection carry on an unfinished building when it is clicked.
+			TArray<FGenObjectID> Dozers;
+			if (bOwn && HitObj->IsUnderConstruction())
+			{
+				for (FGenObjectID Id : Selection)
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (O && O->GetOwner() == Local && O->GetTemplate()->bIsDozer) { Dozers.Add(Id); }
+				}
+			}
+			// Gatherers of ours in the selection go to work when a supply pile, or a supply center they
+			// have something for, is clicked.
+			TArray<FGenObjectID> Gatherers;
+			if (HitObj && HitObj->GetDock())
+			{
+				for (FGenObjectID Id : Selection)
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (O && O->GetOwner() == Local && Logic->CanTransferSuppliesAt(*O, *HitObj)) { Gatherers.Add(Id); }
+				}
+			}
+			// Aircraft of ours in the selection land at an airfield of ours when it is clicked.
+			TArray<FGenObjectID> Aircraft;
+			if (bOwn && HitObj->GetParking() && !HitObj->IsUnderConstruction())
+			{
+				for (FGenObjectID Id : Selection)
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (O && O->GetOwner() == Local && O->GetTemplate()->bJetAI) { Aircraft.Add(Id); }
+				}
+			}
+			// Dozers of ours in the selection mend a damaged building when it is clicked; damaged vehicles
+			// of ours drive in for repairs when it is a war factory of ours.
+			TArray<FGenObjectID> Repairers, Patients;
+			if (HitObj)
+			{
+				for (FGenObjectID Id : Selection)
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (!O || O->GetOwner() != Local) { continue; }
+					if (Logic->CanRepairObject(*O, *HitObj)) { Repairers.Add(Id); }
+					else if (Logic->CanGetRepairedAt(*O, *HitObj)) { Patients.Add(Id); }
+				}
+			}
+			// With nothing but factories of ours selected, a click on the ground sets their rally point.
+			TArray<FGenObjectID> RallyBuildings;
+			if (!HitObj)
+			{
+				for (FGenObjectID Id : Selection)
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (O && O->GetOwner() == Local && Logic->CanSetRallyPoint(*O))
+					{
+						RallyBuildings.Add(Id);
+					}
+					else
+					{
+						RallyBuildings.Reset();
+						break;
+					}
+				}
+			}
+			// Units of ours in the selection get into a transport, a garrison, a tunnel or a barracks
+			// when it is clicked (ActionManager::canEnterObject).
+			TArray<FGenObjectID> Enterers;
+			if (HitObj && HitObj->GetContain())
+			{
+				for (FGenObjectID Id : Selection)
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (O && O->GetOwner() == Local && Logic->CanEnterObject(*O, *HitObj, true)) { Enterers.Add(Id); }
+				}
+			}
+			FVector3f RallyPos;
+			if (Gatherers.Num() > 0)
+			{
+				Logic->IssueDock(Gatherers, Hit);
+			}
+			else if (Enterers.Num() > 0)
+			{
+				Logic->IssueEnter(Enterers, Hit);
+			}
+			else if (Repairers.Num() > 0 && !HitObj->IsUnderConstruction())
+			{
+				Logic->IssueRepair(Repairers, Hit);
+			}
+			else if (Patients.Num() > 0)
+			{
+				Logic->IssueGetRepaired(Patients, Hit);
+			}
+			else if (RallyBuildings.Num() > 0 && GetTerrainUnderCursor(MX, MY, RallyPos))
+			{
+				Logic->IssueSetRallyPoint(RallyBuildings, RallyPos);
+			}
+			else if (Aircraft.Num() > 0)
+			{
+				Logic->IssueLand(Aircraft, Hit);
+			}
+			else if (Dozers.Num() > 0)
+			{
+				Logic->IssueResumeConstruction(Dozers, Hit);
+			}
+			else if (bOwn)
 			{
 				if (!bShift)
 				{
@@ -213,6 +650,20 @@ void AGenPlayerController::UpdateSelectionInput(float MX, float MY, bool bHasMou
 	if (WasInputKeyJustPressed(EKeys::S) && Selection.Num() > 0)
 	{
 		Logic->IssueStop(Selection);
+	}
+	// A: attack-move, G: guard (then a left click says where).
+	const bool bHasMovers = Selection.ContainsByPredicate([Logic](FGenObjectID Id)
+	{
+		const FGenObject* O = Logic->FindObject(Id);
+		return O && O->GetOwner() == Logic->GetLocalPlayer() && O->CanMove();
+	});
+	if (bHasMovers && WasInputKeyJustPressed(EKeys::A))
+	{
+		BeginOrderTargeting(FGenCommandData::Get().FindButton(TEXT("Command_AttackMove")));
+	}
+	if (bHasMovers && WasInputKeyJustPressed(EKeys::G))
+	{
+		BeginOrderTargeting(FGenCommandData::Get().FindButton(TEXT("Command_Guard")));
 	}
 
 	// Drop objects that died or no longer exist.

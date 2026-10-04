@@ -12,6 +12,7 @@ Creates under /Game/Generals:
 
 Material parameters (set at runtime by UGenAssetSubsystem / UGenTerrainComponent):
   BaseTexture, UseTexture, Tint (rgb * diffuse, a = opacity), Emissive, HouseColor, HouseColorMode
+  EnvTexture, UnderTint, UnderlayMode (opaque first pass under an alpha-blended texture, see W3D_SHADE_HLSL)
   Atlas (terrain)
 Re-running is safe: existing assets are rebuilt in place.
 """
@@ -65,7 +66,15 @@ else
     c *= TintRGB;
 }
 c *= VColorRGB;
-return float4(c, a * TintA * VColorA);
+a *= TintA * VColorA;
+if (UnderlayMode > 0.5)
+{
+    // Two-pass "W3D Reflectivity" mesh: an opaque first pass (environment map or plain color) with this
+    // texture alpha-blended over it, so the first pass shows where the texture's alpha is below 1.
+    c = lerp(Under * UnderTint, c, saturate(a));
+    a = 1.0;
+}
+return float4(c, a);
 """
 
 
@@ -156,16 +165,52 @@ def build_w3d_material(name, lit, mpc=None):
     emissive = vector_param(mat, "Emissive", (0, 0, 0, 0), -900, 650)
     vcol = expr(mat, unreal.MaterialExpressionVertexColor, -900, 850)
 
+    if lit:
+        # First pass of two-pass "W3D Reflectivity" meshes: an environment map looked up with the camera-space
+        # reflection vector (EnvironmentMapperClass: uv = R.xy * 0.5 + 0.5), tinted by that pass's diffuse color.
+        refl = expr(mat, unreal.MaterialExpressionReflectionVectorWS, -1900, 1200)
+        to_view = expr(mat, unreal.MaterialExpressionTransform, -1700, 1200)
+        to_view.set_editor_property("transform_source_type", unreal.MaterialVectorCoordTransformSource.TRANSFORMSOURCE_WORLD)
+        to_view.set_editor_property("transform_type", unreal.MaterialVectorCoordTransform.TRANSFORM_VIEW)
+        MEL.connect_material_expressions(refl, "", to_view, "")
+        refl_xy = mask(mat, to_view, "", (True, True, False, False), -1500, 1200)
+        half = expr(mat, unreal.MaterialExpressionMultiply, -1350, 1200)
+        half.set_editor_property("const_b", 0.5)
+        MEL.connect_material_expressions(refl_xy, "", half, "A")
+        env_uv = expr(mat, unreal.MaterialExpressionAdd, -1200, 1200)
+        env_uv.set_editor_property("const_b", 0.5)
+        MEL.connect_material_expressions(half, "", env_uv, "A")
+        under = expr(mat, unreal.MaterialExpressionTextureSampleParameter2D, -1000, 1200)
+        under.set_editor_property("parameter_name", "EnvTexture")
+        if white:
+            under.set_editor_property("texture", white)
+        MEL.connect_material_expressions(env_uv, "", under, "UVs")
+        under_out = "RGB"
+        under_tint = vector_param(mat, "UnderTint", (1, 1, 1, 1), -900, 1450)
+        underlay_mode = scalar_param(mat, "UnderlayMode", 0.0, -900, 1650)
+    else:
+        # Unlit (additive / multiply) sections never have an underlay; constants let the compiler drop it.
+        under = expr(mat, unreal.MaterialExpressionConstant3Vector, -900, 1200)
+        under.set_editor_property("constant", unreal.LinearColor(1, 1, 1, 1))
+        under_out = ""
+        under_tint = under
+        underlay_mode = expr(mat, unreal.MaterialExpressionConstant, -900, 1450)
+        underlay_mode.set_editor_property("r", 0.0)
+
     custom = expr(mat, unreal.MaterialExpressionCustom, -500, 0)
     custom.set_editor_property("code", W3D_SHADE_HLSL)
     custom.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT4)
     custom.set_editor_property("description", "W3DShade")
     inputs = []
-    for n in ("Tex", "UseTexture", "TintRGB", "TintA", "HouseColor", "HouseColorMode", "VColorRGB", "VColorA"):
+    for n in ("Tex", "UseTexture", "TintRGB", "TintA", "HouseColor", "HouseColorMode", "VColorRGB", "VColorA",
+              "Under", "UnderTint", "UnderlayMode"):
         ci = unreal.CustomInput()
         ci.set_editor_property("input_name", n)
         inputs.append(ci)
     custom.set_editor_property("inputs", inputs)
+    MEL.connect_material_expressions(under, under_out, custom, "Under")
+    MEL.connect_material_expressions(under_tint, "", custom, "UnderTint")
+    MEL.connect_material_expressions(underlay_mode, "", custom, "UnderlayMode")
     MEL.connect_material_expressions(tex, "RGBA", custom, "Tex")
     MEL.connect_material_expressions(use_tex, "", custom, "UseTexture")
     MEL.connect_material_expressions(tint, "", custom, "TintRGB")

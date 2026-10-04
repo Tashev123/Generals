@@ -100,6 +100,13 @@ bool FGenObject::HasWeapons() const
 	return false;
 }
 
+int32 FGenObject::GetDamageState() const
+{
+	if (ModelConditions.Test(GenConditions::Rubble())) { return 3; }
+	if (ModelConditions.Test(GenConditions::ReallyDamaged())) { return 2; }
+	return ModelConditions.Test(GenConditions::Damaged()) ? 1 : 0;
+}
+
 bool FGenObject::ContainsPoint(const FVector3f& P) const
 {
 	if (P.Z < Position.Z - 1.f || P.Z > Position.Z + FMath::Max(Template->GeometryHeight, 1.f) + 1.f)
@@ -118,9 +125,9 @@ bool FGenObject::ContainsPoint(const FVector3f& P) const
 
 bool FGenObject::IsTargetable() const
 {
-	if (bDead || bPendingDestroy || Projectile.bActive)
+	if (bDead || bPendingDestroy || Projectile.bActive || ContainedBy != GenInvalidObjectID)
 	{
-		return false;
+		return false; // (what is inside a container can only be got at through the container)
 	}
 	// Objects without a real body (InactiveBody: trees, props, decorations) can't be damaged.
 	if (Template->BodyType.IsEmpty() || Template->BodyType.Equals(TEXT("InactiveBody"), ESearchCase::IgnoreCase))
@@ -144,8 +151,16 @@ int32 FGenObject::TurretForSlot(int32 Slot) const
 
 bool FGenObject::CanWeaponTarget(const FGenWeaponTemplate& W, const FGenObject& Target) const
 {
-	// Everything is on the ground until aircraft fly.
-	return W.PrimaryDamage > 0.f && W.bAntiGround;
+	// WeaponTemplate anti-mask: aircraft up in the air need an anti-air weapon, everything else a ground one.
+	if (W.PrimaryDamage <= 0.f)
+	{
+		return false;
+	}
+	if (Target.IsAirborneTarget())
+	{
+		return Target.IsKindOf(TEXT("INFANTRY")) ? W.bAntiAirborneInfantry : W.bAntiAirborneVehicle;
+	}
+	return W.bAntiGround;
 }
 
 float FGenObject::AttackDistance(const FGenObject& Target) const
@@ -185,9 +200,9 @@ int32 FGenObject::ChooseWeapon(const FGenObject& Target) const
 	for (int32 s = 0; s < 3; ++s)
 	{
 		const FGenWeaponTemplate* W = Weapons[s].Template;
-		if (!W || !CanWeaponTarget(*W, Target))
+		if (!W || !CanWeaponTarget(*W, Target) || IsWeaponOutOfAmmo(s))
 		{
-			continue;
+			continue; // (a plane's missiles are gone until it has been home)
 		}
 		const float Damage = Target.Armor ? Target.Armor->AdjustDamage(W->DamageType, W->PrimaryDamage) : W->PrimaryDamage;
 		if (Damage > BestDamage)
@@ -217,7 +232,7 @@ FGenObject* FGenObject::FindAutoTarget() const
 			continue;
 		}
 		const float Dist = AttackDistance(*O);
-		if (Dist <= Weapons[Slot].Template->AttackRange && Dist < BestDist)
+		if (Dist <= GetAttackRange(*Weapons[Slot].Template) && Dist < BestDist)
 		{
 			BestDist = Dist;
 			Best = O;
@@ -233,6 +248,16 @@ void FGenObject::CommandAttack(FGenObjectID Target)
 	if (bDead || !HasWeapons() || Target == ID)
 	{
 		return;
+	}
+	if (bJetAI)
+	{
+		FJetCommand Cmd;
+		Cmd.Type = FJetCommand::Attack;
+		Cmd.Target = Target;
+		if (JetInterceptCommand(Cmd))
+		{
+			return;
+		}
 	}
 	TargetID = Target;
 	bExplicitAttack = true;
@@ -266,9 +291,16 @@ bool FGenObject::AimAt(const FGenObject& Target, int32 Slot)
 	const FGenWeaponTemplate& W = *Weapons[Slot].Template;
 	const float Desired = FMath::Atan2(Target.Position.Y - Position.Y, Target.Position.X - Position.X);
 	const float Tolerance = W.AcceptableAimDelta + AimThreshold;
+	if (ContainedBy != GenInvalidObjectID)
+	{
+		// Shooting out of a window or a firing port: no turning on the spot in there.
+		SetOrientation(Desired);
+		return true;
+	}
 
 	const int32 T = TurretForSlot(Slot);
-	if (T != INDEX_NONE)
+	// (A turret that cannot turn is only there to allow firing on the move, as on the Comanche: the body aims.)
+	if (T != INDEX_NONE && Template->Turrets[T].TurnRate > 0.f)
 	{
 		// TurretAI: rotate the turret (relative to the body) towards the target.
 		const float DesiredRel = GenLogic::AngleDiff(Desired, Orientation);
@@ -357,14 +389,23 @@ void FGenObject::FireWeapon(int32 Slot, FGenObject& Target, uint32 Frame)
 	FiringConditionEnd[Slot] = Frame + 1;
 
 	// Rate of fire and clips (Weapon::privateFireWeapon / reloadWithBonus).
-	const int32 ShotDelay = Rand.RandRange(W.DelayBetweenShotsMin, FMath::Max(W.DelayBetweenShotsMin, W.DelayBetweenShotsMax));
+	// (The RATE_OF_FIRE bonuses -- veterancy -- shorten both the time between shots and the reload.)
+	const float RateOfFire = GetWeaponBonus(W, FGenWeaponBonus::RateOfFire);
+	const int32 ShotDelay = FMath::RoundToInt32(float(Rand.RandRange(W.DelayBetweenShotsMin, FMath::Max(W.DelayBetweenShotsMin, W.DelayBetweenShotsMax))) / RateOfFire);
 	WI.bReloading = false;
 	if (W.ClipSize > 0)
 	{
 		if (--WI.AmmoInClip <= 0)
 		{
+			if (W.ReloadType != EGenReloadType::Auto)
+			{
+				// OUT_OF_AMMO: the clip stays empty (a plane reloads at its airfield).
+				WI.AmmoInClip = 0;
+				WI.ReadyFrame = Frame + FMath::Max(1, ShotDelay);
+				return;
+			}
 			WI.AmmoInClip = W.ClipSize;
-			WI.ReadyFrame = Frame + FMath::Max(1, W.ClipReloadTime);
+			WI.ReadyFrame = Frame + FMath::Max(1, FMath::RoundToInt32(float(W.ClipReloadTime) / RateOfFire));
 			WI.bReloading = true;
 			return;
 		}
@@ -377,15 +418,28 @@ void FGenObject::UpdateCombat(uint32 Frame)
 	PrevTurretAngle[0] = TurretAngle[0];
 	PrevTurretAngle[1] = TurretAngle[1];
 
-	FGenObject* Target = TargetID != GenInvalidObjectID ? Logic->FindObject(TargetID) : nullptr;
+	if (Delivery)
+	{
+		return; // an aircraft on a delivery run has its own orders
+	}
+	// An aircraft on the ground, or busy taking off, landing or flying home, does not fight.
+	const bool bJetBusy = bJetAI && (JetState != EGenJetState::None || !bJetAllowAirLoco);
+	// Planes (unlike helicopters) attack only what they are sent against.
+	const bool bNoAutoAcquire = bJetBusy || (bJetAI && !Template->bAutoAcquireEnemiesWhenIdle);
+
+	FGenObject* Target = (TargetID != GenInvalidObjectID && !bJetBusy) ? Logic->FindObject(TargetID) : nullptr;
 	if (TargetID != GenInvalidObjectID && (!Target || !Target->IsTargetable()))
 	{
 		ClearAttack();
 		Target = nullptr;
+		if (bJetAI && Template->bJetNeedsRunway && !bJetBusy)
+		{
+			JetReturnToBaseFrame = Frame; // JetAIUpdate::notifyVictimIsDead: job done, home we go
+		}
 	}
 
 	// Idle units look for enemies in weapon range (AutoAcquireEnemiesWhenIdle).
-	if (!Target && !bMoving && Frame >= NextAutoAcquireFrame)
+	if (!Target && !bMoving && !bNoAutoAcquire && Frame >= NextAutoAcquireFrame)
 	{
 		NextAutoAcquireFrame = Frame + uint32(GenLogic::GetLogicFPS() / 2) + (ID % 7);
 		if (FGenObject* Found = FindAutoTarget())
@@ -408,18 +462,25 @@ void FGenObject::UpdateCombat(uint32 Frame)
 		}
 	}
 
-	if (Target)
+	if (Target && HasMinSpeed() && IsUsingAirLoco() && (bExplicitAttack || AttackDistance(*Target) <= GetAttackRange(*Weapons[ActiveSlot].Template)))
+	{
+		// A plane cannot stop to aim: it flies attack passes.
+		UpdateJetAttack(*Target, ActiveSlot, Frame);
+		bAiming = true;
+	}
+	else if (Target)
 	{
 		const FGenWeaponInstance& WI = Weapons[ActiveSlot];
 		const float Dist = AttackDistance(*Target);
-		if (Dist > WI.Template->AttackRange)
+		const float Range = GetAttackRange(*WI.Template);
+		if (Dist > Range)
 		{
-			if (bExplicitAttack && CanMove())
+			if (bExplicitAttack && CanMove() && ContainedBy == GenInvalidObjectID)
 			{
 				// Approach: head for a free spot within range, refreshed while the target moves.
 				if (!bMovingOutOfWay && (!bMoving || Frame >= NextRepathFrame))
 				{
-					StartApproach(*Target, WI.Template->AttackRange);
+					StartApproach(*Target, Range);
 					NextRepathFrame = Frame + uint32(GenLogic::GetLogicFPS());
 				}
 			}
@@ -434,7 +495,7 @@ void FGenObject::UpdateCombat(uint32 Frame)
 			// In range. While still rolling onto the spot we reserved for this attack (it lies within range
 			// too) keep going, so attackers line up next to each other instead of stopping in a heap where
 			// they first got in range. Any other movement ends here, except stepping out of a unit's way.
-			const bool bRollingToSpot = bMoving && IsWithinRangeFrom(FVector2f(Goal.X, Goal.Y), *Target, WI.Template->AttackRange);
+			const bool bRollingToSpot = bMoving && IsWithinRangeFrom(FVector2f(Goal.X, Goal.Y), *Target, Range);
 			if (bMoving && !bMovingOutOfWay && !bRollingToSpot)
 			{
 				CommandStop();
@@ -506,17 +567,27 @@ void FGenObject::AttemptDamage(float Amount, const FString& DamageType, const FS
 		return;
 	}
 	const bool bImmortal = Template->BodyType.Equals(TEXT("ImmortalBody"), ESearchCase::IgnoreCase);
+	const int32 OldDamageState = GetDamageState();
+	LastDamageFrame = Logic->GetFrame();
 	Health = FMath::Max(bImmortal ? 1.f : 0.f, Health - Amount);
 
 	// ActiveBody::setCorrectDamageState -> Drawable::reactToBodyDamageStateChange: exactly one of
 	// DAMAGED / REALLYDAMAGED / RUBBLE (zero health) is set.
 	const FGenGameData& GD = FGenGameData::Get();
 	const float Ratio = MaxHealth > 0.f ? Health / MaxHealth : 0.f;
+	// (A construction site has little health by design: it only shows damage states once it is finished.)
 	const bool bRubble = Ratio <= 0.f;
-	const bool bReally = !bRubble && Ratio <= GD.UnitReallyDamagedThreshold;
+	const bool bReally = !bRubble && !bUnderConstruction && Ratio <= GD.UnitReallyDamagedThreshold;
 	SetModelCondition(GenConditions::Rubble(), bRubble);
 	SetModelCondition(GenConditions::ReallyDamaged(), bReally);
-	SetModelCondition(GenConditions::Damaged(), !bRubble && !bReally && Ratio <= GD.UnitDamagedThreshold);
+	SetModelCondition(GenConditions::Damaged(), !bRubble && !bReally && !bUnderConstruction && Ratio <= GD.UnitDamagedThreshold);
+
+	// TransitionDamageFX: effects for crossing into a worse damage state.
+	const int32 NewDamageState = GetDamageState();
+	if (NewDamageState > OldDamageState)
+	{
+		Logic->DoTransitionDamageFX(*this, NewDamageState);
+	}
 
 	if (Health <= 0.f)
 	{
@@ -524,8 +595,9 @@ void FGenObject::AttemptDamage(float Amount, const FString& DamageType, const FS
 		return;
 	}
 
-	// Fight back when attacked while idle.
-	if (TargetID == GenInvalidObjectID && !bMoving && HasWeapons())
+	// Fight back when attacked while idle (parked aircraft and planes without orders don't).
+	const bool bNoRetaliation = bJetAI && (JetState != EGenJetState::None || !bJetAllowAirLoco || !Template->bAutoAcquireEnemiesWhenIdle);
+	if (TargetID == GenInvalidObjectID && !bMoving && HasWeapons() && !bNoRetaliation)
 	{
 		const FGenObject* Attacker = Logic->FindObject(Source);
 		if (Attacker && Attacker->IsTargetable() && Logic->GetRelationship(Owner, Attacker->Owner) == EGenRelationship::Enemies
@@ -538,6 +610,22 @@ void FGenObject::AttemptDamage(float Amount, const FString& DamageType, const FS
 	}
 }
 
+void FGenObject::AttemptHealing(float Amount)
+{
+	if (bDead || bPendingDestroy || Amount <= 0.f || Health >= MaxHealth)
+	{
+		return;
+	}
+	Health = FMath::Min(MaxHealth, Health + Amount);
+	// ActiveBody::setCorrectDamageState
+	const FGenGameData& GD = FGenGameData::Get();
+	const float Ratio = MaxHealth > 0.f ? Health / MaxHealth : 0.f;
+	const bool bReally = !bUnderConstruction && Ratio <= GD.UnitReallyDamagedThreshold;
+	SetModelCondition(GenConditions::Rubble(), false);
+	SetModelCondition(GenConditions::ReallyDamaged(), bReally);
+	SetModelCondition(GenConditions::Damaged(), !bReally && !bUnderConstruction && Ratio <= GD.UnitDamagedThreshold);
+}
+
 void FGenObject::Die(const FString& DeathType, FGenObjectID Killer)
 {
 	if (bDead)
@@ -546,8 +634,24 @@ void FGenObject::Die(const FString& DeathType, FGenObjectID Killer)
 	}
 	const uint32 Frame = Logic->GetFrame();
 	bDead = true;
+	if (Parking)
+	{
+		Parking->KillAllParkedUnits(); // ParkingPlaceBehavior::onDie: aircraft on the ground go with their airfield
+	}
+	if (JetState != EGenJetState::None)
+	{
+		SetJetState(EGenJetState::None, Frame); // gives back the runway
+	}
+	AIMode = EGenAIMode::None;
 	ClearAttack();
+	StopDocking(); // whoever was queueing behind us at a dock moves up
 	CommandStop();
+	if (bFlies && IsAirborneTarget())
+	{
+		// Shot out of the sky: the wreck falls (the helicopter and jet crash behaviours aren't ported yet).
+		bFreePhysics = true;
+		YawRate = Logic->GetRandom().FRandRange(-0.12f, 0.12f);
+	}
 	if (!bFreePhysics)
 	{
 		Velocity = FVector3f::ZeroVector; // thrown wrecks keep flying while they die
@@ -560,6 +664,23 @@ void FGenObject::Die(const FString& DeathType, FGenObjectID Killer)
 	SetModelCondition(GenConditions::Moving(), false);
 	SetModelCondition(DyingIndex(), true);
 	Logic->OnObjectDied(*this);
+	Logic->OnObjectKilled(*this, Killer);
+	Logic->OnContainerDied(*this);
+	StopEntering();
+	for (const FProduction& P : Production)
+	{
+		if (P.Upgrade) { Logic->CancelUpgradeInProduction(Owner, *P.Upgrade); }
+	}
+	// FireWeaponWhenDeadBehavior: a bomb's bang is the weapon it "fires" where it dies.
+	for (const FString& WeaponName : Template->DeathWeapons)
+	{
+		if (const FGenWeaponTemplate* W = FGenGameData::Get().FindWeapon(WeaponName))
+		{
+			Logic->DoFXPos(W->FireFX, Position, nullptr, 0.f, nullptr, W->PrimaryDamageRadius);
+			if (!W->FireOCL.IsEmpty()) { Logic->DoOCL(W->FireOCL, *this); }
+			Logic->DealDamage(*W, ID, GenInvalidObjectID, Position, true);
+		}
+	}
 
 	// Die modules: every one whose DeathTypes apply runs (FXListDie, CreateObjectDie, DestroyDie, InstantDeathBehavior).
 	FRandomStream& Rand = Logic->GetRandom();
@@ -578,6 +699,14 @@ void FGenObject::Die(const FString& DeathType, FGenObjectID Killer)
 	{
 		DestroyFrame = Frame + 1;
 		return;
+	}
+	if (Template->JetDeath.bValid && DeathTypeApplies(Template->JetDeath.DeathTypes, DeathType) && BeginJetDeath(DeathType, Frame))
+	{
+		return; // JetSlowDeathBehavior: blown up on the ground, or rolling out of the sky
+	}
+	if (Template->HeliDeath.bValid && DeathTypeApplies(Template->HeliDeath.DeathTypes, DeathType) && BeginHeliDeath(Frame))
+	{
+		return; // HelicopterSlowDeathBehavior: spiralling down
 	}
 
 	// Pick one applicable SlowDeathBehavior, weighted by ProbabilityModifier.
@@ -645,10 +774,29 @@ void FGenObject::DoDeathPhase(int32 Phase)
 	const TArray<FString>& OCL = SlowDeath->OCL[Phase];
 	if (FX.Num() > 0) { Logic->DoFXObj(FX[Rand.RandRange(0, FX.Num() - 1)], *this); }
 	if (OCL.Num() > 0) { Logic->DoOCL(OCL[Rand.RandRange(0, OCL.Num() - 1)], *this); }
+	const TArray<FString>& PhaseWeapons = SlowDeath->Weapons[Phase];
+	if (PhaseWeapons.Num() > 0)
+	{
+		if (const FGenWeaponTemplate* W = FGenGameData::Get().FindWeapon(PhaseWeapons[Rand.RandRange(0, PhaseWeapons.Num() - 1)]))
+		{
+			Logic->DoFXPos(W->FireFX, Position, nullptr, 0.f, nullptr, W->PrimaryDamageRadius);
+			Logic->DealDamage(*W, ID, GenInvalidObjectID, Position, true);
+		}
+	}
 }
 
 void FGenObject::UpdateDying(uint32 Frame)
 {
+	if (bJetDying)
+	{
+		UpdateJetDying(Frame);
+		return;
+	}
+	if (bHeliDying)
+	{
+		UpdateHeliDying(Frame);
+		return;
+	}
 	if (SlowDeath && !bMidpointDone && Frame >= MidpointFrame)
 	{
 		bMidpointDone = true;
@@ -739,7 +887,14 @@ void FGenObject::UpdateProjectile(uint32 Frame)
 		const FVector3f Aim = Projectile.End;
 		const FVector3f Delta = Aim - Position;
 		const float Dist = Delta.Size();
-		const float Speed = FMath::Max(W.WeaponSpeed, 0.01f);
+		float Speed = W.WeaponSpeed;
+		if (Template->bIsMissile && !Template->bMissileUseWeaponSpeed && Locomotor)
+		{
+			// MissileAIUpdate: a missile flies on its own locomotor (the weapon's speed only counts with
+			// UseWeaponSpeed); until its engine lights it coasts at the speed it was launched with.
+			Speed = Projectile.Step++ < Template->MissileIgnitionDelay ? Template->MissileInitialVelocity : Locomotor->Speed;
+		}
+		Speed = FMath::Max(Speed, 0.01f);
 		if (Dist <= Speed)
 		{
 			NewPos = Aim;
@@ -795,7 +950,8 @@ void FGenObject::UpdateProjectile(uint32 Frame)
 		{
 			Logic->DoOCL(W.ProjectileDetonationOCL, *this);
 		}
-		Logic->DealDamage(W, Projectile.Launcher, Projectile.Victim, Position, true);
+		// (With the launcher gone the shot itself answers for the damage, so its player still gets the credit.)
+		Logic->DealDamage(W, Logic->FindObject(Projectile.Launcher) ? Projectile.Launcher : ID, Projectile.Victim, Position, true);
 		bPendingDestroy = true;
 	}
 }

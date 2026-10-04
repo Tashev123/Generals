@@ -50,6 +50,8 @@ public:
 	/** Particle system that follows an object (projectile exhaust, debris trails). */
 	FGenParticleSystem* CreateAttachedSystem(const FString& TemplateName, FGenObjectID Object);
 	void OnObjectDestroyed(FGenObjectID Object);
+	/** Stops a system from emitting; it is removed once its particles have died. */
+	void DestroySystem(uint32 SystemID);
 
 	void AddScorch(const FVector3f& Pos, float Radius, int32 Type);
 

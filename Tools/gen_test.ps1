@@ -19,6 +19,16 @@ param(
     [string]$EnemyAt = "",
     [switch]$TestAttack,
     [string]$TestFX = "",
+    [string]$TestBuild = "",
+    [string]$TestQueue = "",
+    [string]$TestSelect = "",
+    [int]$TestGather = 0,
+    [string]$TestJets = "",
+    [string]$TestPowers = "",
+    [double]$Speed = 0,
+    [string]$Enemy = "",
+    [string]$Difficulty = "",
+    [switch]$NoAI,
     [switch]$Trace,
     [int]$Seed = 0,
     [int]$PauseFrame = 0,
@@ -50,13 +60,25 @@ if ($Enemies) { $args += "-GenEnemyObject=$Enemies" }
 if ($EnemyAt) { $args += "-GenEnemyAt=$EnemyAt" }
 if ($TestAttack) { $args += "-GenTestAttack" }
 if ($TestFX) { $args += "-GenTestFX=$TestFX" }
+if ($TestBuild) { $args += "-GenTestBuild=$TestBuild" }
+if ($TestQueue) { $args += "-GenTestQueue=$TestQueue" }
+if ($TestSelect) { $args += "-GenTestSelect=$TestSelect" }
+if ($TestGather) { $args += "-GenTestGather=$TestGather" }
+if ($TestJets) { $args += "-GenTestJets=`"$TestJets`"" }
+if ($TestPowers) { $args += "-GenTestPowers=`"$TestPowers`"" }
+if ($Speed) { $args += "-GenSpeed=$Speed" }
+if ($Enemy) { $args += "-GenEnemy=$Enemy" }
+if ($Difficulty) { $args += "-GenDifficulty=$Difficulty" }
+if ($NoAI) { $args += "-GenNoAI" }
 if ($Trace) { $args += "-GenTrace" }
 if ($Seed) { $args += "-GenSeed=$Seed" }
 if ($PauseFrame) { $args += "-GenPauseFrame=$PauseFrame" }
 if ($Faction) { $args += "-GenFaction=$Faction" }
 if ($Shot) {
+    # Relative paths are taken from the project folder; quoted, since that path contains a space.
+    if (-not [IO.Path]::IsPathRooted($Shot)) { $Shot = Join-Path (Split-Path $proj) $Shot }
     $shotPath = [IO.Path]::GetFullPath($Shot).Replace("\", "/")
-    $args += "-GenShot=$shotPath"
+    $args += "-GenShot=`"$shotPath`""
     $args += "-GenShotDelay=$Delay"
 }
 if ($Extra) { $args += $Extra }

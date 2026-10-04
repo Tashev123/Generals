@@ -37,6 +37,11 @@ FGenObject::FGenObject(FGenObjectID InID, const FGenThingTemplate* InTemplate, i
 			}
 		}
 	}
+	bFlies = Locomotor && Locomotor->IsAirOnly();
+	InitJet();
+	bSpawnPending = !Template->SpawnTemplate.IsEmpty() && Template->SpawnNumber > 0;
+	InitSupply();
+	InitContain();
 	bAllowBounce = Template->bAllowBouncing;
 	if (Template->bHasLifetime)
 	{
@@ -45,6 +50,14 @@ FGenObject::FGenObject(FGenObjectID InID, const FGenThingTemplate* InTemplate, i
 		LifetimeDieFrame = Logic->GetFrame() + uint32(FMath::Max(1, Delay));
 	}
 	InitCombat();
+	InitUpgrades();
+	InitPayload();
+	InitVeterancy();
+}
+
+bool FGenObject::IsDisabled() const
+{
+	return Logic->GetFrame() < DisabledUntilFrame;
 }
 
 void FGenObject::SetRotation(const FQuat4f& Q)
@@ -67,7 +80,7 @@ bool FGenObject::IsKindOf(const TCHAR* Kind) const
 
 bool FGenObject::IsSelectable() const
 {
-	return !bDead && !bPendingDestroy && Template->IsKindOf(TEXT("SELECTABLE"));
+	return !bDead && !bPendingDestroy && ContainedBy == GenInvalidObjectID && Template->IsKindOf(TEXT("SELECTABLE"));
 }
 
 // ---- orders -------------------------------------------------------------------------------------
@@ -78,14 +91,57 @@ void FGenObject::CommandMoveTo(const FVector3f& InGoal)
 	{
 		return;
 	}
+	if (bJetAI)
+	{
+		// A parked aircraft takes off first; one that is taking off or landing remembers the order.
+		FJetCommand Cmd;
+		Cmd.Type = FJetCommand::Move;
+		Cmd.Pos = InGoal;
+		if (JetInterceptCommand(Cmd))
+		{
+			return;
+		}
+	}
 	bMovingOutOfWay = false;
 	bHasResumeGoal = false;
 	MoveOutOfWayOf = GenInvalidObjectID;
 	StartPath(InGoal, false);
 }
 
+void FGenObject::StartDirectMove(const FVector3f& InGoal)
+{
+	Path.Reset();
+	Path.Add(FVector2f(InGoal.X, InGoal.Y));
+	PathIndex = 0;
+	PathStart = FVector2f(Position.X, Position.Y);
+	Goal = FVector3f(InGoal.X, InGoal.Y, Logic->GetGroundHeight(InGoal.X, InGoal.Y));
+	RequestedGoal = InGoal;
+	if (!bFlies)
+	{
+		Logic->GetPathfinder().UpdateUnitGoal(ID, Path[0], Template->GetBoundingCircleRadius());
+	}
+	bMoving = true;
+	StuckFrames = 0;
+	BlockedFrames = 0;
+	bBlocked = false;
+	bBlockedAndStuck = false;
+	bSidestepPath = false;
+	bLocoBraking = false;
+	BrakingFactor = 1.f;
+}
+
 bool FGenObject::StartPath(const FVector3f& InGoal, bool bAroundUnits, const TFunction<bool(const FVector2f&)>* Accept)
 {
+	if (bFlies)
+	{
+		// Aircraft need no path: they fly straight there (Pathfinder::findPath for an AIR-only locomotor set),
+		// ending where no other aircraft hovers or is headed.
+		FVector2f Spot(InGoal.X, InGoal.Y);
+		Logic->AdjustAirDestination(*this, Spot);
+		StartDirectMove(FVector3f(Spot.X, Spot.Y, InGoal.Z));
+		RequestedGoal = InGoal;
+		return true;
+	}
 	FGenPathfinder& PF = Logic->GetPathfinder();
 	const float Footprint = Template->GetBoundingCircleRadius();
 	const FVector2f From(Position.X, Position.Y);
@@ -113,6 +169,7 @@ bool FGenObject::StartPath(const FVector3f& InGoal, bool bAroundUnits, const TFu
 	}
 	Path = MoveTemp(NewPath);
 	PathIndex = 0;
+	PathStart = From;
 	const FVector2f End = Path.Last();
 	Goal = FVector3f(End.X, End.Y, Logic->GetGroundHeight(End.X, End.Y));
 	RequestedGoal = InGoal;
@@ -136,7 +193,7 @@ void FGenObject::CommandStop()
 	bLocoBraking = false;
 	bMovingOutOfWay = false;
 	bHasResumeGoal = false;
-	if (Locomotor && !bDead)
+	if (Locomotor && !bDead && !bFlies)
 	{
 		// Where we stand is now our destination.
 		Logic->GetPathfinder().UpdateUnitGoal(ID, FVector2f(Position.X, Position.Y), Template->GetBoundingCircleRadius());
@@ -161,10 +218,99 @@ void FGenObject::Update(uint32 Frame)
 		UpdateDying(Frame);
 		return;
 	}
+	if (bHeldByParachute)
+	{
+		return; // hanging under a parachute: the parachute moves us
+	}
+	if (ContainedBy != GenInvalidObjectID)
+	{
+		UpdateContained(Frame); // rides along; shoots out if the container lets it
+		return;
+	}
 	if (LifetimeDieFrame != 0 && Frame >= LifetimeDieFrame)
 	{
 		Kill();
 		return;
+	}
+	if (SellFrame != 0)
+	{
+		// BuildAssistant sell list: the building is taken down, then its owner is refunded.
+		if (Frame >= SellFrame)
+		{
+			Logic->FinishSell(*this);
+			bPendingDestroy = true;
+		}
+		return;
+	}
+	if (bUnderConstruction)
+	{
+		// A construction site does nothing by itself; without a dozer at work it just waits.
+		static const int32 ActivelyBeingConstructed = GenConditions::Index(TEXT("ACTIVELY_BEING_CONSTRUCTED"));
+		SetModelCondition(ActivelyBeingConstructed, Frame <= LastBuiltFrame + 1);
+		return;
+	}
+	if (bSpawnPending)
+	{
+		// SpawnBehavior: a finished building's own units come out (a supply center's first gatherer).
+		bSpawnPending = false;
+		Logic->SpawnBuildingUnits(*this);
+	}
+	if (Contain)
+	{
+		Logic->UpdateContain(*this);
+	}
+	if (bAutoHealActive)
+	{
+		UpdateAutoHeal(Frame);
+	}
+	if (AreaWeapons.Num() > 0)
+	{
+		UpdateAreaWeapons(Frame);
+	}
+	if ((Template->bHasDeletion || Template->bHeightDie || bFalling || ParachuteRider != GenInvalidObjectID) && !UpdatePayload(Frame))
+	{
+		return; // deleted, gone off, or a parachute on its way down
+	}
+	if (Frame < DisabledUntilFrame)
+	{
+		// EMP: nothing works. Whatever was rolling comes to rest.
+		if (CanMove())
+		{
+			bMoving = false;
+			Path.Reset();
+			if (IsUsingAirLoco()) { UpdateFlightPhysics(Frame); } else { UpdatePhysics(Frame); }
+			SetModelCondition(GenConditions::Moving(), false);
+		}
+		return;
+	}
+	if (Dock)
+	{
+		UpdateDock(Frame);
+	}
+	if (Parking)
+	{
+		Parking->Update(Frame);
+	}
+	if (Production.Num() > 0)
+	{
+		UpdateProduction(Frame);
+	}
+	bJetDriving = false;
+	if (bJetAI)
+	{
+		UpdateJet(Frame); // taxiing, takeoff, landing, reloading; may take over this frame's movement
+		if (bDead)
+		{
+			return; // ran out of fuel with nowhere to land
+		}
+	}
+	if (Delivery && !UpdateDelivery(Frame))
+	{
+		return; // a power's aircraft that hasn't started yet, or has just left
+	}
+	if (AIMode != EGenAIMode::None)
+	{
+		UpdateAIMode(Frame);
 	}
 	if (HasWeapons())
 	{
@@ -172,8 +318,49 @@ void FGenObject::Update(uint32 Frame)
 	}
 	if (CanMove())
 	{
-		UpdateAI(Frame);
-		UpdatePhysics(Frame);
+		if (Template->bChinookAI && Contain)
+		{
+			UpdateChinookFlight(Frame);
+		}
+		if (EnterTarget != GenInvalidObjectID)
+		{
+			UpdateEnter(Frame);
+		}
+		if (bHasExitRally && !bMoving)
+		{
+			// Out of the factory door: now on to the rally point.
+			bHasExitRally = false;
+			CommandMoveTo(ExitRally);
+		}
+		if (BuildTarget != GenInvalidObjectID || RepairTarget != GenInvalidObjectID)
+		{
+			UpdateDozer(Frame);
+		}
+		else if (Template->bIsDozer)
+		{
+			UpdateDozerBored(Frame);
+		}
+		if (Template->bIsSupplyTruck)
+		{
+			UpdateSupplyTruck(Frame);
+		}
+		if (DockTarget != GenInvalidObjectID)
+		{
+			UpdateDocking(Frame);
+		}
+		if (!bJetDriving)
+		{
+			UpdateAI(Frame);
+		}
+		// (An aircraft on the ground at its airfield rolls on its taxi locomotor, like a ground unit.)
+		if (IsUsingAirLoco())
+		{
+			UpdateFlightPhysics(Frame);
+		}
+		else
+		{
+			UpdatePhysics(Frame);
+		}
 		// A unit held up behind another one stops its move animation after a quarter second.
 		SetModelCondition(GenConditions::Moving(), bMoving && BlockedFrames <= uint32(GenLogic::GetLogicFPS() / 4));
 	}
@@ -217,6 +404,10 @@ void FGenObject::UpdateAI(uint32 Frame)
 
 	if (!bMoving || Path.Num() == 0)
 	{
+		if (bFlies)
+		{
+			MaintainPosition(Frame); // hovering takes work even when going nowhere
+		}
 		return;
 	}
 
@@ -247,8 +438,10 @@ void FGenObject::UpdateAI(uint32 Frame)
 		++PathIndex;
 	}
 
+	// A plane measures what is left along its line of flight: it cannot stop on the goal, it flies past it.
+	const bool bPlane = HasMinSpeed() && IsUsingAirLoco();
+	const float DistToGoal = bPlane ? FlightDistToGoal() : PathDistanceFrom(PathIndex);
 	const FVector2f Target = Path[PathIndex];
-	const float DistToGoal = PathDistanceFrom(PathIndex);
 	const float CloseEnough = FMath::Max(Locomotor->CloseEnoughDist, 1.f);
 
 	// Arrived: AIUpdate's move state ends when within CloseEnoughDist and stopped (or nearly).
@@ -256,6 +449,10 @@ void FGenObject::UpdateAI(uint32 Frame)
 	{
 		bMoving = false;
 		Path.Reset();
+		if (bPlane)
+		{
+			return; // keeps flying; with nowhere to go it circles here
+		}
 		Velocity.X = Velocity.Y = 0.f;
 		bStatusBraking = false;
 		if (bMovingOutOfWay)
@@ -309,6 +506,7 @@ void FGenObject::LocoMoveTowardsPosition(const FVector3f& GoalPos, float OnPathD
 {
 	const float MaxSpeed = Locomotor->Speed;
 	DesiredSpeed = FMath::Min(DesiredSpeed, MaxSpeed);
+	bMaintainPosValid = false;
 
 	const float DistToStopAtMaxSpeed = (MaxSpeed / GetBraking()) * MaxSpeed / 2.f;
 	if (OnPathDistToGoal > CellSize && OnPathDistToGoal > DistToStopAtMaxSpeed)
@@ -332,14 +530,26 @@ void FGenObject::LocoMoveTowardsPosition(const FVector3f& GoalPos, float OnPathD
 	// A zero motive force marks the object as driven by its locomotor.
 	ApplyMotiveForce(FVector3f::ZeroVector, Frame);
 
-	const bool bWasBraking = bStatusBraking;
-	switch (Locomotor->Appearance)
+	if (Locomotor->Appearance == EGenLocoAppearance::Wings)
 	{
-	case EGenLocoAppearance::TwoLegs: MoveLegs(GoalPos, OnPathDistToGoal, DesiredSpeed); break;
-	case EGenLocoAppearance::FourWheels:
-	case EGenLocoAppearance::Motorcycle: MoveWheels(GoalPos, OnPathDistToGoal, DesiredSpeed, Frame); break;
-	case EGenLocoAppearance::Treads: MoveTreads(GoalPos, OnPathDistToGoal, DesiredSpeed); break;
-	default: MoveTreads(GoalPos, OnPathDistToGoal, DesiredSpeed); break; // hover/other: tread-like for now
+		bLocoBraking = false; // wings never "brake into place"
+	}
+	const bool bWasBraking = bStatusBraking;
+	// Up in the air only locomotors that say so can still push themselves along.
+	if (Locomotor->bAllowAirborneMotiveForce || !bFlies || !IsAirborneTarget())
+	{
+		switch (Locomotor->Appearance)
+		{
+		case EGenLocoAppearance::TwoLegs: MoveLegs(GoalPos, OnPathDistToGoal, DesiredSpeed); break;
+		case EGenLocoAppearance::FourWheels:
+		case EGenLocoAppearance::Motorcycle: MoveWheels(GoalPos, OnPathDistToGoal, DesiredSpeed, Frame); break;
+		case EGenLocoAppearance::Treads: MoveTreads(GoalPos, OnPathDistToGoal, DesiredSpeed); break;
+		default: MoveOther(GoalPos, OnPathDistToGoal, DesiredSpeed, Frame); break; // hover, wings, other (and thrust for now)
+		}
+	}
+	if (bFlies)
+	{
+		HandleBehaviorZ(Frame);
 	}
 
 	// Objects that are braking don't follow the normal physics, so they end up at their destination exactly.
@@ -613,7 +823,7 @@ void FGenObject::ApplyMotiveForce(const FVector3f& Force, uint32 Frame)
 void FGenObject::UpdatePhysics(uint32 Frame)
 {
 	// applyFrictionalForces (on the ground)
-	const float Extra = Locomotor ? Locomotor->Extra2DFriction : 0.f;
+	const float Extra = (Locomotor ? Locomotor->Extra2DFriction : 0.f) + (bLocoUltraAccurate ? 0.5f * 30.f / float(GenLogic::GetLogicFPS()) : 0.f);
 	if (Velocity.X != 0.f || Velocity.Y != 0.f)
 	{
 		const FVector2f Dir = GetDirection2D();

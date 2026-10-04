@@ -242,6 +242,21 @@ UGenModelComponent* AGenMapActor::CreateObjectVisual(const FGenThingTemplate& Te
 	return MC;
 }
 
+UGenModelComponent* AGenMapActor::CreateAttachedVisual(UGenModelComponent* Parent, const FLinearColor& HouseColor)
+{
+	if (!Parent)
+	{
+		return nullptr;
+	}
+	// No model yet: the caller applies a condition state, which may well be "nothing shown".
+	UGenModelComponent* MC = NewObject<UGenModelComponent>(this, NAME_None, RF_Transient);
+	MC->SetupAttachment(Parent);
+	MC->RegisterComponent();
+	MC->SetHouseColor(HouseColor);
+	ObjectModels.Add(MC);
+	return MC;
+}
+
 UGenModelComponent* AGenMapActor::CreateModelVisual(const FString& Model, const FLinearColor& HouseColor)
 {
 	UGenModelComponent* MC = NewObject<UGenModelComponent>(this, NAME_None, RF_Transient);

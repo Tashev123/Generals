@@ -2,101 +2,21 @@
 #include "Core/GenCompression.h"
 #include "Core/GenCoords.h"
 #include "Core/GenFileSystem.h"
+#include "Map/GenDataChunk.h"
 #include "Generals1.h"
 
 namespace
 {
-	class FChunkReader
-	{
-	public:
-		FChunkReader(TConstArrayView<uint8> InData, const TMap<uint32, FString>& InNames) : Data(InData), Names(InNames) {}
+	using FChunkReader = FGenChunkReader;
 
-		bool Has(int32 N) const { return Pos >= 0 && Pos + N <= Data.Num(); }
-		int32 I32() { int32 V = 0; if (Has(4)) { FMemory::Memcpy(&V, &Data[Pos], 4); } Pos += 4; return V; }
-		uint32 U32() { return uint32(I32()); }
-		uint16 U16() { uint16 V = 0; if (Has(2)) { FMemory::Memcpy(&V, &Data[Pos], 2); } Pos += 2; return V; }
-		uint8 U8() { const uint8 V = Has(1) ? Data[Pos] : 0; Pos += 1; return V; }
-		float F32() { float V = 0; if (Has(4)) { FMemory::Memcpy(&V, &Data[Pos], 4); } Pos += 4; return V; }
-		FVector3f Vec3() { const float X = F32(); const float Y = F32(); const float Z = F32(); return FVector3f(X, Y, Z); }
-
-		FString AStr()
-		{
-			const int32 N = U16();
-			FString S;
-			S.Reserve(N);
-			for (int32 i = 0; i < N && Has(1); ++i) { S.AppendChar(TCHAR(Data[Pos])); ++Pos; }
-			return S;
-		}
-
-		FString UStr()
-		{
-			const int32 N = U16();
-			FString S;
-			S.Reserve(N);
-			for (int32 i = 0; i < N && Has(2); ++i) { S.AppendChar(TCHAR(Data[Pos] | (Data[Pos + 1] << 8))); Pos += 2; }
-			return S;
-		}
-
-		FGenDict Dict()
-		{
-			FGenDict D;
-			const int32 N = U16();
-			for (int32 i = 0; i < N && Has(4); ++i)
-			{
-				const int32 KeyAndType = I32();
-				const int32 Type = KeyAndType & 0xFF;
-				const FString* KeyName = Names.Find(uint32(KeyAndType) >> 8);
-				FGenDictValue V;
-				switch (Type)
-				{
-				case 0: V.Type = FGenDictValue::EType::Bool; V.Bool = U8() != 0; break;
-				case 1: V.Type = FGenDictValue::EType::Int; V.Int = I32(); break;
-				case 2: V.Type = FGenDictValue::EType::Real; V.Real = F32(); break;
-				case 3: V.Type = FGenDictValue::EType::AsciiString; V.String = AStr(); break;
-				case 4: V.Type = FGenDictValue::EType::UnicodeString; V.String = UStr(); break;
-				default: return D; // corrupt
-				}
-				D.Add(KeyName ? *KeyName : FString::Printf(TEXT("#%d"), uint32(KeyAndType) >> 8), MoveTemp(V));
-			}
-			return D;
-		}
-
-		template<typename T>
-		void Array(TArray<T>& Out, int32 Count)
-		{
-			Out.SetNumZeroed(Count);
-			const int32 Bytes = Count * int32(sizeof(T));
-			if (Has(Bytes)) { FMemory::Memcpy(Out.GetData(), &Data[Pos], Bytes); }
-			Pos += Bytes;
-		}
-
-		struct FChunk { FString Name; uint16 Version; int32 Start; int32 End; };
-
-		bool NextChunk(int32 End, FChunk& Out)
-		{
-			if (Pos + 10 > End) { return false; }
-			const uint32 Id = U32();
-			Out.Version = U16();
-			const int32 Size = I32();
-			Out.Start = Pos;
-			Out.End = Pos + Size;
-			const FString* N = Names.Find(Id);
-			Out.Name = N ? *N : FString();
-			return Size >= 0 && Out.End <= End;
-		}
-
-		TConstArrayView<uint8> Data;
-		const TMap<uint32, FString>& Names;
-		int32 Pos = 0;
-	};
-
-	FLinearColor RGB(FChunkReader& R) { const float X = R.F32(); const float Y = R.F32(); const float Z = R.F32(); return FLinearColor(X, Y, Z); }
+	// (Not "RGB": that is a Windows macro, and unity builds can put a Windows header in front of this file.)
+	FLinearColor ReadColor3(FChunkReader& R) { const float X = R.F32(); const float Y = R.F32(); const float Z = R.F32(); return FLinearColor(X, Y, Z); }
 
 	FGenMapLight ReadLight(FChunkReader& R)
 	{
 		FGenMapLight L;
-		L.Ambient = RGB(R);
-		L.Diffuse = RGB(R);
+		L.Ambient = ReadColor3(R);
+		L.Diffuse = ReadColor3(R);
 		L.Direction = R.Vec3();
 		return L;
 	}
@@ -129,27 +49,12 @@ bool FGenMapData::LoadFromVfs(const FString& MapPath)
 bool FGenMapData::LoadFromMemory(TConstArrayView<uint8> InData)
 {
 	TArray<uint8> Data;
-	if (!GenCompression::Decompress(InData, Data) || Data.Num() < 8 || FMemory::Memcmp(Data.GetData(), "CkMp", 4) != 0)
+	TMap<uint32, FString> Names;
+	const int32 Pos = GenCompression::Decompress(InData, Data) ? FGenChunkReader::ReadNameTable(Data, Names) : 0;
+	if (Pos == 0)
 	{
 		UE_LOG(LogGenerals, Error, TEXT("Map '%s': not a CkMp file"), *Path);
 		return false;
-	}
-
-	// Table of contents: chunk/key names.
-	TMap<uint32, FString> Names;
-	int32 Pos = 4;
-	int32 Count = 0;
-	FMemory::Memcpy(&Count, &Data[Pos], 4);
-	Pos += 4;
-	for (int32 i = 0; i < Count && Pos < Data.Num(); ++i)
-	{
-		const int32 Len = Data[Pos++];
-		FString Name;
-		for (int32 c = 0; c < Len && Pos < Data.Num(); ++c) { Name.AppendChar(TCHAR(Data[Pos++])); }
-		uint32 Id = 0;
-		FMemory::Memcpy(&Id, &Data[Pos], 4);
-		Pos += 4;
-		Names.Add(Id, Name);
 	}
 
 	FChunkReader R(Data, Names);
@@ -287,6 +192,15 @@ bool FGenMapData::LoadFromMemory(TConstArrayView<uint8> InData)
 				}
 			}
 		}
+		else if (C.Name == TEXT("WaypointsList"))
+		{
+			const int32 NumLinks = R.I32();
+			for (int32 i = 0; i < NumLinks && R.Pos < C.End; ++i)
+			{
+				const int32 From = R.I32(); const int32 To = R.I32();
+				WaypointLinks.Add(FIntPoint(From, To));
+			}
+		}
 		else if (C.Name == TEXT("SidesList"))
 		{
 			const int32 NumSides = R.I32();
@@ -376,6 +290,83 @@ const FGenMapObject* FGenMapData::FindWaypoint(const FString& Name) const
 		}
 	}
 	return nullptr;
+}
+
+const FGenPolygonTrigger* FGenMapData::FindTrigger(const FString& Name) const
+{
+	for (const FGenPolygonTrigger& T : PolygonTriggers)
+	{
+		if (T.Name.Equals(Name, ESearchCase::CaseSensitive))
+		{
+			return &T;
+		}
+	}
+	return nullptr;
+}
+
+const FGenMapObject* FGenMapData::FindWaypointByID(int32 Id) const
+{
+	for (const FGenMapObject& O : Objects)
+	{
+		if (O.IsWaypoint() && O.GetInt(TEXT("waypointID"), -1) == Id)
+		{
+			return &O;
+		}
+	}
+	return nullptr;
+}
+
+const FGenMapObject* FGenMapData::GetClosestWaypointOnPath(const FVector2f& Pos, const FString& Label) const
+{
+	const FGenMapObject* Best = nullptr;
+	float BestDistSq = 0.f;
+	if (Label.IsEmpty())
+	{
+		return nullptr;
+	}
+	for (const FGenMapObject& O : Objects)
+	{
+		if (!O.IsWaypoint())
+		{
+			continue;
+		}
+		const bool bMatch = O.GetString(TEXT("waypointPathLabel1")).Equals(Label, ESearchCase::IgnoreCase)
+			|| O.GetString(TEXT("waypointPathLabel2")).Equals(Label, ESearchCase::IgnoreCase)
+			|| O.GetString(TEXT("waypointPathLabel3")).Equals(Label, ESearchCase::IgnoreCase);
+		const float DistSq = FVector2f::DistSquared(Pos, FVector2f(O.Location.X, O.Location.Y));
+		if (bMatch && (!Best || DistSq < BestDistSq))
+		{
+			Best = &O;
+			BestDistSq = DistSq;
+		}
+	}
+	return Best;
+}
+
+void FGenMapData::GetWaypointPath(const FGenMapObject& Start, TArray<FVector2f>& OutPath) const
+{
+	const FGenMapObject* Cur = &Start;
+	TSet<int32> Seen;
+	while (Cur)
+	{
+		const int32 Id = Cur->GetInt(TEXT("waypointID"), -1);
+		if (Seen.Contains(Id))
+		{
+			break; // a loop
+		}
+		Seen.Add(Id);
+		OutPath.Add(FVector2f(Cur->Location.X, Cur->Location.Y));
+		const FGenMapObject* Next = nullptr;
+		for (const FIntPoint& L : WaypointLinks)
+		{
+			if (L.X == Id)
+			{
+				Next = FindWaypointByID(L.Y);
+				break;
+			}
+		}
+		Cur = Next;
+	}
 }
 
 const FGenMapLighting* FGenMapData::GetCurrentLighting() const

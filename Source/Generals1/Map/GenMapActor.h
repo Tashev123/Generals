@@ -62,6 +62,9 @@ public:
 	/** Creates an unplaced visual (attached to this actor) for a template in its default state. */
 	UGenModelComponent* CreateObjectVisual(const struct FGenThingTemplate& Template, const FLinearColor& HouseColor);
 
+	/** Creates an empty model attached to another object visual (an object's additional draw modules). */
+	UGenModelComponent* CreateAttachedVisual(UGenModelComponent* Parent, const FLinearColor& HouseColor);
+
 	/** Creates an unplaced visual showing a bare W3D model (debris chunks). */
 	UGenModelComponent* CreateModelVisual(const FString& Model, const FLinearColor& HouseColor);
 

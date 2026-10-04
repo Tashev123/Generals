@@ -2,6 +2,7 @@
 #include "Client/GenDrawable.h"
 #include "Client/GenFXManager.h"
 #include "Core/GenCoords.h"
+#include "Logic/GenCommandData.h"
 #include "Logic/GenGameData.h"
 #include "Map/GenMapActor.h"
 #include "Map/GenMapData.h"
@@ -45,6 +46,8 @@ void UGenGameLogic::Deinitialize()
 	Drawables.Reset();
 	DrawStates.Reset();
 	DelayedDamage.Reset();
+	FloatingTexts.Reset();
+	AIPlayers.Reset();
 	ObstacleOwners.Reset();
 	PendingCommands.Reset();
 	MapActor = nullptr;
@@ -80,6 +83,9 @@ bool UGenGameLogic::StartSkirmish(AGenMapActor* InMapActor, const TArray<FGenSki
 		return false;
 	}
 	FGenGameData& GD = FGenGameData::Get();
+	bGameOver = false;
+	GameOverFrame = 0;
+	WinningPlayer = INDEX_NONE;
 
 	Pathfinder.Build(*Map);
 	bNight = Map->TimeOfDay == 4; // TIME_OF_DAY_NIGHT
@@ -90,7 +96,13 @@ bool UGenGameLogic::StartSkirmish(AGenMapActor* InMapActor, const TArray<FGenSki
 	Random.Initialize(Seed);
 	bTrace = FParse::Param(FCommandLine::Get(), TEXT("GenTrace"));
 	FParse::Value(FCommandLine::Get(), TEXT("GenPauseFrame="), PauseAtFrame);
+	float Speed = 1.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("GenSpeed="), Speed))
+	{
+		SetTimeScale(Speed); // tests: fast-forward through build times and supply runs
+	}
 
+	FGenCommandData::Get().Initialize();
 	FX = GetWorld()->GetSubsystem<UGenFXManager>();
 	if (FX)
 	{
@@ -138,6 +150,7 @@ bool UGenGameLogic::StartSkirmish(AGenMapActor* InMapActor, const TArray<FGenSki
 		}
 		P.Color = S.Color.A > 0.f ? S.Color : SlotPalette[SlotIdx % UE_ARRAY_COUNT(SlotPalette)];
 		P.Money = 10000; // default skirmish starting cash
+		InitPlayerSciences(P);
 		if (P.bHuman && LocalPlayer == INDEX_NONE)
 		{
 			LocalPlayer = P.Index;
@@ -152,6 +165,31 @@ bool UGenGameLogic::StartSkirmish(AGenMapActor* InMapActor, const TArray<FGenSki
 	if (LocalPlayer == INDEX_NONE)
 	{
 		LocalPlayer = Players.Num() > 1 ? 1 : 0;
+	}
+
+	// Computer players: every slot that isn't played by a human (-GenNoAI leaves them passive).
+	if (!FParse::Param(FCommandLine::Get(), TEXT("GenNoAI")))
+	{
+		FGenAIData::Get().Initialize();
+		EGenDifficulty Difficulty = EGenDifficulty::Normal;
+		FString DifficultyName;
+		if (FParse::Value(FCommandLine::Get(), TEXT("GenDifficulty="), DifficultyName))
+		{
+			Difficulty = DifficultyName.Equals(TEXT("Easy"), ESearchCase::IgnoreCase) ? EGenDifficulty::Easy
+				: (DifficultyName.Equals(TEXT("Hard"), ESearchCase::IgnoreCase) ? EGenDifficulty::Hard : EGenDifficulty::Normal);
+		}
+		for (FGenPlayer& P : Players)
+		{
+			if (!P.bHuman && !P.bNeutral && P.Template && P.StartPosition >= 0)
+			{
+				P.bSkirmishAI = true;
+				AIPlayers.Add(MakeUnique<FGenSkirmishAI>(this, P.Index, Difficulty));
+			}
+		}
+		for (const TUniquePtr<FGenSkirmishAI>& AI : AIPlayers)
+		{
+			AI->NewMap();
+		}
 	}
 
 	for (FGenObjectID Id : ObjectOrder)
@@ -253,6 +291,15 @@ FGenObject* UGenGameLogic::CreateObject(const FGenThingTemplate* Template, int32
 	{
 		return nullptr;
 	}
+	// ThingFactory::newObject: a template that only lists build variations becomes one of them.
+	if (Template->BuildVariations.Num() > 0)
+	{
+		const FString& Pick = Template->BuildVariations[Random.RandRange(0, Template->BuildVariations.Num() - 1)];
+		if (const FGenThingTemplate* Variation = FGenGameData::Get().FindTemplate(Pick))
+		{
+			Template = Variation;
+		}
+	}
 	const FGenObjectID Id = NextID++;
 	TUniquePtr<FGenObject> Obj = MakeUnique<FGenObject>(Id, Template, OwnerPlayer, this);
 	Obj->SetPosition(Position);
@@ -279,7 +326,24 @@ FGenObject* UGenGameLogic::CreateObject(const FGenThingTemplate* Template, int32
 			MC->SetRelativeLocation(GenCoords::ToUE(Position.X, Position.Y, Position.Z));
 			MC->SetRelativeRotation(FRotator(0.f, GenCoords::AngleToYaw(Angle), 0.f));
 			Drawables.Add(Id, MC);
-			DrawStates.Add(Id, FDrawState()); // evaluated on the next drawable update
+			FDrawState& DS = DrawStates.Add(Id, FDrawState()); // evaluated on the next drawable update
+			// Every other model draw module gets its own model on the same object; which model (if any)
+			// it shows follows the object's condition flags, like the primary one.
+			const FGenDrawModule* Primary = Template->PrimaryDraw();
+			for (int32 i = 0; i < Template->Draws.Num(); ++i)
+			{
+				const FGenDrawModule& Draw = Template->Draws[i];
+				if (&Draw == Primary || Draw.States.Num() == 0)
+				{
+					continue;
+				}
+				if (UGenModelComponent* Extra = MapActor->CreateAttachedVisual(MC, Color))
+				{
+					FExtraDraw& E = DS.Extras.AddDefaulted_GetRef();
+					E.DrawIndex = i;
+					E.Model = Extra;
+				}
+			}
 		}
 	}
 	return Raw;
@@ -298,6 +362,13 @@ void UGenGameLogic::DestroyObject(FGenObjectID ID)
 		Pathfinder.RemoveObstacle(Obj);
 	}
 	Pathfinder.RemoveUnit(ID);
+	if (const FDrawState* DS = DrawStates.Find(ID))
+	{
+		for (const FExtraDraw& E : DS->Extras)
+		{
+			if (UGenModelComponent* Extra = E.Model.Get()) { Extra->DestroyComponent(); }
+		}
+	}
 	if (TObjectPtr<UGenModelComponent>* D = Drawables.Find(ID))
 	{
 		if (*D) { (*D)->DestroyComponent(); }
@@ -368,7 +439,61 @@ void UGenGameLogic::IssueMove(const TArray<FGenObjectID>& Units, const FVector3f
 				Dest.Y += (Row - (Cols - 1) * 0.5f) * Spacing;
 			}
 			Movers[i]->ClearAttack(); // a move order overrides the current attack
+			Movers[i]->StopConstructing(); // ... and a dozer's building job
+			Movers[i]->OnPlayerCommand(false); // ... and a gatherer's supply run
 			Movers[i]->CommandMoveTo(Dest);
+		}
+	});
+}
+
+TArray<TPair<FGenObject*, FVector3f>> UGenGameLogic::SpreadGroup(const TArray<FGenObjectID>& Units, const FVector3f& Goal) const
+{
+	TArray<TPair<FGenObject*, FVector3f>> Out;
+	float Spacing = GenLogic::PathfindCellSize;
+	for (FGenObjectID Id : Units)
+	{
+		FGenObject* O = FindObject(Id);
+		if (O && O->CanMove() && !O->IsDead() && !O->IsContained())
+		{
+			Out.Emplace(O, Goal);
+			Spacing = FMath::Max(Spacing, O->GetTemplate()->GetBoundingCircleRadius() * 2.2f);
+		}
+	}
+	const int32 Cols = FMath::CeilToInt32(FMath::Sqrt(float(Out.Num())));
+	for (int32 i = 0; Out.Num() > 1 && i < Out.Num(); ++i)
+	{
+		Out[i].Value.X += (i % Cols - (Cols - 1) * 0.5f) * Spacing;
+		Out[i].Value.Y += (i / Cols - (Cols - 1) * 0.5f) * Spacing;
+	}
+	return Out;
+}
+
+void UGenGameLogic::IssueAttackMove(const TArray<FGenObjectID>& Units, const FVector3f& Goal)
+{
+	PendingCommands.Add([this, Units, Goal]()
+	{
+		for (const TPair<FGenObject*, FVector3f>& It : SpreadGroup(Units, Goal))
+		{
+			It.Key->StopConstructing();
+			It.Key->OnPlayerCommand(false);
+			It.Key->CommandAttackMove(It.Value);
+		}
+	});
+}
+
+void UGenGameLogic::IssueGuard(const TArray<FGenObjectID>& Units, const FVector3f& Pos, FGenObjectID GuardObject, EGenGuardMode Mode)
+{
+	PendingCommands.Add([this, Units, Pos, GuardObject, Mode]()
+	{
+		for (const TPair<FGenObject*, FVector3f>& It : SpreadGroup(Units, Pos))
+		{
+			if (It.Key->GetID() == GuardObject)
+			{
+				continue; // (nothing guards itself)
+			}
+			It.Key->StopConstructing();
+			It.Key->OnPlayerCommand(false);
+			It.Key->CommandGuardPosition(FVector2f(It.Value.X, It.Value.Y), Mode, GuardObject);
 		}
 	});
 }
@@ -381,8 +506,25 @@ void UGenGameLogic::IssueStop(const TArray<FGenObjectID>& Units)
 		{
 			if (FGenObject* O = FindObject(Id))
 			{
-				O->ClearAttack();
-				O->CommandStop();
+				O->StopConstructing();
+				O->OnPlayerCommand(false);
+				O->CommandIdle();
+			}
+		}
+	});
+}
+
+void UGenGameLogic::IssueLand(const TArray<FGenObjectID>& Units, FGenObjectID Airfield)
+{
+	PendingCommands.Add([this, Units, Airfield]()
+	{
+		for (FGenObjectID Id : Units)
+		{
+			FGenObject* O = FindObject(Id);
+			if (O && O->bJetAI && !O->IsDead())
+			{
+				O->OnPlayerCommand(false);
+				O->CommandLandAt(Airfield);
 			}
 		}
 	});
@@ -401,6 +543,7 @@ void UGenGameLogic::IssueAttack(const TArray<FGenObjectID>& Units, FGenObjectID 
 		{
 			if (FGenObject* O = FindObject(Id))
 			{
+				O->OnPlayerCommand(false);
 				O->CommandStop();
 				O->CommandAttack(Target);
 			}
@@ -421,12 +564,14 @@ void UGenGameLogic::DealDamage(const FGenWeaponTemplate& Weapon, FGenObjectID So
 		Pos = Primary->GetPosition();
 	}
 
+	// WeaponBonus: what the shooter's upgrades add to this weapon's damage.
+	const float DamageBonus = Source ? Source->GetWeaponBonus(Weapon, int32(FGenWeaponBonus::Damage)) : 1.f;
 	const float Radius = FMath::Max(Weapon.PrimaryDamageRadius, Weapon.SecondaryDamageRadius);
 	if (Radius <= 0.f)
 	{
 		if (Primary)
 		{
-			Primary->AttemptDamage(Weapon.PrimaryDamage, Weapon.DamageType, Weapon.DeathType, SourceId);
+			Primary->AttemptDamage(Weapon.PrimaryDamage * DamageBonus, Weapon.DamageType, Weapon.DeathType, SourceId);
 			UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [hit f%u] %s from #%u -> #%u %s hp=%.0f%s"), Frame, *Weapon.Name, SourceId, Primary->GetID(),
 				*Primary->GetTemplate()->Name, Primary->GetHealth(), Primary->IsDead() ? TEXT(" DEAD") : TEXT(""));
 		}
@@ -458,12 +603,17 @@ void UGenGameLogic::DealDamage(const FGenWeaponTemplate& Weapon, FGenObjectID So
 			}
 			else
 			{
-				if ((Affects & GenWeaponAffects::Self) == 0 && O == Source)
+				// (A bomb or missile doesn't hurt what launched it either.)
+				if ((Affects & GenWeaponAffects::Self) == 0 && (O == Source || Source->Producer == O->GetID()))
 				{
 					continue;
 				}
+				if ((Affects & GenWeaponAffects::NotAirborne) != 0 && O->GetPosition().Z - GetGroundHeight(O->GetPosition().X, O->GetPosition().Y) > 9.f)
+				{
+					continue; // isSignificantlyAboveTerrain
+				}
 				const EGenRelationship Rel = GetRelationship(O->GetOwner(), Source->GetOwner());
-				if ((Affects & GenWeaponAffects::NotSimilar) != 0 && Rel == EGenRelationship::Allies && O->GetTemplate() == Source->GetTemplate())
+				if ((Affects & GenWeaponAffects::NotSimilar) != 0 && Rel == EGenRelationship::Allies && O->GetTemplate()->Canonical() == Source->GetTemplate()->Canonical())
 				{
 					continue;
 				}
@@ -475,7 +625,7 @@ void UGenGameLogic::DealDamage(const FGenWeaponTemplate& Weapon, FGenObjectID So
 				}
 			}
 		}
-		const float Amount = bKillSelf ? 1e9f : (Dist <= Weapon.PrimaryDamageRadius ? Weapon.PrimaryDamage : Weapon.SecondaryDamage);
+		const float Amount = bKillSelf ? 1e9f : (Dist <= Weapon.PrimaryDamageRadius ? Weapon.PrimaryDamage : Weapon.SecondaryDamage) * DamageBonus;
 		O->AttemptDamage(Amount, Weapon.DamageType, Weapon.DeathType, SourceId);
 		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [hit f%u] %s from #%u -> #%u %s hp=%.0f%s"), Frame, *Weapon.Name, SourceId, O->GetID(),
 			*O->GetTemplate()->Name, O->GetHealth(), O->IsDead() ? TEXT(" DEAD") : TEXT(""));
@@ -517,6 +667,26 @@ void UGenGameLogic::OnObjectDied(const FGenObject& Obj)
 	}
 	// The dead hold no ground: their cells and their reserved destination are free again.
 	Pathfinder.RemoveUnit(Obj.GetID());
+}
+
+FGenSkirmishAI* UGenGameLogic::GetAI(int32 Player) const
+{
+	for (const TUniquePtr<FGenSkirmishAI>& AI : AIPlayers)
+	{
+		if (AI->GetPlayer() == Player)
+		{
+			return AI.Get();
+		}
+	}
+	return nullptr;
+}
+
+void UGenGameLogic::DescribeAI(TArray<FString>& OutLines) const
+{
+	for (const TUniquePtr<FGenSkirmishAI>& AI : AIPlayers)
+	{
+		OutLines.Add(AI->Describe());
+	}
 }
 
 // ---- tick ---------------------------------------------------------------------------------------
@@ -587,6 +757,15 @@ void UGenGameLogic::StepLogic()
 		}
 	}
 
+	// Computer players think (scripts, base building, teams) before their units act.
+	for (const TUniquePtr<FGenSkirmishAI>& AI : AIPlayers)
+	{
+		if (!IsPlayerDefeated(AI->GetPlayer()))
+		{
+			AI->Update(Frame);
+		}
+	}
+
 	// Objects created during this pass (projectiles) start updating next frame.
 	for (int32 i = 0, Num = ObjectOrder.Num(); i < Num; ++i)
 	{
@@ -597,6 +776,10 @@ void UGenGameLogic::StepLogic()
 
 	// Collisions between units are found after everything has moved and acted on next frame.
 	UpdateCollisions();
+	UpdateVictory();
+
+	const uint32 FloatingTextFrames = uint32(GenLogic::GetLogicFPS() * 3);
+	FloatingTexts.RemoveAll([this, FloatingTextFrames](const FGenFloatingText& F) { return Frame > F.Frame + FloatingTextFrames; });
 }
 
 FVector3f UGenGameLogic::GetRenderPosition(const FGenObject& Obj) const
@@ -635,6 +818,25 @@ void UGenGameLogic::UpdateDrawables()
 
 		// Condition state (model / animation / sub-objects) follows the object's model condition flags.
 		FDrawState& DS = DrawStates.FindOrAdd(It.Key);
+		// What is inside a container isn't drawn; a garrisoned building wears its occupants' colour.
+		if (DS.bHidden != O->IsHidden())
+		{
+			DS.bHidden = O->IsHidden();
+			// (Hidden-in-game rather than visibility: the model's sub-objects keep their own shown / hidden state.)
+			MC->SetHiddenInGame(DS.bHidden, true);
+		}
+		if (DS.Owner != O->GetOwner())
+		{
+			if (DS.Owner != MIN_int32 && Players.IsValidIndex(O->GetOwner()))
+			{
+				MC->SetHouseColor(Players[O->GetOwner()].Color);
+				for (const FExtraDraw& E : DS.Extras)
+				{
+					if (UGenModelComponent* Extra = E.Model.Get()) { Extra->SetHouseColor(Players[O->GetOwner()].Color); }
+				}
+			}
+			DS.Owner = O->GetOwner();
+		}
 		if (DS.AppliedVersion != O->GetConditionVersion())
 		{
 			DS.AppliedVersion = O->GetConditionVersion();
@@ -648,8 +850,125 @@ void UGenGameLogic::UpdateDrawables()
 					DS.AppliedTurret = 1e9f; // the model may have changed: re-apply the turret pose
 				}
 			}
+			for (FExtraDraw& E : DS.Extras)
+			{
+				UGenModelComponent* Extra = E.Model.Get();
+				const FGenDrawModule& ExtraDraw = O->GetTemplate()->Draws[E.DrawIndex];
+				const int32 Best = ExtraDraw.FindBestState(O->GetModelConditions());
+				if (Extra && Best != E.StateIndex)
+				{
+					E.StateIndex = Best;
+					GenDrawable::ApplyState(Extra, ExtraDraw, Best, bNight);
+				}
+			}
+			DS.SubObjectVersion = MAX_uint32; // the state was re-applied: upgrade overrides have to go on top again
+		}
+		// SubObjectsUpgrade and payload on pylons: parts an upgrade shows or hides, whatever the state says.
+		if (DS.SubObjectVersion != O->GetSubObjectVersion())
+		{
+			DS.SubObjectVersion = O->GetSubObjectVersion();
+			for (const TPair<FString, bool>& Override : O->GetSubObjectOverrides())
+			{
+				MC->ShowSubObject(Override.Key, Override.Value);
+				for (const FExtraDraw& E : DS.Extras)
+				{
+					if (UGenModelComponent* Extra = E.Model.Get()) { Extra->ShowSubObject(Override.Key, Override.Value); }
+				}
+			}
+		}
+
+		// W3DSupplyDraw: the boxes of a supply pile sit on bones "<prefix>01..NN"; as the stock runs down,
+		// fewer of them show (the highest numbers go first).
+		if (O->GetDock() && O->GetTemplate()->bSupplyWarehouse && !O->GetTemplate()->SupplyBonePrefix.IsEmpty())
+		{
+			const FString& Prefix = O->GetTemplate()->SupplyBonePrefix;
+			UGenModelComponent* Boxes = Draw && Draw->Type.Equals(TEXT("W3DSupplyDraw"), ESearchCase::IgnoreCase) ? MC : nullptr;
+			for (const FExtraDraw& E : DS.Extras)
+			{
+				if (!Boxes && O->GetTemplate()->Draws[E.DrawIndex].Type.Equals(TEXT("W3DSupplyDraw"), ESearchCase::IgnoreCase))
+				{
+					Boxes = E.Model.Get();
+				}
+			}
+			if (Boxes && DS.SupplyBones < 0)
+			{
+				TArray<FTransform3f> Bones;
+				DS.SupplyBones = Boxes->GetNumberedBoneTransformsW3D(Prefix, Bones);
+				DS.SupplyShown = DS.SupplyBones;
+			}
+			if (Boxes && DS.SupplyBones > 0)
+			{
+				const float Stock = float(O->GetBoxes()) / float(FMath::Max(1, O->GetTemplate()->StartingBoxes));
+				const int32 Show = FMath::Clamp(FMath::CeilToInt32(float(DS.SupplyBones) * Stock), 0, DS.SupplyBones);
+				for (int32 i = FMath::Min(Show, DS.SupplyShown); i < FMath::Max(Show, DS.SupplyShown); ++i)
+				{
+					Boxes->SetSubObjectsOnBonePrefixHidden(FString::Printf(TEXT("%s%02d"), *Prefix, i + 1), i >= Show);
+				}
+				DS.SupplyShown = Show;
+			}
 		}
 		const FGenModelConditionState* State = Draw && Draw->States.IsValidIndex(DS.StateIndex) ? &Draw->States[DS.StateIndex] : nullptr;
+
+		if (FX)
+		{
+			auto DestroySystems = [this](TArray<uint32>& Ids)
+			{
+				for (uint32 Id : Ids) { FX->DestroySystem(Id); }
+				Ids.Reset();
+			};
+			auto Attach = [this, &It](const FString& System, const FTransform3f& BoneXf, TArray<uint32>& Ids)
+			{
+				if (FGenParticleSystem* Sys = FX->CreateAttachedSystem(System, It.Key))
+				{
+					Sys->SetLocalTransform(BoneXf);
+					Ids.Add(Sys->GetID());
+				}
+			};
+
+			// ParticleSysBone: particle systems (fire, smoke, exhaust) that sit on bones while this state shows.
+			if (DS.StateSystemsFor != DS.StateIndex)
+			{
+				DS.StateSystemsFor = DS.StateIndex;
+				DestroySystems(DS.StateSystems);
+				if (State)
+				{
+					for (const TPair<FString, FString>& PB : State->ParticleBones)
+					{
+						FTransform3f BoneXf;
+						if (MC->GetBoneTransformW3D(PB.Key, BoneXf))
+						{
+							Attach(PB.Value, BoneXf, DS.StateSystems);
+						}
+					}
+				}
+			}
+
+			// TransitionDamageFX particle systems: started when the damage state gets worse, and gone
+			// again as soon as it changes (repair, or death).
+			const int32 DamageState = O->GetDamageState();
+			if (DamageState != DS.DamageState)
+			{
+				DestroySystems(DS.TransitionSystems);
+				if (DamageState > DS.DamageState)
+				{
+					for (const FGenTransitionFX& X : O->GetTemplate()->TransitionFX)
+					{
+						if (X.State != DamageState || X.Kind != FGenTransitionFX::ParticleSystem)
+						{
+							continue;
+						}
+						FTransform3f BoneXf = FTransform3f::Identity;
+						TArray<FTransform3f> Bones;
+						if (!X.Bone.IsEmpty() && MC->GetNumberedBoneTransformsW3D(X.Bone, Bones) > 0)
+						{
+							BoneXf = Bones[X.bRandomBone ? FMath::RandRange(0, Bones.Num() - 1) : 0];
+						}
+						Attach(X.Name, BoneXf, DS.TransitionSystems);
+					}
+				}
+				DS.DamageState = DamageState;
+			}
+		}
 
 		if (State && O->HasWeapons())
 		{
@@ -740,7 +1059,8 @@ void UGenGameLogic::UpdateDrawables()
 		if (O->IsDynamic() || !DS.bPlaced)
 		{
 			DS.bPlaced = true;
-			const FVector3f P = GetRenderPosition(*O);
+			FVector3f P = GetRenderPosition(*O);
+			P.Z += O->GetDrawLift(P); // an aircraft's wheels stand on the tarmac, not in it
 			if (O->HasFreeRotation())
 			{
 				// Projectiles and tumbling debris: full orientation, interpolated between logic frames.
