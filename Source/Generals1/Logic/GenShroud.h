@@ -41,7 +41,19 @@ enum class EGenRadarEvent : uint8
 	UnderAttack,
 	Information,
 	Infiltration,
+	StealthDiscovered,   // we found a stealthed unit
+	StealthNeutralized,  // one of ours has been found
 	Fake,           // marks a spot to jump to, but shows nothing
+};
+
+/** StealthLookType: how the local player sees a stealthed object. */
+enum class EGenStealthLook : uint8
+{
+	None,                       // not stealthed: as usual
+	VisibleFriendly,            // ours: faint, pulsing
+	VisibleDetected,            // theirs, shown up by a detector
+	VisibleFriendlyDetected,    // ours, and the enemy can see it
+	Invisible,                  // theirs: not drawn
 };
 
 /** A marker that spins down onto a spot of the radar and fades. */

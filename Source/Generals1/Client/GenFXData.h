@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Logic/GenRadiusDecal.h"
 
 struct FGenIniBlock;
 
@@ -140,6 +141,8 @@ namespace GenDisposition
 struct GENERALS1_API FGenOCLNugget
 {
 	bool bDebris = false;                // CreateDebris: Names are W3D models shown on a GenericDebris object
+	bool bApplyRandomForce = false;      // ApplyRandomForce: nothing is made - the source itself is thrown (MinMag .. SpinRate)
+	TArray<FString> AnimSets;            // CreateDebris AnimationSet lines, three names each: first, in flight, on landing ("STOP": hold)
 	TArray<FString> Names;
 	int32 Count = 1;
 	float Mass = 0.f;
@@ -152,6 +155,7 @@ struct GENERALS1_API FGenOCLNugget
 	int32 MinFrames = 0, MaxFrames = 0;   // lifetime override
 	float ExtraBounciness = 0.f;
 	float ExtraFriction = 0.f;            // per frame
+	FString BounceSound;                  // heard each time what is thrown lands (PhysicsBehavior::doBounceSound)
 	float MinHealth = 1.f, MaxHealth = 1.f;
 	FString ParticleSystem;               // attached to each created object
 	FString FXFinal;
@@ -160,6 +164,11 @@ struct GENERALS1_API FGenOCLNugget
 	bool bSkipIfSignificantlyAirborne = false;
 	bool bSpreadFormation = false;        // several objects stand apart instead of on one spot
 	float MinDistanceFormation = 20.f;
+	FString PutInContainer;               // each object comes into the world inside one of these (a parachute)
+	bool bInheritsVeterancy = false;      // ... with the rank of what made it
+	int32 InvulnerableFrames = 0;         // ... and can't be hurt for this long
+	bool bRequiresLivePlayer = false;     // nothing is made for a player who is out of the game
+	bool bContainInsideSourceObject = false; // what is made goes aboard what made it (an Overlord's add-on)
 };
 
 /** DeliverPayload nugget: an aircraft comes in from the map edge and drops (or fires) its load at the target. */
@@ -197,6 +206,7 @@ struct GENERALS1_API FGenDeliverPayload
 	float StrafeLength = 0.f;
 	FString StrafeWeaponFX;
 	float DeliveryDecalRadius = 0.f;
+	FGenRadiusDecalTemplate DeliveryDecal; // laid at the target for the owner to see, till the aircraft heads home
 };
 
 struct GENERALS1_API FGenOCL
@@ -204,6 +214,15 @@ struct GENERALS1_API FGenOCL
 	FString Name;
 	TArray<FGenOCLNugget> Nuggets;
 	TArray<FGenDeliverPayload> Payloads;
+	/** FireWeapon nuggets: the weapon is fired from the object the list is run for, at the spot given (the nuclear missile). */
+	TArray<FString> FireWeapons;
+	/** Attack nuggets: the object the list is run for attacks the spot with one of its own weapons, so many shots (the SCUD storm). */
+	struct FAttack
+	{
+		int32 Slot = 0;
+		int32 NumShots = 1;
+	};
+	TArray<FAttack> Attacks;
 };
 
 /** Registry of effect definitions: ParticleSystem.ini, FXList.ini, ObjectCreationList.ini. */

@@ -261,7 +261,9 @@ UTexture2D* GenTextureLoader::LoadGameTexture(const FString& TextureName, bool b
 {
 	FGenFileSystem& FS = FGenFileSystem::Get();
 	const FString Base = FPaths::GetBaseFilename(TextureName);
-	const FString Dirs[] = { TEXT("Art\\Textures\\"), TEXT("Data\\English\\Art\\Textures\\"), TEXT("Art\\Terrain\\") };
+	// W3DFileSystem: "We need to be able to grab images from a localization dir" - the language's folder first.
+	// (Zero Hour's interface sheets are there; Art\Textures still holds the base game's, laid out differently.)
+	const FString Dirs[] = { TEXT("Data\\English\\Art\\Textures\\"), TEXT("Art\\Textures\\"), TEXT("Art\\Terrain\\") };
 
 	TArray<uint8> Bytes;
 	for (const FString& Dir : Dirs)

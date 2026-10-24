@@ -51,6 +51,7 @@ namespace GenSurface
 		Cliff = 1 << 2,
 		Air = 1 << 3,
 		Rubble = 1 << 4,
+		Fence = 1 << 5,   // not a locomotor's surface: a crusher's leave to drive through fences (Pathfinder's isCrusher)
 	};
 }
 
@@ -68,10 +69,32 @@ enum class EGenLocoAppearance : uint8
 	Motorcycle,
 };
 
+/** One beam to draw this frame (W3DLaserDraw + LaserUpdate): a laser pointer, a hacker's stream of numbers, a particle cannon's beam. */
+struct FGenBeam
+{
+	const struct FGenLaserDraw* Draw = nullptr;
+	FVector3f Start = FVector3f::ZeroVector;
+	FVector3f End = FVector3f::ZeroVector;
+	float WidthScale = 1.f;   // LaserUpdate's width scalar: a beam that is still widening, or narrowing away
+};
+
 /** Relationship between players. */
 enum class EGenRelationship : uint8
 {
 	Enemies,
 	Neutral,
 	Allies,
+};
+
+struct FGenBattlePlanData;
+
+/** BattlePlanBonuses: what the plans in force do to a player's army. */
+struct GENERALS1_API FGenBattlePlanBonuses
+{
+	float ArmorScalar = 1.f;                // damage taken (hold the line: less)
+	float SightScalar = 1.f;                // how far they see (search and destroy: further)
+	int32 Bombardment = 0;                  // > 0: the BATTLEPLAN_... weapon bonus condition
+	int32 HoldTheLine = 0;
+	int32 SearchAndDestroy = 0;
+	const FGenBattlePlanData* Kinds = nullptr; // whom it applies to (the plan's Valid/InvalidMemberKindOf)
 };

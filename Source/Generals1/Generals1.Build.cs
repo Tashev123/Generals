@@ -20,9 +20,18 @@ public class Generals1 : ModuleRules
 			"StaticMeshDescription",
 			"ProceduralMeshComponent",
 			"DeveloperSettings",
+			"ApplicationCore",
 			"Slate",
 			"SlateCore",
 			"UMG",
+			"AudioMixer",
+			"AudioExtensions",
+			// Network games: plain TCP between the players and the host's server.
+			"Sockets",
+			"Networking",
 		});
+
+		// Music is MP3; the engine ships dr_mp3 for it.
+		AddEngineThirdPartyPrivateStaticDependencies(Target, "dr_libs");
 	}
 }

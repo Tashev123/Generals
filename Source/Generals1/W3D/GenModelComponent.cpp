@@ -1,11 +1,15 @@
 #include "W3D/GenModelComponent.h"
+#include "Core/GenPerf.h"
 #include "Core/GenCoords.h"
 #include "W3D/GenAssets.h"
 #include "Generals1.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
+#include "Engine/World.h"
+#include "GameFramework/Actor.h"
 #include "HAL/IConsoleManager.h"
-#include "ProceduralMeshComponent.h"
+#include "W3D/GenSkinMeshComponent.h"
+#include "Async/ParallelFor.h"
 
 static TAutoConsoleVariable<int32> CVarGenAnimInterpolation(
 	TEXT("gen.AnimInterpolation"), 1,
@@ -36,18 +40,209 @@ namespace
 		C->bReceivesDecals = false;
 		C->SetCastShadow(bCastShadow);
 	}
+
+	/**
+	 * Part components nobody is using (the game thread's). A model that changes its looks - a building
+	 * going up, then standing, then damaged - takes its old parts down and puts new ones up, twenty at a
+	 * time. Destroyed, they are garbage the engine has to stop and collect: nine in ten of all the
+	 * garbage a game made were these. Kept here, they are the next model's parts.
+	 */
+	TArray<TWeakObjectPtr<UStaticMeshComponent>> GFreeParts;
+	constexpr int32 MaxFreeParts = 4000;
+
+	void ReleasePart(UMeshComponent* C, const AActor* Owner)
+	{
+		UStaticMeshComponent* Part = C->GetClass() == UStaticMeshComponent::StaticClass() ? static_cast<UStaticMeshComponent*>(C) : nullptr;
+		const UWorld* World = Part ? Part->GetWorld() : nullptr;
+		if (Part && Owner && Part->GetOuter() == Owner && World && !World->bIsTearingDown && !Owner->IsActorBeingDestroyed() && GFreeParts.Num() < MaxFreeParts)
+		{
+			Part->DetachFromComponent(FDetachmentTransformRules::KeepRelativeTransform);
+			Part->UnregisterComponent();
+			Part->EmptyOverrideMaterials();
+			GFreeParts.Add(Part);
+			return;
+		}
+		C->DestroyComponent();
+	}
+
+	/** A static mesh component for a part: one that was put away if there is one (of this map's), else a new one. Not registered. */
+	UStaticMeshComponent* TakeStaticPart(UObject* Outer)
+	{
+		while (GFreeParts.Num() > 0)
+		{
+			UStaticMeshComponent* Part = GFreeParts.Pop(EAllowShrinking::No).Get();
+			if (Part && Part->GetOuter() == Outer && !Part->IsRegistered())
+			{
+				Part->SetRelativeTransform(FTransform::Identity);
+				return Part;
+			}
+		}
+		return NewObject<UStaticMeshComponent>(Outer, NAME_None, RF_Transient);
+	}
 }
+
+static TAutoConsoleVariable<int32> CVarGenPoseBudget(
+	TEXT("gen.PoseBudget"), 32,
+	TEXT("How many animated models in view are blended between animation frames per drawn frame (the rest take turns; all are posed at their animation's own frame rate)."));
 
 UGenModelComponent::UGenModelComponent()
 {
+	static int32 NextSerial = 0;
+	Serial = NextSerial++;
 	PrimaryComponentTick.bCanEverTick = true;
 	PrimaryComponentTick.bStartWithTickEnabled = false;
 	bTickInEditor = true;
 }
 
+namespace
+{
+	/** The managed models that are animating (game thread's). */
+	TArray<UGenModelComponent*> GManagedModels;
+}
+
 void UGenModelComponent::OnUnregister()
 {
+	if (ManagedIndex != INDEX_NONE)
+	{
+		SetAnimating(false); // (out of the world: nobody is to tick it any more)
+	}
 	Super::OnUnregister();
+}
+
+void UGenModelComponent::BeginDestroy()
+{
+	if (ManagedIndex != INDEX_NONE)
+	{
+		SetAnimating(false);
+	}
+	Super::BeginDestroy();
+}
+
+void UGenModelComponent::ResetForReuse()
+{
+	Animation.Reset();
+	IdlePool.Reset();
+	SetAnimating(false);
+	AnimFrame = 0.f;
+	PosedAnimFrame = -1000.f;
+	BoneOverrides.Reset();
+	BoneOffsets.Reset();
+	bAnimPaused = false;
+	SetStealthLook(0.f, 0.f);
+	SetTint(FLinearColor(0.f, 0.f, 0.f, 0.f));
+	RefreshParts();
+	ResetSubObjectVisibility(); // (poses the model)
+}
+
+void UGenModelComponent::CountParts(int32& OutParts, int32& OutShown, int32& OutGroups) const
+{
+	TSet<int32> Groups;
+	for (const FSubObject& Sub : SubObjects)
+	{
+		if (!Sub.Component)
+		{
+			continue;
+		}
+		++OutParts;
+		if (Sub.Component->IsVisible())
+		{
+			++OutShown;
+			if (Sub.Skin)
+			{
+				++OutGroups;
+			}
+			else
+			{
+				Groups.Add(Sub.bModelSpace ? -1 : Sub.Bone);
+			}
+		}
+	}
+	OutGroups += Groups.Num();
+}
+
+void UGenModelComponent::SetManagedTick(bool bManaged)
+{
+	if (bManaged == bManagedTick)
+	{
+		return;
+	}
+	const bool bAnimating = bManagedTick ? ManagedIndex != INDEX_NONE : IsComponentTickEnabled();
+	SetAnimating(false);
+	bManagedTick = bManaged;
+	SetAnimating(bAnimating);
+}
+
+void UGenModelComponent::SetAnimating(bool bAnimating)
+{
+	if (!bManagedTick)
+	{
+		SetComponentTickEnabled(bAnimating);
+		return;
+	}
+	if (bAnimating == (ManagedIndex != INDEX_NONE))
+	{
+		return;
+	}
+	if (bAnimating)
+	{
+		ManagedIndex = GManagedModels.Add(this);
+	}
+	else
+	{
+		GManagedModels.RemoveAtSwap(ManagedIndex, EAllowShrinking::No);
+		if (GManagedModels.IsValidIndex(ManagedIndex))
+		{
+			GManagedModels[ManagedIndex]->ManagedIndex = ManagedIndex;
+		}
+		ManagedIndex = INDEX_NONE;
+	}
+}
+
+void UGenModelComponent::TickManaged(float DeltaTime)
+{
+	static TArray<UGenModelComponent*> ToPose;
+	ToPose.Reset();
+	{
+		GEN_PERF_SCOPE("R.ModelTick");
+		// Backwards: a model that stops animating takes itself out, and the last one takes its place.
+		for (int32 i = GManagedModels.Num() - 1; i >= 0; --i)
+		{
+			if (GManagedModels.IsValidIndex(i))
+			{
+				UGenModelComponent* Model = GManagedModels[i];
+				Model->bWantsPose = false;
+				Model->Advance(DeltaTime);
+				if (Model->bWantsPose)
+				{
+					ToPose.Add(Model);
+				}
+			}
+		}
+	}
+	GEN_PERF_SCOPE("R.Pose");
+	GEN_PERF_COUNT("R.Poses#", ToPose.Num());
+	// Posing is arithmetic on each model's own bones and vertices: many hands. What follows from it -
+	// parts moved, new vertices sent to the renderer - is the game thread's, one model after the other.
+	if (ToPose.Num() >= 6)
+	{
+		ParallelFor(TEXT("GenModelPose"), ToPose.Num(), 2, [](int32 Index) { ToPose[Index]->ComputePose(); });
+	}
+	else
+	{
+		for (UGenModelComponent* Model : ToPose)
+		{
+			Model->ComputePose();
+		}
+	}
+	for (UGenModelComponent* Model : ToPose)
+	{
+		Model->ApplyPose();
+	}
+}
+
+int32 UGenModelComponent::GetNumManagedAnimating()
+{
+	return GManagedModels.Num();
 }
 
 void UGenModelComponent::OnComponentDestroyed(bool bDestroyingHierarchy)
@@ -63,11 +258,17 @@ void UGenModelComponent::ClearModel()
 	{
 		if (C)
 		{
-			C->DestroyComponent();
+			ReleasePart(C, GetOwner());
 		}
 	}
 	MeshComponents.Reset();
 	SubObjects.Reset();
+	MergedMembers.Reset();
+	MergedBones.Reset();
+	MergedBonePose.Reset();
+	PickParts.Reset();
+	bPickPartsBuilt = false;
+	PlanVersion = 0;
 	File.Reset();
 	Hierarchy.Reset();
 	Animation.Reset();
@@ -77,7 +278,7 @@ void UGenModelComponent::ClearModel()
 	BoneOverrides.Reset();
 	BoneOffsets.Reset();
 	ModelName.Reset();
-	SetComponentTickEnabled(false);
+	SetAnimating(false);
 }
 
 bool UGenModelComponent::SetModel(const FString& InModelName)
@@ -104,30 +305,102 @@ bool UGenModelComponent::SetModel(const FString& InModelName)
 	}
 	ModelName = InModelName;
 
-	// Sub-objects: from the HLOD if present, otherwise every mesh in the file on the root bone.
 	TArray<FGenW3DSubObject> Subs;
-	if (File->HLod)
-	{
-		Hierarchy = Assets->FindHierarchy(File->HLod->HierarchyName, File.Get());
-		Subs = File->HLod->SubObjects;
-		Subs.Append(File->HLod->Aggregates);
-	}
-	else
-	{
-		Hierarchy = File->Hierarchy;
-		for (const FGenW3DMesh& M : File->Meshes)
-		{
-			Subs.Add({ 0, M.FullName() });
-		}
-	}
-
-	const int32 NumPivots = Hierarchy ? Hierarchy->Pivots.Num() : 1;
+	Assets->GetModelSubObjects(*File, Subs, Hierarchy);
+	const int32 NumPivots = Hierarchy ? FMath::Max(1, Hierarchy->Pivots.Num()) : 1;
 	PoseW3D.Init(FTransform3f::Identity, NumPivots);
 	PivotVisible.Init(true, NumPivots);
 
-	UObject* Outer = GetOwner() ? (UObject*)GetOwner() : (UObject*)this;
-	for (const FGenW3DSubObject& SO : Subs)
+	BuildParts();
+	UpdatePose();
+	// (A model of bones alone is a model too: a mine field is eight bones with a light on each.)
+	return SubObjects.Num() > 0 || (Hierarchy && Hierarchy->Pivots.Num() > 1);
+}
+
+void UGenModelComponent::BuildParts()
+{
+	UGenAssetSubsystem* Assets = UGenAssetSubsystem::Get();
+	PickParts.Reset();
+	bPickPartsBuilt = false;
+	if (!Assets || !File)
 	{
+		return;
+	}
+	// Sub-objects: from the HLOD if present, otherwise every mesh in the file on the root bone.
+	TArray<FGenW3DSubObject> Subs;
+	TSharedPtr<const FGenW3DHierarchy> SameHierarchy;
+	Assets->GetModelSubObjects(*File, Subs, SameHierarchy);
+	const int32 NumPivots = PoseW3D.Num();
+	const FString& InModelName = ModelName;
+	// (The plan stays where it is while the parts are made: nothing below asks for another.)
+	const FGenModelPlan& Plan = Assets->GetModelPlan(ModelName);
+	PlanVersion = Plan.InfoVersion;
+
+	UObject* Outer = GetOwner() ? (UObject*)GetOwner() : (UObject*)this;
+	auto AddPart = [this](FSubObject& Sub)
+	{
+		if (Sub.Name.Contains(TEXT("HEADLIGHT"), ESearchCase::IgnoreCase))
+		{
+			Sub.bForcedHidden = true; // daytime default; see SetHeadlightsVisible
+		}
+		Sub.Component->SetVisibility(!Sub.bHiddenByDefault && !Sub.bForcedHidden);
+		if (Sub.Component->bHiddenInGame != bHiddenInGame)
+		{
+			Sub.Component->SetHiddenInGame(bHiddenInGame); // (as the model is: in a transport, in the fog, in the pool)
+		}
+		// (A model put on while the object is stealthed starts out with the look the old one had.)
+		Sub.Component->SetCustomPrimitiveDataFloat(0, StealthFade);
+		Sub.Component->SetCustomPrimitiveDataFloat(1, StealthGlow);
+		Sub.Component->SetCustomPrimitiveDataVector4(2, FVector4(ObjectTint.R, ObjectTint.G, ObjectTint.B, 0.f));
+		MeshComponents.Add(Sub.Component);
+		FSubObject& Added = SubObjects.Add_GetRef(MoveTemp(Sub));
+		ApplyMaterials(Added);
+	};
+
+	if (Plan.Merged.Num() > 0 && Plan.MergedMesh.Mesh)
+	{
+		// The meshes nothing moves or hides, as one. It has each of them where the base pose has its bone:
+		// those places are kept, to see should a pose ever have one of the bones elsewhere (ApplyPose).
+		MergedMembers = Plan.Merged;
+		TArray<FTransform3f, TInlineAllocator<64>> Base;
+		Base.Init(FTransform3f::Identity, NumPivots);
+		for (int32 i = 0; i < NumPivots; ++i)
+		{
+			if (Hierarchy && Hierarchy->Pivots.IsValidIndex(i))
+			{
+				const FGenW3DPivot& P = Hierarchy->Pivots[i];
+				const FTransform3f Local(P.Rotation.GetNormalized(), P.Translation);
+				Base[i] = (P.Parent >= 0 && P.Parent < i) ? Local * Base[P.Parent] : Local;
+			}
+		}
+		for (const FGenModelPlan::FPart& Part : MergedMembers)
+		{
+			if (!MergedBones.Contains(Part.Bone))
+			{
+				MergedBones.Add(Part.Bone);
+				MergedBonePose.Add(Base.IsValidIndex(Part.Bone) ? Base[Part.Bone] : FTransform3f::Identity);
+			}
+		}
+		UStaticMeshComponent* C = TakeStaticPart(Outer);
+		C->SetStaticMesh(Plan.MergedMesh.Mesh);
+		ConfigureMeshComponent(C, true);
+		C->SetupAttachment(this);
+		C->RegisterComponent();
+		FSubObject Sub;
+		Sub.Name = TEXT("(merged)");
+		Sub.Component = C;
+		Sub.Sections = Plan.MergedMesh.Sections;
+		Sub.bModelSpace = true;
+		AddPart(Sub);
+	}
+
+	for (int32 SubIndex = 0; SubIndex < Subs.Num(); ++SubIndex)
+	{
+		if (Plan.bIsMerged.IsValidIndex(SubIndex) && Plan.bIsMerged[SubIndex])
+		{
+			continue;
+		}
+		const FGenW3DSubObject& SO = Subs[SubIndex];
 		const FGenW3DMesh* Mesh = File->FindMesh(SO.Name);
 		if (!Mesh)
 		{
@@ -137,31 +410,26 @@ bool UGenModelComponent::SetModel(const FString& InModelName)
 
 		FSubObject Sub;
 		Sub.Name = StripContainer(SO.Name);
+		Sub.SubIndex = SubIndex;
 		Sub.bHiddenInMesh = Mesh->IsHidden();
 		Sub.bHiddenByDefault = Sub.bHiddenInMesh;
 
 		const bool bCanSkin = Mesh->IsSkin() && Hierarchy && Mesh->Influences.Num() == Mesh->Vertices.Num();
 		if (bCanSkin)
 		{
-			// Deforming skin: CPU-skinned procedural mesh in component space.
+			// Deforming skin: skinned on the CPU, in component space.
 			const FGenSkinData* Skin = Assets->GetSkinData(InModelName, *Mesh);
 			if (!Skin || Skin->Sections.Num() == 0)
 			{
 				continue;
 			}
-			UProceduralMeshComponent* C = NewObject<UProceduralMeshComponent>(Outer, NAME_None, RF_Transient);
+			UGenSkinMeshComponent* C = NewObject<UGenSkinMeshComponent>(Outer, NAME_None, RF_Transient);
 			ConfigureMeshComponent(C, bCastShadow);
-			C->bUseAsyncCooking = true;
+			C->SetSkin(Skin);
 			C->SetupAttachment(this);
 			C->RegisterComponent();
-			for (int32 s = 0; s < Skin->Sections.Num(); ++s)
+			for (const FGenSkinData::FSection& S : Skin->Sections)
 			{
-				const FGenSkinData::FSection& S = Skin->Sections[s];
-				TArray<FVector> Pos;
-				TArray<FVector> Nrm;
-				Pos.SetNumZeroed(S.LocalPositions.Num());
-				Nrm.SetNumZeroed(S.LocalPositions.Num());
-				C->CreateMeshSection_LinearColor(s, Pos, S.Triangles, Nrm, S.UVs, S.Colors, TArray<FProcMeshTangent>(), false, false);
 				Sub.Sections.Add(S.Material);
 			}
 			Sub.Component = C;
@@ -176,7 +444,7 @@ bool UGenModelComponent::SetModel(const FString& InModelName)
 			{
 				continue;
 			}
-			UStaticMeshComponent* C = NewObject<UStaticMeshComponent>(Outer, NAME_None, RF_Transient);
+			UStaticMeshComponent* C = TakeStaticPart(Outer);
 			C->SetStaticMesh(Built->Mesh);
 			ConfigureMeshComponent(C, bCastShadow);
 			C->SetupAttachment(this);
@@ -186,19 +454,74 @@ bool UGenModelComponent::SetModel(const FString& InModelName)
 			Sub.bModelSpace = Built->bSkinBakedToModelSpace;
 			Sub.Bone = Sub.bModelSpace ? 0 : FMath::Clamp(SO.Bone, 0, NumPivots - 1);
 		}
-
-		if (Sub.Name.Contains(TEXT("HEADLIGHT"), ESearchCase::IgnoreCase))
-		{
-			Sub.bForcedHidden = true; // daytime default; see SetHeadlightsVisible
-		}
-		Sub.Component->SetVisibility(!Sub.bHiddenByDefault && !Sub.bForcedHidden);
-		MeshComponents.Add(Sub.Component);
-		FSubObject& Added = SubObjects.Add_GetRef(MoveTemp(Sub));
-		ApplyMaterials(Added);
+		AddPart(Sub);
 	}
+}
 
+void UGenModelComponent::RebuildParts()
+{
+	if (!File || bRebuildingParts)
+	{
+		return;
+	}
+	TGuardValue<bool> Guard(bRebuildingParts, true);
+	GEN_PERF_SCOPE("R.ModelRebuild");
+	UGenAssetSubsystem* Assets = UGenAssetSubsystem::Get();
+	// What was shown or hidden stays so (and what is hidden is, by that, no part of the one mesh).
+	TMap<FString, TPair<bool, bool>> Kept;
+	for (const FSubObject& Sub : SubObjects)
+	{
+		Kept.Add(Sub.Name.ToLower(), TPair<bool, bool>(Sub.bHiddenByDefault, Sub.bForcedHidden));
+		if (Assets && Sub.bForcedHidden && !Sub.bHiddenInMesh)
+		{
+			Assets->NoteToggledSubObject(ModelName, Sub.Name);
+		}
+	}
+	for (UMeshComponent* C : MeshComponents)
+	{
+		if (C)
+		{
+			ReleasePart(C, GetOwner());
+		}
+	}
+	MeshComponents.Reset();
+	SubObjects.Reset();
+	MergedMembers.Reset();
+	MergedBones.Reset();
+	MergedBonePose.Reset();
+	BuildParts();
+	for (FSubObject& Sub : SubObjects)
+	{
+		if (const TPair<bool, bool>* Flags = Kept.Find(Sub.Name.ToLower()))
+		{
+			Sub.bHiddenByDefault = Flags->Key;
+			Sub.bForcedHidden = Flags->Value;
+		}
+	}
 	UpdatePose();
-	return SubObjects.Num() > 0;
+}
+
+bool UGenModelComponent::RefreshParts()
+{
+	UGenAssetSubsystem* Assets = UGenAssetSubsystem::Get();
+	// (Parts come out of the one mesh as more becomes known, never into it: with none in it there is nothing to do.)
+	if (!Assets || !File || bRebuildingParts || MergedMembers.Num() == 0 || Assets->GetMergeInfoVersion(ModelName) == PlanVersion)
+	{
+		return false;
+	}
+	const FGenModelPlan& Plan = Assets->GetModelPlan(ModelName);
+	PlanVersion = Plan.InfoVersion;
+	bool bSame = Plan.Merged.Num() == MergedMembers.Num();
+	for (int32 i = 0; bSame && i < MergedMembers.Num(); ++i)
+	{
+		bSame = Plan.Merged[i].SubIndex == MergedMembers[i].SubIndex;
+	}
+	if (bSame)
+	{
+		return false;
+	}
+	RebuildParts();
+	return true;
 }
 
 void UGenModelComponent::ApplyMaterials(FSubObject& Sub)
@@ -206,7 +529,54 @@ void UGenModelComponent::ApplyMaterials(FSubObject& Sub)
 	UGenAssetSubsystem* Assets = UGenAssetSubsystem::Get();
 	for (int32 s = 0; s < Sub.Sections.Num(); ++s)
 	{
-		Sub.Component->SetMaterial(s, Assets->GetSectionMaterial(Sub.Sections[s], HouseColor));
+		Sub.Component->SetMaterial(s, Assets->GetSectionMaterial(Sub.Sections[s], HouseColor, bFadeable));
+	}
+}
+
+void UGenModelComponent::SetStealthLook(float FadeOut, float Glow)
+{
+	FadeOut = FMath::Clamp(FadeOut, 0.f, 1.f);
+	Glow = FMath::Clamp(Glow, 0.f, 1.f);
+	const bool bWantFadeable = FadeOut > 0.001f;
+	if (bWantFadeable != bFadeable)
+	{
+		bFadeable = bWantFadeable;
+		for (FSubObject& Sub : SubObjects)
+		{
+			if (Sub.Component) { ApplyMaterials(Sub); }
+		}
+	}
+	if (FadeOut == StealthFade && Glow == StealthGlow)
+	{
+		return;
+	}
+	StealthFade = FadeOut;
+	StealthGlow = Glow;
+	// Custom primitive data rather than material parameters: the material instances are shared between
+	// all objects that look alike, and only this one is to change.
+	for (UMeshComponent* C : MeshComponents)
+	{
+		if (C)
+		{
+			C->SetCustomPrimitiveDataFloat(0, StealthFade);
+			C->SetCustomPrimitiveDataFloat(1, StealthGlow);
+		}
+	}
+}
+
+void UGenModelComponent::SetTint(const FLinearColor& Tint)
+{
+	if (Tint.Equals(ObjectTint, 1.e-3f))
+	{
+		return;
+	}
+	ObjectTint = Tint;
+	for (UMeshComponent* C : MeshComponents)
+	{
+		if (C)
+		{
+			C->SetCustomPrimitiveDataVector4(2, FVector4(Tint.R, Tint.G, Tint.B, 0.f));
+		}
 	}
 }
 
@@ -225,9 +595,65 @@ void UGenModelComponent::SetHouseColor(const FLinearColor& Color)
 
 void UGenModelComponent::ShowSubObject(const FString& SubObjectName, bool bShow)
 {
+	// W3DModelDraw::doHideShowSubObjs: the sub-object of that name, and with it "all other child objects
+	// that use this bone as a parent" (doHideShowBoneSubObjs: whatever hangs on a bone further down the
+	// tree - a launcher's spare missile under the turret that is put away).
+	auto IsBelow = [this](int32 Bone, int32 Ancestor)
+	{
+		for (int32 Guard = 0; Hierarchy && Bone > 0 && Hierarchy->Pivots.IsValidIndex(Bone) && Guard < 256; ++Guard)
+		{
+			Bone = Hierarchy->Pivots[Bone].Parent;
+			if (Bone == Ancestor)
+			{
+				return true;
+			}
+		}
+		return false;
+	};
+	TArray<int32, TInlineAllocator<4>> NamedBones;
+	for (const FGenModelPlan::FPart& Part : MergedMembers)
+	{
+		if (Part.Name.Equals(SubObjectName, ESearchCase::IgnoreCase)) { NamedBones.AddUnique(Part.Bone); }
+	}
+	for (const FSubObject& Sub : SubObjects)
+	{
+		if (Sub.Name.Equals(SubObjectName, ESearchCase::IgnoreCase)) { NamedBones.AddUnique(Sub.Bone); }
+	}
+	auto Affected = [&](const FString& Name, int32 Bone)
+	{
+		if (Name.Equals(SubObjectName, ESearchCase::IgnoreCase))
+		{
+			return true;
+		}
+		for (int32 Named : NamedBones)
+		{
+			if (Named > 0 && IsBelow(Bone, Named)) { return true; }
+		}
+		return false;
+	};
+	if (!bShow)
+	{
+		// Parts drawn as one mesh: parts of their own from now on, for every model of the kind.
+		bool bRebuild = false;
+		for (const FGenModelPlan::FPart& Part : MergedMembers)
+		{
+			if (Affected(Part.Name, Part.Bone))
+			{
+				if (UGenAssetSubsystem* Assets = UGenAssetSubsystem::Get())
+				{
+					Assets->NoteToggledSubObject(ModelName, Part.Name);
+				}
+				bRebuild = true;
+			}
+		}
+		if (bRebuild)
+		{
+			RebuildParts();
+		}
+	}
 	for (FSubObject& Sub : SubObjects)
 	{
-		if (Sub.Name.Equals(SubObjectName, ESearchCase::IgnoreCase))
+		if (Affected(Sub.Name, Sub.Bone))
 		{
 			Sub.bForcedHidden = !bShow;
 			Sub.bHiddenByDefault = false;
@@ -274,6 +700,14 @@ void UGenModelComponent::SetSubObjectsOnBonePrefixHidden(const FString& Prefix, 
 				return true;
 			}
 		}
+		for (const FGenModelPlan::FPart& Part : MergedMembers)
+		{
+			if (Part.Name.Equals(Name, ESearchCase::IgnoreCase))
+			{
+				OutBones.AddUnique(Part.Bone);
+				return true;
+			}
+		}
 		return false;
 	};
 	TArray<int32> Bones;
@@ -284,6 +718,15 @@ void UGenModelComponent::SetSubObjectsOnBonePrefixHidden(const FString& Prefix, 
 	if (Bones.Num() == 0)
 	{
 		Resolve(Prefix, Bones);
+	}
+	if (bHidden && MergedBones.ContainsByPredicate([&Bones](int32 Bone) { return Bones.Contains(Bone); }))
+	{
+		// Parts drawn as one mesh are on those bones: parts of their own from now on, for every model of the kind.
+		if (UGenAssetSubsystem* Assets = UGenAssetSubsystem::Get())
+		{
+			Assets->NoteMovedBonePrefix(ModelName, Prefix);
+		}
+		RebuildParts();
 	}
 	bool bChanged = false;
 	for (FSubObject& Sub : SubObjects)
@@ -313,8 +756,17 @@ bool UGenModelComponent::PlayAnimation(const FString& QualifiedName, EGenAnimMod
 	AnimSpeed = Speed;
 	PingPongDir = 1;
 	AnimFrame = (Mode == EGenAnimMode::OnceBackwards || Mode == EGenAnimMode::LoopBackwards) ? float(Animation->NumFrames - 1) : 0.f;
-	SetComponentTickEnabled(Mode != EGenAnimMode::Manual);
-	UpdatePose();
+	SetAnimating(Mode != EGenAnimMode::Manual);
+	if (MergedMembers.Num() > 0)
+	{
+		// What it moves is no part of the one mesh (for the animations a draw module lists that was seen
+		// to when the model's plan was made; this is for the others).
+		Assets->NoteAnimation(ModelName, *Animation);
+	}
+	if (!RefreshParts())
+	{
+		UpdatePose();
+	}
 	return true;
 }
 
@@ -322,7 +774,7 @@ void UGenModelComponent::StopAnimation()
 {
 	Animation.Reset();
 	IdlePool.Reset();
-	SetComponentTickEnabled(false);
+	SetAnimating(false);
 	UpdatePose();
 }
 
@@ -361,6 +813,38 @@ bool UGenModelComponent::IsAnimationPlaying() const
 	}
 }
 
+bool UGenModelComponent::IsAnimationComplete() const
+{
+	if (!Animation)
+	{
+		return true;
+	}
+	switch (AnimMode)
+	{
+	case EGenAnimMode::Once: return AnimFrame >= float(Animation->NumFrames - 1);
+	case EGenAnimMode::OnceBackwards: return AnimFrame <= 0.f;
+	default: return false;
+	}
+}
+
+void UGenModelComponent::SetAnimFrame(float Frame)
+{
+	if (Animation)
+	{
+		AnimFrame = FMath::Clamp(Frame, 0.f, float(FMath::Max(0, Animation->NumFrames - 1)));
+		UpdatePose();
+	}
+}
+
+void UGenModelComponent::SetAnimDuration(float Seconds)
+{
+	if (Animation && Seconds > 0.f && Animation->FrameRate > 0.f && Animation->NumFrames > 0)
+	{
+		// (a multiplier of the animation's own rate, as the original sets one)
+		AnimSpeed = float(Animation->NumFrames) / Animation->FrameRate / Seconds;
+	}
+}
+
 void UGenModelComponent::ResetSubObjectVisibility()
 {
 	for (FSubObject& Sub : SubObjects)
@@ -391,6 +875,10 @@ bool UGenModelComponent::GetBoneTransformW3D(const FString& BoneName, FTransform
 	{
 		return false;
 	}
+	if (bPoseDirty)
+	{
+		const_cast<UGenModelComponent*>(this)->UpdatePose(); // out of view until now: the pose is behind the animation
+	}
 	int32 Idx = Hierarchy->FindPivot(BoneName + TEXT("01"));
 	if (Idx == INDEX_NONE)
 	{
@@ -407,6 +895,10 @@ bool UGenModelComponent::GetBoneTransformW3D(const FString& BoneName, FTransform
 int32 UGenModelComponent::GetNumberedBoneTransformsW3D(const FString& Prefix, TArray<FTransform3f>& OutTransforms) const
 {
 	OutTransforms.Reset();
+	if (bPoseDirty && Hierarchy)
+	{
+		const_cast<UGenModelComponent*>(this)->UpdatePose();
+	}
 	if (!Hierarchy || Prefix.IsEmpty())
 	{
 		return 0;
@@ -469,11 +961,52 @@ void UGenModelComponent::SetBoneOffsetOnPrefix(const FString& Prefix, const FVec
 	}
 }
 
+void UGenModelComponent::SetBoneControl(const FString& BoneName, const FVector3f& OffsetW3D, const FQuat4f& Rotation)
+{
+	if (!Hierarchy || BoneName.IsEmpty())
+	{
+		return;
+	}
+	const int32 Bone = Hierarchy->FindPivot(BoneName);
+	if (Bone == INDEX_NONE)
+	{
+		return;
+	}
+	FVector3f& Offset = BoneOffsets.FindOrAdd(Bone, FVector3f::ZeroVector);
+	FQuat4f& Rot = BoneOverrides.FindOrAdd(Bone, FQuat4f::Identity);
+	if (Offset.Equals(OffsetW3D, 1e-4f) && Rot.Equals(Rotation, 1e-5f))
+	{
+		return;
+	}
+	Offset = OffsetW3D;
+	Rot = Rotation;
+	bPoseDirty = true;
+	bControlsChanged = true; // (posed once for all of this frame's bones: UpdatePoseIfDirty)
+}
+
+void UGenModelComponent::SetTreadOffsets(float Left, float Right, float Middle)
+{
+	for (UMeshComponent* C : MeshComponents)
+	{
+		if (C)
+		{
+			// (Custom primitive data 5..7, read only by sections whose material scrolls as treads.)
+			C->SetCustomPrimitiveDataFloat(5, Left);
+			C->SetCustomPrimitiveDataFloat(6, Right);
+			C->SetCustomPrimitiveDataFloat(7, Middle);
+		}
+	}
+}
+
 bool UGenModelComponent::GetBoneTransform(const FString& BoneName, FTransform& OutTransform) const
 {
 	if (!Hierarchy)
 	{
 		return false;
+	}
+	if (bPoseDirty)
+	{
+		const_cast<UGenModelComponent*>(this)->UpdatePose();
 	}
 	const int32 Idx = Hierarchy->FindPivot(BoneName);
 	if (!PoseW3D.IsValidIndex(Idx))
@@ -487,9 +1020,23 @@ bool UGenModelComponent::GetBoneTransform(const FString& BoneName, FTransform& O
 void UGenModelComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+	bWantsPose = false;
+	Advance(DeltaTime);
+	if (bWantsPose)
+	{
+		UpdatePose();
+	}
+}
+
+void UGenModelComponent::Advance(float DeltaTime)
+{
 	if (!Animation)
 	{
-		SetComponentTickEnabled(false);
+		SetAnimating(false);
+		return;
+	}
+	if (bAnimPaused)
+	{
 		return;
 	}
 	const float Last = float(Animation->NumFrames - 1);
@@ -525,11 +1072,60 @@ void UGenModelComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 	default:
 		break;
 	}
-	UpdatePose();
+	// Posing a model (and skinning it) costs more than everything else it does put together, and most
+	// of the time most models are nowhere near the screen. Those keep their animation running, but are
+	// posed again only when they come into view - or when somebody asks where one of their bones is.
+	bPoseDirty = true;
+	if (!IsBeingDrawn())
+	{
+		return;
+	}
+	// In view: posed whenever the animation has reached its next frame (the rate it was made at, 15 to
+	// 30 a second) or its end. The blend towards the next frame, which is what makes it smooth at a
+	// hundred frames a second, is given to as many models per drawn frame as the budget allows, in
+	// turn - with a few soldiers on screen that is all of them every frame, with a thousand each gets
+	// its turn less often, and the game stays fast.
+	static uint64 CountFrame = 0;
+	static int32 CountNow = 0, CountLast = 0;
+	if (CountFrame != GFrameCounter)
+	{
+		CountFrame = GFrameCounter;
+		CountLast = CountNow;
+		CountNow = 0;
+	}
+	++CountNow;
+	const bool bAtEnd = (AnimMode == EGenAnimMode::Once && AnimFrame >= Last) || (AnimMode == EGenAnimMode::OnceBackwards && AnimFrame <= 0.f);
+	const bool bNextFrame = FMath::Abs(AnimFrame - PosedAnimFrame) >= 1.f || (bAtEnd && AnimFrame != PosedAnimFrame);
+	const int32 Budget = FMath::Max(1, CVarGenPoseBudget.GetValueOnGameThread());
+	const int32 Stride = FMath::Max(1, FMath::DivideAndRoundUp(FMath::Max(CountLast, 1), Budget));
+	if (bNextFrame || (uint64(Serial) + GFrameCounter) % uint64(Stride) == 0)
+	{
+		bWantsPose = true;
+	}
+}
+
+bool UGenModelComponent::IsBeingDrawn() const
+{
+	for (const UMeshComponent* MC : MeshComponents)
+	{
+		if (MC && MC->WasRecentlyRendered(0.25f))
+		{
+			return true;
+		}
+	}
+	return false;
 }
 
 void UGenModelComponent::UpdatePose()
 {
+	ComputePose();
+	ApplyPose();
+}
+
+void UGenModelComponent::ComputePose()
+{
+	bPoseDirty = false;
+	PosedAnimFrame = AnimFrame;
 	const int32 NumPivots = PoseW3D.Num();
 	int32 Frame0 = 0, Frame1 = 0;
 	float Blend = 0.f;
@@ -537,7 +1133,7 @@ void UGenModelComponent::UpdatePose()
 	{
 		const int32 N = Animation->NumFrames;
 		Frame0 = FMath::Clamp(FMath::FloorToInt32(AnimFrame), 0, N - 1);
-		if (CVarGenAnimInterpolation.GetValueOnGameThread() != 0)
+		if (CVarGenAnimInterpolation.GetValueOnAnyThread() != 0)
 		{
 			Blend = FMath::Clamp(AnimFrame - float(Frame0), 0.f, 1.f);
 			const bool bLooping = AnimMode == EGenAnimMode::Loop || AnimMode == EGenAnimMode::LoopBackwards;
@@ -592,7 +1188,35 @@ void UGenModelComponent::UpdatePose()
 		PoseW3D[i] = (Parent >= 0 && Parent < i) ? Local * PoseW3D[Parent] : Local;
 		PivotVisible[i] = bPivotVis && (Parent < 0 || Parent >= i || PivotVisible[Parent]);
 	}
+	ComputeSkins();
+}
 
+void UGenModelComponent::ApplyPose()
+{
+	if (MergedBones.Num() > 0 && !bRebuildingParts)
+	{
+		// The parts drawn as one mesh are where the base pose has their bones. Should this pose have one
+		// of those elsewhere, or hidden - nothing said beforehand that it would - what is on it becomes
+		// parts of their own again, for every model of the kind from now on.
+		TArray<int32, TInlineAllocator<8>> Left;
+		for (int32 i = 0; i < MergedBones.Num(); ++i)
+		{
+			const int32 Bone = MergedBones[i];
+			if (PoseW3D.IsValidIndex(Bone) && (!PivotVisible[Bone] || !PoseW3D[Bone].Equals(MergedBonePose[i], 1.e-3f)))
+			{
+				Left.Add(Bone);
+			}
+		}
+		if (Left.Num() > 0)
+		{
+			if (UGenAssetSubsystem* Assets = UGenAssetSubsystem::Get())
+			{
+				Assets->NoteMovedPivots(ModelName, MakeArrayView(Left));
+			}
+			RebuildParts(); // (poses the model, with the parts it has now)
+			return;
+		}
+	}
 	for (FSubObject& Sub : SubObjects)
 	{
 		if (!Sub.Component)
@@ -608,36 +1232,76 @@ void UGenModelComponent::UpdatePose()
 		{
 			Sub.Component->SetVisibility(bShouldShow);
 		}
+		if (Sub.bSkinPosed)
+		{
+			Sub.bSkinPosed = false;
+			if (UGenSkinMeshComponent* SC = Cast<UGenSkinMeshComponent>(Sub.Component))
+			{
+				SC->PoseChanged(Sub.SkinBox);
+			}
+		}
 	}
-	UpdateSkins();
 }
 
-void UGenModelComponent::UpdateSkins()
+void UGenModelComponent::ComputeSkins()
 {
-	TArray<FVector> Pos;
-	TArray<FVector> Nrm;
+	// A W3D skin's vertex follows one bone. The bones as what they do to a vertex, already in Unreal's
+	// frame (mirrored on Y; positions in cm): made when the first skin wants them.
+	struct FBoneAxes
+	{
+		FVector3f X, Y, Z, T;
+	};
+	TArray<FBoneAxes, TInlineAllocator<64>> Bones;
+	const float Cm = float(GenCoords::UnitsToCm);
+	const FPackedNormal TangentX(FVector3f(1.f, 0.f, 0.f));
 	for (FSubObject& Sub : SubObjects)
 	{
-		UProceduralMeshComponent* PMC = Cast<UProceduralMeshComponent>(Sub.Component);
-		if (!Sub.Skin || !PMC || !PMC->IsVisible())
+		UGenSkinMeshComponent* SC = Sub.Skin ? Cast<UGenSkinMeshComponent>(Sub.Component) : nullptr;
+		// (Shown, as ApplyPose is about to see to: a skin hangs on no bone that could hide it.)
+		if (!SC || Sub.bHiddenByDefault || Sub.bForcedHidden || PoseW3D.Num() == 0)
 		{
 			continue;
 		}
-		for (int32 s = 0; s < Sub.Skin->Sections.Num(); ++s)
+		if (Bones.Num() == 0)
 		{
-			const FGenSkinData::FSection& S = Sub.Skin->Sections[s];
+			Bones.SetNumUninitialized(PoseW3D.Num());
+			for (int32 b = 0; b < PoseW3D.Num(); ++b)
+			{
+				const FQuat4f Q = PoseW3D[b].GetRotation();
+				const FVector3f AX = Q.GetAxisX(), AY = Q.GetAxisY(), AZ = Q.GetAxisZ(), T = PoseW3D[b].GetTranslation();
+				Bones[b] = { GenCoords::DirToUE(AX.X, AX.Y, AX.Z), GenCoords::DirToUE(AY.X, AY.Y, AY.Z), GenCoords::DirToUE(AZ.X, AZ.Y, AZ.Z),
+					GenCoords::ToUEf(T.X, T.Y, T.Z) };
+			}
+		}
+		const int32 Total = SC->GetNumVertices();
+		TArray<FVector3f>& Pos = SC->GetPosePositions();
+		TArray<FPackedNormal>& Tan = SC->GetPoseTangents();
+		Pos.SetNumUninitialized(Total, EAllowShrinking::No);
+		Tan.SetNumUninitialized(Total * 2, EAllowShrinking::No);
+		FVector3f Min(MAX_flt), Max(-MAX_flt);
+		int32 Base = 0;
+		for (const FGenSkinData::FSection& S : Sub.Skin->Sections)
+		{
 			const int32 N = S.LocalPositions.Num();
-			Pos.SetNumUninitialized(N);
-			Nrm.SetNumUninitialized(N);
+			if (Base + N > Total)
+			{
+				break;
+			}
 			for (int32 v = 0; v < N; ++v)
 			{
-				const FTransform3f& Bone = PoseW3D.IsValidIndex(S.Bones[v]) ? PoseW3D[S.Bones[v]] : PoseW3D[0];
-				const FVector3f P = Bone.TransformPosition(S.LocalPositions[v]);
-				const FVector3f Nm = Bone.TransformVectorNoScale(S.LocalNormals[v]);
-				Pos[v] = FVector(GenCoords::ToUEf(P.X, P.Y, P.Z));
-				Nrm[v] = FVector(GenCoords::DirToUE(Nm.X, Nm.Y, Nm.Z));
+				const FBoneAxes& Bone = Bones.IsValidIndex(S.Bones[v]) ? Bones[S.Bones[v]] : Bones[0];
+				const FVector3f& L = S.LocalPositions[v];
+				const FVector3f& LN = S.LocalNormals[v];
+				const FVector3f P = (Bone.X * L.X + Bone.Y * L.Y + Bone.Z * L.Z) * Cm + Bone.T;
+				Pos[Base + v] = P;
+				Min = FVector3f::Min(Min, P);
+				Max = FVector3f::Max(Max, P);
+				Tan[(Base + v) * 2] = TangentX;
+				Tan[(Base + v) * 2 + 1] = FPackedNormal(Bone.X * LN.X + Bone.Y * LN.Y + Bone.Z * LN.Z);
 			}
-			PMC->UpdateMeshSection_LinearColor(s, Pos, Nrm, TArray<FVector2D>(), TArray<FLinearColor>(), TArray<FProcMeshTangent>(), false);
+			Base += N;
 		}
+		Sub.SkinBox = Base > 0 ? FBox3f(Min, Max) : FBox3f(ForceInit);
+		Sub.bSkinPosed = true;
 	}
 }

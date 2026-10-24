@@ -5,6 +5,7 @@
 // ParachuteContain.cpp (much simplified) and DeletionUpdate.cpp.
 
 #include "Logic/GenGameLogic.h"
+#include "Audio/GenAudioManager.h"
 #include "Client/GenFXData.h"
 #include "Logic/GenCommandData.h"
 #include "Logic/GenGameData.h"
@@ -86,7 +87,22 @@ bool UGenGameLogic::IsPowerReady(const FGenObject& Obj, int32 Module, uint32* Ou
 	{
 		return No(TEXT("Requires a general's promotion"));
 	}
-	if (M.Type == EGenPowerModule::Other || M.Type == EGenPowerModule::CashBounty || !T->bPorted || Obj.IsPowerPaused(Module))
+	if (Obj.IsDisabled())
+	{
+		return No(TEXT("Disabled")); // (SpecialPowerModule::isReady: not while its countdown is paused)
+	}
+	if (M.Type == EGenPowerModule::SpecialAbility && T->bPorted && Obj.FindAbility(M.Power) != INDEX_NONE && Obj.IsPowerPaused(Module))
+	{
+		return No(TEXT("Requires an upgrade"));
+	}
+	if (M.Type == EGenPowerModule::Other || M.Type == EGenPowerModule::CashBounty || !T->bPorted || Obj.IsPowerPaused(Module)
+		|| (M.Type == EGenPowerModule::SpecialAbility && Obj.FindAbility(M.Power) == INDEX_NONE
+			// (The particle cannon's is a SpecialAbility too, with "UpdateModuleStartsAttack": its own update does the work.)
+			&& !(Obj.GetTemplate()->ParticleCannon.bValid && Obj.GetTemplate()->ParticleCannon.Power.Equals(M.Power, ESearchCase::IgnoreCase))
+			// (... and so is the one that sends for a gunship: SpectreGunshipDeploymentUpdate.)
+			&& !Obj.GetTemplate()->GunshipDeployments.ContainsByPredicate([&M](const FGenGunshipDeployment& G) { return G.Power.Equals(M.Power, ESearchCase::IgnoreCase); })
+			// (... and the strategy center's: BattlePlanUpdate.)
+			&& !(Obj.GetTemplate()->BattlePlan.bValid && Obj.GetTemplate()->BattlePlan.Power.Equals(M.Power, ESearchCase::IgnoreCase))))
 	{
 		return No(TEXT("Not available yet"));
 	}
@@ -96,6 +112,11 @@ bool UGenGameLogic::IsPowerReady(const FGenObject& Obj, int32 Module, uint32* Ou
 	{
 		const uint32* Shared = Players[Obj.GetOwner()].PowerReadyFrame.Find(T->Name.ToLower());
 		Ready = Shared ? *Shared : 0;
+	}
+	// (-GenPowersReady: test runs don't wait out a superweapon's five minutes.)
+	if (bPowersReady)
+	{
+		Ready = 0;
 	}
 	if (OutReadyFrame) { *OutReadyFrame = Ready; }
 	if (Frame < Ready)
@@ -116,6 +137,10 @@ FGenObject* UGenGameLogic::FindPowerSource(int32 Player, const FString& Power, b
 		if (O->GetOwner() != Player || O->IsDead() || O->IsDestroyed() || O->IsUnderConstruction())
 		{
 			continue;
+		}
+		if (O->GetTemplate()->Gunship.bValid)
+		{
+			continue; // (the gunship carries the power's module too, but it is what the power sends, not who sends it)
 		}
 		const int32 Module = FindPowerModule(*O, Power);
 		if (Module == INDEX_NONE || O->GetTemplate()->PowerModules[Module].bScriptedOnly)
@@ -139,19 +164,33 @@ FGenObject* UGenGameLogic::FindPowerSource(int32 Player, const FString& Power, b
 
 void UGenGameLogic::IssueSpecialPower(FGenObjectID Source, const FString& Power, const FVector3f& TargetPos, FGenObjectID TargetObj)
 {
-	PendingCommands.Add([this, Source, Power, TargetPos, TargetObj]()
-	{
-		FGenObject* S = FindObject(Source);
-		const int32 Module = S ? FindPowerModule(*S, Power) : INDEX_NONE;
-		if (Module != INDEX_NONE)
-		{
-			FireSpecialPower(*S, Module, TargetPos, TargetObj);
-		}
-	});
+	FGenCommand C(EGenCommandType::SpecialPower);
+	C.Units = { Source };
+	C.Name = Power;
+	C.Pos = TargetPos;
+	C.Target = TargetObj;
+	SubmitCommand(MoveTemp(C));
+}
+
+void UGenGameLogic::ExecSpecialPower(const FGenCommand& C)
+{
+	const FGenObjectID Source = C.Units.Num() > 0 ? C.Units[0] : GenInvalidObjectID;
+	FGenObject* S = FindObject(Source);
+	const int32 Module = S ? FindPowerModule(*S, C.Name) : INDEX_NONE;
+	const bool bFired = Module != INDEX_NONE && FireSpecialPower(*S, Module, C.Pos, C.Target);
+	UE_CLOG(bTrace && !bFired, LogGenerals, Log, TEXT("  [power f%u] %s from #%u %s at (%.0f, %.0f): not fired (%s)"), Frame, *C.Name, Source,
+		S ? *S->GetTemplate()->Name : TEXT("nothing"), C.Pos.X, C.Pos.Y, Module == INDEX_NONE ? TEXT("no such power there") : TEXT("not ready"));
 }
 
 bool UGenGameLogic::FireSpecialPower(FGenObject& Source, int32 Module, const FVector3f& InTargetPos, FGenObjectID TargetObj)
 {
+	// (A particle cannon whose beam is burning: the order says where the beam goes next.)
+	if (Source.GetTemplate()->ParticleCannon.bValid && Source.GetTemplate()->PowerModules.IsValidIndex(Module)
+		&& Source.SteerParticleCannon(Source.GetTemplate()->PowerModules[Module].Power,
+			FVector3f(InTargetPos.X, InTargetPos.Y, GetGroundHeight(InTargetPos.X, InTargetPos.Y)), Frame))
+	{
+		return true;
+	}
 	if (!IsPowerReady(Source, Module))
 	{
 		return false;
@@ -167,8 +206,42 @@ bool UGenGameLogic::FireSpecialPower(FGenObject& Source, int32 Module, const FVe
 	}
 	TargetPos.Z = GetGroundHeight(TargetPos.X, TargetPos.Y);
 
-	switch (M.Type)
+	const bool bCannon = Source.BeginParticleCannon(M.Power, TargetPos, Frame) || DeployGunship(Source, M.Power, TargetPos);
+	switch (bCannon ? EGenPowerModule::Other : M.Type)
 	{
+	case EGenPowerModule::Other:
+		if (!bCannon)
+		{
+			return false;
+		}
+		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [power f%u] p%d fires %s at (%.0f, %.0f)"), Frame, Player, *T.Name, TargetPos.X, TargetPos.Y);
+		break;
+	case EGenPowerModule::SpecialAbility:
+	{
+		// SpecialAbility::doSpecialPowerAtObject: the unit's SpecialAbilityUpdate takes it from here; the
+		// power starts recharging when the unit gets down to it.
+		// (ActionManager::canDoSpecialPowerAtObject; with nothing aimed at, canDoSpecialPower: only the
+		// remote charges do anything then - they go off.)
+		const bool bAtPosition = !Victim && T.AbilityKind == EGenAbilityKind::HelixNapalmBomb;
+		if (TargetObj != GenInvalidObjectID && !Victim)
+		{
+			return false; // what it was aimed at is gone
+		}
+		if (!bAtPosition && !CanUseAbilityOn(Source, Module, Victim, false))
+		{
+			return false;
+		}
+		const FString Hunt = Source.HuntButton; // (the order may come from the unit's own hunt)
+		Source.OnPlayerCommand(false);
+		Source.HuntButton = Hunt;
+		if (!Source.StartAbility(Source.FindAbility(M.Power), TargetObj, bAtPosition ? &TargetPos : nullptr))
+		{
+			return false;
+		}
+		PlaySoundAt(M.InitiateSound, Source);
+		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [ability f%u] #%u p%d %s sets off to use %s on #%u"), Frame, Source.GetID(), Player, *Source.GetTemplate()->Name, *T.Name, TargetObj);
+		return true;
+	}
 	case EGenPowerModule::OCL:
 	{
 		// OCLSpecialPower::findOCL: the strongest version whose science the player owns.
@@ -190,7 +263,15 @@ bool UGenGameLogic::FireSpecialPower(FGenObject& Source, int32 Module, const FVe
 		else if (M.CreateLocation == TEXT("CREATE_AT_EDGE_NEAR_TARGET")) { CreatePos = FindEdgePoint(TargetPos, false); }
 		else if (M.CreateLocation == TEXT("CREATE_AT_EDGE_FARTHEST_FROM_TARGET")) { CreatePos = FindEdgePoint(TargetPos, true); CreatePos.Z += CreateAboveLocationHeight; }
 		else if (M.CreateLocation == TEXT("CREATE_ABOVE_LOCATION")) { CreatePos.Z += CreateAboveLocationHeight; }
-		RunPowerOCL(OCLName, Source, CreatePos, TargetPos);
+		// OCLSpecialPower's ReferenceObject (the sneak attack's tunnel): the power puts a building down, and
+		// only where that building could be built.
+		const FGenThingTemplate* Reference = M.ReferenceObject.IsEmpty() ? nullptr : FGenGameData::Get().FindTemplate(M.ReferenceObject);
+		if (Reference && !IsLocationLegalToBuild(*Reference, TargetPos, Reference->PlacementViewAngle))
+		{
+			UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [power f%u] p%d: %s can't go at (%.0f, %.0f) - no %s could be built there"), Frame, Player, *T.Name, TargetPos.X, TargetPos.Y, *Reference->Name);
+			return false;
+		}
+		RunPowerOCL(OCLName, Source, CreatePos, TargetPos, Reference ? &Reference->PlacementViewAngle : nullptr);
 		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [power f%u] p%d fires %s (%s) at (%.0f, %.0f) from (%.0f, %.0f)"), Frame, Player, *T.Name, *OCLName,
 			TargetPos.X, TargetPos.Y, CreatePos.X, CreatePos.Y);
 		break;
@@ -212,15 +293,32 @@ bool UGenGameLogic::FireSpecialPower(FGenObject& Source, int32 Module, const FVe
 			}
 		}
 		FGenPlayer& From = Players[Victim->GetOwner()];
-		Amount = FMath::Min(Amount, From.Money);
-		From.Money -= Amount;
-		Players[Player].Money += Amount;
+		Amount = Withdraw(Victim->GetOwner(), Amount);
+		Deposit(Player, Amount);
+		ScoreMoneyEarned(Player, Amount);
 		FGenFloatingText& Text = FloatingTexts.AddDefaulted_GetRef();
 		Text.Text = FString::Printf(TEXT("-$%d"), Amount);
 		Text.Pos = Victim->GetPosition();
 		Text.Color = From.Color;
 		Text.Frame = Frame;
 		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [power f%u] p%d fires %s: $%d taken from p%d"), Frame, Player, *T.Name, Amount, From.Index);
+		break;
+	}
+	case EGenPowerModule::SpyVision:
+	{
+		// SpyVisionSpecialPower -> SpyVisionUpdate::activateSpyVision: for the duration, what the enemy's
+		// units see, this player sees too. (Kept per player here; the original marks each enemy unit.)
+		FGenPlayer& Spy = Players[Player];
+		Spy.SpyVisionEndFrame = Frame + uint32(FMath::Max(M.Duration, 1));
+		Spy.SpyVisionSource = Source.GetID();
+		for (FGenPlayer& Other : Players)
+		{
+			if (GetRelationship(Player, Other.Index) == EGenRelationship::Enemies)
+			{
+				Other.SpiedByMask |= 1u << Player;
+			}
+		}
+		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [power f%u] p%d fires %s: sees what the enemy sees until f%u"), Frame, Player, *T.Name, Spy.SpyVisionEndFrame);
 		break;
 	}
 	default:
@@ -237,10 +335,110 @@ bool UGenGameLogic::FireSpecialPower(FGenObject& Source, int32 Module, const FVe
 		Source.PowerReady[Module] = Frame + uint32(T.ReloadTime);
 	}
 	++Players[Player].PowersFired;
+	Source.OnLauncherPowerFired(T.Name, Frame);
+	// SpecialPowerModule::aboutToDoSpecialPower: "Let EVA do her thing" - "all players need to hear these warnings".
+	EvaSuperweapon(TEXT("Launched"), Source, T);
+	// SpecialPowerModule::createViewObject: its owner sees the spot it was aimed at for a while (ViewObjectDuration,
+	// ViewObjectRange) - the superweapons, the generals' strikes and drops, a charge planted.
+	RevealAreaFor(Player, FVector2f(TargetPos.X, TargetPos.Y), T.ViewObjectRange, uint32(T.ViewObjectFrames));
+	// SpecialPowerModule::initiateIntentToDoSpecialPower: what its owner hears, and what is heard where it is aimed.
+	if (Audio)
+	{
+		Audio->PlayUI(T.InitiateSound, Player);
+		Audio->PlayAt(T.InitiateAtLocationSound, TargetPos, Player);
+	}
 	return true;
 }
 
-void UGenGameLogic::RunPowerOCL(const FString& OCLName, const FGenObject& Source, const FVector3f& CreatePos, const FVector3f& TargetPos)
+void UGenGameLogic::IssueCapture(const TArray<FGenObjectID>& Units, FGenObjectID Target)
+{
+	FGenCommand C(EGenCommandType::Capture);
+	C.Units = Units;
+	C.Target = Target;
+	SubmitCommand(MoveTemp(C));
+}
+
+void UGenGameLogic::ExecCapture(const FGenCommand& C)
+{
+	const FGenObject* Victim = FindObject(C.Target);
+	for (FGenObjectID Id : C.Units)
+	{
+		FGenObject* U = FindObject(Id);
+		if (!U || !Victim || U->IsDead())
+		{
+			continue;
+		}
+		const TArray<FGenSpecialPowerModule>& Modules = U->GetTemplate()->PowerModules;
+		for (int32 i = 0; i < Modules.Num(); ++i)
+		{
+			const FGenSpecialPowerTemplate* T = FGenUpgradeData::Get().FindPower(Modules[i].Power);
+			if (Modules[i].Type == EGenPowerModule::SpecialAbility && T && T->Enum.EndsWith(TEXT("SPECIAL_INFANTRY_CAPTURE_BUILDING"), ESearchCase::IgnoreCase))
+			{
+				FireSpecialPower(*U, i, Victim->GetPosition(), C.Target);
+				break;
+			}
+		}
+	}
+}
+
+void UGenGameLogic::IssueFireWeapon(const TArray<FGenObjectID>& Units, FGenObjectID Target, int32 Slot)
+{
+	FGenCommand C(EGenCommandType::FireWeapon);
+	C.Units = Units;
+	C.Target = Target;
+	C.A = Slot;
+	SubmitCommand(MoveTemp(C));
+}
+
+void UGenGameLogic::ExecFireWeapon(const FGenCommand& C)
+{
+	const FGenObject* Victim = FindObject(C.Target);
+	const int32 Slot = C.A;
+	for (FGenObjectID Id : C.Units)
+	{
+		FGenObject* U = FindObject(Id);
+		if (U && Victim && !U->IsDead() && !U->IsContained() && Slot >= 0 && Slot < 3 && U->GetWeapon(Slot).Template)
+		{
+			U->OnPlayerCommand(false);
+			U->CommandAttackWithSlot(C.Target, Slot);
+		}
+	}
+}
+
+void UGenGameLogic::AddFloatingText(const FString& InText, const FVector3f& Pos, const FLinearColor& Color)
+{
+	FGenFloatingText& Text = FloatingTexts.AddDefaulted_GetRef();
+	Text.Text = InText;
+	Text.Pos = Pos;
+	Text.Color = Color;
+	Text.Frame = Frame;
+}
+
+void UGenGameLogic::PlaySoundAt(const FString& Event, const FGenObject& Obj)
+{
+	if (Audio && !Event.IsEmpty())
+	{
+		Audio->PlayAt(Event, Obj.GetPosition(), Obj.GetOwner());
+	}
+}
+
+void UGenGameLogic::PlayEventForObject(const FString& Event, const FGenObject& Obj)
+{
+	if (Audio && !Event.IsEmpty())
+	{
+		Audio->PlayForObject(Event, Obj);
+	}
+}
+
+void UGenGameLogic::SetAbilityLoopSound(const FGenObject& Obj, const FString& Event)
+{
+	if (Audio)
+	{
+		Audio->SetObjectLoop(Obj.GetID(), 6, Event); // (0 moving, 1 ambient, 2-4 weapons, 5 a helicopter going down)
+	}
+}
+
+void UGenGameLogic::RunPowerOCL(const FString& OCLName, const FGenObject& Source, const FVector3f& CreatePos, const FVector3f& TargetPos, const float* PlacedAngle)
 {
 	const FGenOCL* OCL = FGenFXData::Get().FindOCL(OCLName);
 	if (!OCL)
@@ -279,9 +477,26 @@ void UGenGameLogic::RunPowerOCL(const FString& OCLName, const FGenObject& Source
 			}
 			const float Ground = GetGroundHeight(Pos.X, Pos.Y);
 			Pos.Z = FMath::Max(Pos.Z, Ground);
-			if (FGenObject* O = CreateObject(T, Player, Pos, Random.FRandRange(-PI, PI)))
+			// (ObjectCreationList::create with an angle: a building the power puts down faces the way it was placed.)
+			if (FGenObject* O = CreateObject(T, Player, Pos, PlacedAngle ? *PlacedAngle : Random.FRandRange(-PI, PI)))
 			{
 				O->Producer = Source.GetID();
+				if (!T->GrantStealth.RadiusParticleSystem.IsEmpty())
+				{
+					AttachParticleSystem(T->GrantStealth.RadiusParticleSystem, O->GetID()); // GrantStealthBehavior's radius effect
+				}
+				if (T->WeaponBonusPulse.bValid)
+				{
+					// (A marker without a model that is gone again in a frame: what its look carries - the frenzy's cloud - is set off here.)
+					if (const FGenDrawModule* Draw = T->PrimaryDraw())
+					{
+						const int32 StateIndex = Draw->FindBestState(FGenConditionBits());
+						for (const TPair<FString, FString>& Bone : Draw->States.IsValidIndex(StateIndex) ? Draw->States[StateIndex].ParticleBones : TArray<TPair<FString, FString>>())
+						{
+							AttachParticleSystem(Bone.Value, O->GetID());
+						}
+					}
+				}
 			}
 		}
 	}
@@ -290,6 +505,25 @@ void UGenGameLogic::RunPowerOCL(const FString& OCLName, const FGenObject& Source
 	for (const FGenDeliverPayload& P : OCL->Payloads)
 	{
 		StartDelivery(P, Source, CreatePos, TargetPos);
+	}
+
+	// FireWeapon and Attack nuggets: the superweapons - "you must have a primary and secondary source for this effect".
+	if (FGenObject* Shooter = FindObject(Source.GetID()))
+	{
+		for (const FString& WeaponName : OCL->FireWeapons)
+		{
+			if (const FGenWeaponTemplate* W = GD.FindWeapon(WeaponName))
+			{
+				FireTempWeapon(*W, *Shooter, TargetPos);
+			}
+		}
+		for (const FGenOCL::FAttack& A : OCL->Attacks)
+		{
+			// "lock merely fires till the weapon is empty or the attack is 'done'"
+			Shooter->CommandAttackPosition(TargetPos, A.NumShots, A.Slot);
+			UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [power f%u] #%u %s attacks (%.0f, %.0f) with %d shots"), Frame, Shooter->GetID(),
+				*Shooter->GetTemplate()->Name, TargetPos.X, TargetPos.Y, A.NumShots);
+		}
 	}
 }
 
@@ -356,6 +590,18 @@ void UGenGameLogic::StartDelivery(const FGenDeliverPayload& P, const FGenObject&
 		Transport->SnapshotPrevious();
 
 		Transport->Delivery = MakeUnique<FGenObject::FDelivery>();
+		if (P.DeliveryDecal.IsValid() && P.DeliveryDecalRadius > 0.f)
+		{
+			DeliveryMarkers.RemoveAll([this](FGenObjectID Id)
+			{
+				const FGenObject* O = FindObject(Id);
+				const FGenRadiusDecalTemplate* T = nullptr;
+				FVector3f Pos;
+				float Radius = 0.f;
+				return !O || !O->GetDeliveryMarker(Pos, Radius, T);
+			});
+			DeliveryMarkers.Add(Transport->GetID());
+		}
 		FGenObject::FDelivery& D = *Transport->Delivery;
 		D.Data = &P;
 		D.Target = Target;
@@ -373,6 +619,18 @@ void UGenGameLogic::StartDelivery(const FGenDeliverPayload& P, const FGenObject&
 }
 
 // ---- the aircraft making a delivery (DeliverPayloadAIUpdate) ------------------------------------
+
+bool FGenObject::GetDeliveryMarker(FVector3f& OutPos, float& OutRadius, const FGenRadiusDecalTemplate*& OutDecal) const
+{
+	if (bDead || bPendingDestroy || !Delivery || !Delivery->Data || Delivery->State >= 2 || !Delivery->Data->DeliveryDecal.IsValid() || Delivery->Data->DeliveryDecalRadius <= 0.f)
+	{
+		return false;
+	}
+	OutPos = Delivery->Target;
+	OutRadius = Delivery->Data->DeliveryDecalRadius;
+	OutDecal = &Delivery->Data->DeliveryDecal;
+	return true;
+}
 
 bool FGenObject::UpdateDelivery(uint32 Frame)
 {
@@ -418,6 +676,8 @@ bool FGenObject::UpdateDelivery(uint32 Frame)
 				FVector3f Strafe(D.Target.X + Along.X * 0.67f, D.Target.Y + Along.Y * 0.67f, 0.f);
 				Strafe.Z = Logic->GetGroundHeight(Strafe.X, Strafe.Y);
 				const FGenWeaponTemplate& W = *Weapons[0].Template;
+				// ("fireCurrentWeapon": its sound and its flash, then where the bullets land.)
+				Logic->DoWeaponFireSound(*this, 0, W);
 				Logic->DoWeaponFireFX(*this, 0, W, Strafe);
 				Logic->DoFXPos(P.StrafeWeaponFX, Strafe, nullptr, 0.f, nullptr, 0.f);
 				Logic->DealDamage(W, ID, GenInvalidObjectID, Strafe, true);
@@ -542,15 +802,21 @@ void FGenObject::DropPayloadItem(uint32 Frame)
 		// ParachuteContain: the item hangs under a parachute, which opens after a short free fall and
 		// then steers for the target.
 		Chute->Producer = ID;
-		Chute->ParachuteRider = Item->ID;
-		Chute->bFalling = true;
-		Chute->Goal = P.bParachuteDirectly ? D.Target : FVector3f(Pos.X, Pos.Y, 0.f);
-		Chute->Velocity = P.bInheritTransportVelocity ? Velocity : FVector3f::ZeroVector;
-		// (Dropped too low to open in time: pretend it started higher, so it opens at once.)
-		Chute->ChuteStartZ = FMath::Max(Pos.Z, Logic->GetGroundHeight(Pos.X, Pos.Y) + 2.f * ChuteT->ParachuteOpenDist);
-		Item->bHeldByParachute = true;
-		Item->SetModelCondition(FreeFallBit(), true);
-		Chute->SetModelCondition(FreeFallBit(), true);
+		// (TransportContain's KeepContainerVelocityOnExit: it leaves the aircraft at the aircraft's speed.)
+		// "ParachuteDirectly ... bunch up on the target": not the one spot for all of them, though (not the
+		// original: the crates of a supply drop came down in a heap) - each its own place on a small spiral
+		// round it.
+		FVector3f LandAt = D.Target;
+		if (P.bParachuteDirectly)
+		{
+			const int32 Dropped = Total - D.ItemsLeft - 1;
+			const float Angle = float(Dropped) * 2.39996f; // (the golden angle: evenly spread, whatever the count)
+			const float Radius = Dropped == 0 ? 0.f : 14.f * FMath::Sqrt(float(Dropped));
+			LandAt.X += Radius * FMath::Cos(Angle);
+			LandAt.Y += Radius * FMath::Sin(Angle);
+		}
+		Chute->CarryUnderParachute(*Item, P.bParachuteDirectly ? &LandAt : nullptr,
+			(P.bInheritTransportVelocity || Template->Contain.bKeepVelocityOnExit) ? Velocity : FVector3f::ZeroVector);
 	}
 	else
 	{
@@ -562,6 +828,45 @@ void FGenObject::DropPayloadItem(uint32 Frame)
 	}
 	UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [power f%u] #%u %s drops %s (#%u) at (%.0f, %.0f) alt %.0f"), Frame, ID, *Template->Name, *ItemT->Name,
 		Item->ID, Pos.X, Pos.Y, Pos.Z - Logic->GetGroundHeight(Pos.X, Pos.Y));
+}
+
+void FGenObject::CarryUnderParachute(FGenObject& Rider, const FVector3f* LandAt, const FVector3f& StartVelocity)
+{
+	ParachuteRider = Rider.ID;
+	bFalling = true;
+	bChuteLandsWhereItOpens = LandAt == nullptr;
+	Goal = LandAt ? *LandAt : FVector3f(Position.X, Position.Y, 0.f);
+	Velocity = StartVelocity;
+	// (Dropped too low to open in time: pretend it started higher, so it opens at once.)
+	ChuteStartZ = FMath::Max(Position.Z, Logic->GetGroundHeight(Position.X, Position.Y) + 2.f * Template->ParachuteOpenDist);
+	Rider.bHeldByParachute = true;
+	Rider.SetModelCondition(FreeFallBit(), true);
+	SetModelCondition(FreeFallBit(), true);
+	// ParachuteContain::updateBonePositions / positionContainedObjectsRelativeToContainer: the rider's PARA_MAN
+	// bone (or the top of it, without one) hangs at the canopy's PARA_ATTCH - below the canopy, not inside it.
+	// And onDrawableBoundToObject: "setDrawableHidden(!m_opened)" - no canopy while it falls free.
+	ChuteRiderDrop = Rider.Template->GetMaxHeightAbovePosition();
+	if (UGenAssetSubsystem* Assets = UGenAssetSubsystem::Get())
+	{
+		TArray<FTransform3f> Bone;
+		const FGenDrawModule* RiderDraw = Rider.Template->PrimaryDraw();
+		const FGenDrawModule* ChuteDraw = Template->PrimaryDraw();
+		float Man = ChuteRiderDrop, Attach = 0.f;
+		if (RiderDraw && Assets->GetPristineBones(RiderDraw->DefaultModel(), TEXT("PARA_MAN"), 0, 1, Bone) > 0)
+		{
+			Man = Bone[0].GetTranslation().Z;
+		}
+		if (ChuteDraw && Assets->GetPristineBones(ChuteDraw->DefaultModel(), TEXT("PARA_ATTCH"), 0, 1, Bone) > 0)
+		{
+			Attach = Bone[0].GetTranslation().Z;
+		}
+		ChuteRiderDrop = FMath::Max(0.f, Man - Attach);
+	}
+	// (The canopy goes above where the rider is let go, not the rider below it.)
+	SetPosition(FVector3f(Position.X, Position.Y, Position.Z + ChuteRiderDrop));
+	ChuteStartZ += ChuteRiderDrop;
+	SnapshotPrevious();
+	bHidden = true;
 }
 
 void FGenObject::FireVisiblePayload(uint32 Frame)
@@ -619,6 +924,12 @@ void FGenObject::UpdateAreaWeapons(uint32 Frame)
 		uint32 Delay = uint32(FMath::Max(1, W->DelayBetweenShotsMin));
 		if (W->ClipSize > 0 && --AreaWeapons[i].Ammo <= 0)
 		{
+			if (W->ReloadType != EGenReloadType::Auto)
+			{
+				// "AutoReloadsClip = No": its clip fired, it is done (the thumps of a tunnel digging its way up).
+				AreaWeapons[i].ReadyFrame = MAX_uint32;
+				continue;
+			}
 			AreaWeapons[i].Ammo = W->ClipSize;
 			Delay = FMath::Max(Delay, uint32(W->ClipReloadTime));
 		}
@@ -687,7 +998,7 @@ void FGenObject::DoEMP(uint32 Frame)
 		{
 			continue; // only base buildings
 		}
-		O->DisableUntil(Frame + uint32(Template->EMPDisabledDuration));
+		O->EMPUntil(Frame + uint32(Template->EMPDisabledDuration));
 		UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [power f%u] EMP disables #%u %s until f%u"), Frame, O->ID, *T->Name, O->DisabledUntilFrame);
 	}
 }
@@ -713,41 +1024,60 @@ bool FGenObject::UpdatePayload(uint32 Frame)
 		if (!bChuteOpen)
 		{
 			Velocity.Z += FGenGameData::Get().Gravity;
-			if (ChuteStartZ - Position.Z >= Template->ParachuteOpenDist)
+			if (FMath::Abs(ChuteStartZ - Position.Z) >= Template->ParachuteOpenDist)
 			{
 				bChuteOpen = true;
+				bHidden = false; // (the canopy shows from now on)
+				if (bChuteLandsWhereItOpens)
+				{
+					Goal = FVector3f(Position.X, Position.Y, 0.f); // (it makes for the ground below, braking off what speed it has)
+				}
 				SetModelCondition(FreeFallBit(), false);
 				SetModelCondition(ParachutingBit(), true);
 				if (Rider)
 				{
 					Rider->SetModelCondition(FreeFallBit(), false);
 					Rider->SetModelCondition(ParachutingBit(), true);
+					Logic->PlayEventForObject(Template->ParachuteOpenSound, *Rider);
 				}
 			}
 		}
 		else
 		{
-			const float MaxSpeed = Locomotor ? Locomotor->Speed : 2.f;
+			float MaxSpeed = Locomotor ? Locomotor->Speed : 2.f;
 			const float Steer = Locomotor ? FMath::Max(Locomotor->Acceleration, 0.01f) : 0.07f;
 			const float Sink = (Locomotor && Locomotor->SpeedLimitZ < 100.f) ? Locomotor->SpeedLimitZ : 0.5f;
 			const float Brake = Locomotor ? FMath::Max(Locomotor->Lift, 0.02f) : 0.1f;
-			const FVector2f Want = FVector2f(Goal.X - Position.X, Goal.Y - Position.Y).GetClampedToMaxSize(MaxSpeed);
+			// (It left the aircraft at the aircraft's speed: like any locomotor it brakes in time to stop
+			// over its landing spot instead of sailing past it.)
+			const FVector2f ToGoal(Goal.X - Position.X, Goal.Y - Position.Y);
+			const float GoalDist = ToGoal.Size();
+			if (!bChuteLandsWhereItOpens)
+			{
+				// (Not the original: a crate let go far short of the drop zone sank to the ground before it got
+				// there. It glides as fast as it has to, to touch down on its spot - up to three times its pace.)
+				const float Height = FMath::Max(Position.Z - ChuteRiderDrop - Logic->GetGroundHeight(Position.X, Position.Y), 0.f);
+				const float FramesLeft = FMath::Max(Height / FMath::Max(Sink, 0.01f), 1.f);
+				MaxSpeed = FMath::Clamp(GoalDist / FramesLeft * 1.15f, MaxSpeed, 3.f * MaxSpeed);
+			}
+			const float BrakeRate = Locomotor ? FMath::Max(Locomotor->Braking, Steer) : Steer;
+			const FVector2f Want = GoalDist > 0.01f ? ToGoal / GoalDist * FMath::Min(MaxSpeed, FMath::Sqrt(2.f * BrakeRate * GoalDist)) : FVector2f::ZeroVector;
 			FVector2f Vel(Velocity.X, Velocity.Y);
-			Vel += (Want - Vel).GetClampedToMaxSize(Steer);
+			Vel += (Want - Vel).GetClampedToMaxSize(Want.SizeSquared() < Vel.SizeSquared() ? BrakeRate : Steer);
 			Velocity.X = Vel.X;
 			Velocity.Y = Vel.Y;
 			Velocity.Z += FMath::Clamp(-Sink - Velocity.Z, -Brake, Brake);
 		}
 		Position += Velocity;
 		const float Ground = Logic->GetGroundHeight(Position.X, Position.Y);
-		const bool bLanded = Position.Z <= Ground;
+		const bool bLanded = Position.Z - ChuteRiderDrop <= Ground; // (the rider's feet on the ground)
 		if (bLanded)
 		{
-			Position.Z = Ground;
+			Position.Z = Ground + ChuteRiderDrop;
 		}
 		if (Rider && !Rider->bDead)
 		{
-			Rider->Position = Position;
+			Rider->Position = FVector3f(Position.X, Position.Y, Position.Z - ChuteRiderDrop);
 			Rider->Velocity = FVector3f::ZeroVector;
 			if (bLanded)
 			{

@@ -13,6 +13,7 @@ class UMaterialInstanceDynamic;
 class UMaterialInterface;
 class UPointLightComponent;
 class UProceduralMeshComponent;
+class UGenQuadBatchComponent;
 
 /**
  * Client-side effects (FXList.cpp, ParticleSys.cpp, W3DParticleSys.cpp): particle systems, tracers,
@@ -49,9 +50,15 @@ public:
 
 	/** Particle system that follows an object (projectile exhaust, debris trails). */
 	FGenParticleSystem* CreateAttachedSystem(const FString& TemplateName, FGenObjectID Object);
+	/** A particle system by itself at a spot (the dust where a gunship's bullets land). */
+	void CreateSystemAt(const FString& TemplateName, const FVector3f& Pos);
 	void OnObjectDestroyed(FGenObjectID Object);
 	/** Stops a system from emitting; it is removed once its particles have died. */
 	void DestroySystem(uint32 SystemID);
+	/** ParticleSystem::stop / start: no new particles while stopped (the ones in the air live out their time). */
+	void SetSystemStopped(uint32 SystemID, bool bStopped);
+	/** A running system by its id (null once it is gone). */
+	FGenParticleSystem* FindSystem(uint32 SystemID);
 
 	void AddScorch(const FVector3f& Pos, float Radius, int32 Type);
 
@@ -59,14 +66,18 @@ public:
 	int32 GetSystemCount() const { return Particles.GetSystems().Num(); }
 
 private:
+	/** The quads of one texture and shader this frame (four vertices each), and what they are drawn with. */
 	struct FBatch
 	{
-		int32 Capacity = 0;                 // quads the mesh section was created with
-		TArray<FVector> Vertices;
-		TArray<FVector2D> UVs;
-		TArray<FLinearColor> Colors;
-		bool bShown = false;
+		TArray<FVector3f> Vertices;
+		TArray<FVector2f> UVs;
+		TArray<FColor> Colors;
+		UMaterialInstanceDynamic* Material = nullptr; // (kept alive by BatchMaterials)
+		int32 Layer = 0;
 	};
+
+	/** What draws the batches: one primitive per kind of blending, in the order they go on the screen. */
+	enum { LayerMasked, LayerMultiply, LayerAlpha, LayerAdditive, NumLayers };
 
 	struct FTracer
 	{
@@ -117,7 +128,7 @@ private:
 	TMap<FString, int32> BatchLookup;
 
 	UPROPERTY(Transient)
-	TArray<TObjectPtr<UProceduralMeshComponent>> BatchComponents;
+	TObjectPtr<UGenQuadBatchComponent> LayerComponents[4]; // (one per layer: NumLayers)
 
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<UMaterialInstanceDynamic>> BatchMaterials;
@@ -126,6 +137,7 @@ private:
 	TMap<uint8, TObjectPtr<UMaterialInterface>> BaseMaterials;
 
 	TArray<FTracer> Tracers;
+	TArray<TPair<FVector3f, int32>> PendingShakes;  // asked for from the simulation's thread
 
 	TArray<FLightPulse> Pulses;
 	UPROPERTY(Transient)

@@ -3,6 +3,7 @@
 // Player.cpp (skill points, ranks, sciences, cash bounty) and AutoHealBehavior.cpp.
 
 #include "Logic/GenUpgrades.h"
+#include "Audio/GenAudioManager.h"
 #include "Logic/GenCommandData.h"
 #include "Logic/GenGameData.h"
 #include "Logic/GenGameLogic.h"
@@ -114,6 +115,22 @@ void FGenObject::GiveObjectUpgrade(const FGenUpgradeTemplate& Upgrade)
 	UpdateUpgradeModules();
 }
 
+void FGenObject::RemoveObjectUpgrade(const FString& UpgradeName)
+{
+	if (ObjectUpgrades.Remove(UpgradeName.ToLower()) == 0)
+	{
+		return;
+	}
+	for (int32 i = 0; i < Template->UpgradeModules.Num(); ++i)
+	{
+		if (ContainsName(Template->UpgradeModules[i].TriggeredBy, UpgradeName))
+		{
+			UpgradeModuleDone[i] = false; // UpgradeMux::resetUpgrade
+		}
+	}
+	UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [upgrade f%u] #%u %s no longer has %s"), Logic->GetFrame(), ID, *Template->Name, *UpgradeName);
+}
+
 void FGenObject::UpdateUpgradeModules()
 {
 	static const TArray<FString> None;
@@ -142,10 +159,7 @@ void FGenObject::ExecuteUpgradeModule(const FGenUpgradeModule& Module)
 	}
 	case EGenUpgradeEffect::Armor:
 		bArmorUpgraded = true;
-		if (const FGenArmorSetEntry* AS = Template->FindArmorSet({ PlayerUpgradeFlag }))
-		{
-			Armor = GD.FindArmor(AS->Armor);
-		}
+		RefreshArmorSet();
 		break;
 	case EGenUpgradeEffect::MaxHealth:
 	{
@@ -197,12 +211,72 @@ void FGenObject::ExecuteUpgradeModule(const FGenUpgradeModule& Module)
 		{
 			if (Template->PowerModules[i].Power.Equals(Module.SpecialPower, ESearchCase::IgnoreCase))
 			{
+				// SpecialPowerModule::pauseCountdown: a paused timer stood still, so a unit's ability that
+				// waited for its upgrade has its whole recharge before it.
+				if (PowerPaused[i] && Template->PowerModules[i].Type == EGenPowerModule::SpecialAbility)
+				{
+					const FGenSpecialPowerTemplate* P = FGenUpgradeData::Get().FindPower(Module.SpecialPower);
+					PowerReady[i] = Logic->GetFrame() + uint32(P ? P->ReloadTime : 0);
+				}
 				PowerPaused[i] = false;
 			}
 		}
 		break;
+	case EGenUpgradeEffect::CostModifier:
+		Logic->RefreshCostModifiers(); // (the module is marked done by now; the player's list is made from those)
+		break;
+	case EGenUpgradeEffect::Radar:
+		StartRadar(Module.bDisableProof);
+		break;
+	case EGenUpgradeEffect::Stealth:
+		bCanStealth = true; // StealthUpgrade::upgradeImplementation: OBJECT_STATUS_CAN_STEALTH
+		break;
+	case EGenUpgradeEffect::Countermeasures:
+		bCountermeasuresActive = Template->Countermeasures.bValid;
+		break;
+	case EGenUpgradeEffect::SpyVision:
+	{
+		// SpyVisionUpdate::upgradeImplementation -> activateSpyVision(SelfPoweredDuration): "If zero, will turn on
+		// permanently."
+		FSpyVision& Spy = SpyVisions.AddDefaulted_GetRef();
+		Spy.Module = &Module;
+		Spy.bActive = true;
+		Spy.OffFrame = Module.SpyDuration > 0 ? Logic->GetFrame() + uint32(Module.SpyDuration) : MAX_uint32;
+		Logic->AddSpyVisionSource(ID);
+		UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [spy f%u] #%u p%d %s: sees what the enemy's %s see%s"), Logic->GetFrame(), ID, Owner, *Template->Name,
+			Module.SpyOnKindOf.Num() > 0 ? *FString::Join(Module.SpyOnKindOf, TEXT(" ")) : TEXT("everything"),
+			Module.SpyDuration > 0 ? *FString::Printf(TEXT(" for %d frames every %d"), Module.SpyDuration, Module.SpyInterval) : TEXT(""));
+		break;
+	}
+	case EGenUpgradeEffect::GenerateMinefield:
+		PlaceMines(); // GenerateMinefieldBehavior::upgradeImplementation
+		break;
+	case EGenUpgradeEffect::ObjectCreation:
+		Logic->DoOCL(Module.OCL, *this); // ObjectCreationUpgrade::upgradeImplementation: "spawn everything in the OCL"
+		break;
+	case EGenUpgradeEffect::PassengersFire:
+		if (Contain)
+		{
+			Contain->bPassengersFire = true; // PassengersFireUpgrade: OpenContain::setPassengerAllowedToFire
+		}
+		break;
 	default:
-		break; // drones, stealth, radar, experience: not ported
+		break; // experience: not ported
+	}
+}
+
+void FGenObject::RefreshArmorSet()
+{
+	// Object::setArmorSetFlag: the set that fits what it has now.
+	const FGenGameData& GD = FGenGameData::Get();
+	TArray<FString> Flags;
+	if (bArmorUpgraded) { Flags.Add(PlayerUpgradeFlag); }
+	if (CrateArmorLevel == 1) { Flags.Add(TEXT("CRATE_UPGRADE_ONE")); }
+	else if (CrateArmorLevel >= 2) { Flags.Add(TEXT("CRATE_UPGRADE_TWO")); }
+	if (const FGenArmorSetEntry* AS = Template->FindArmorSet(Flags))
+	{
+		Armor = GD.FindArmor(AS->Armor);
+		DamageFX = GD.FindDamageFX(AS->DamageFX);
 	}
 }
 
@@ -211,9 +285,11 @@ void FGenObject::RefreshWeaponSet()
 	// WeaponSet::updateWeaponSet: slots whose weapon changes start fresh, the others keep their state.
 	const FGenGameData& GD = FGenGameData::Get();
 	const FGenWeaponSetEntry* WS = Template->FindWeaponSet(SetFlags);
+	WeaponSetEntry = WS;
 	for (int32 s = 0; s < 3; ++s)
 	{
 		const FGenWeaponTemplate* New = WS ? GD.FindWeapon(WS->Weapons[s]) : nullptr;
+		bNoAutoChoose[s] = WS && WS->bNoAutoChoose[s];
 		if (New != Weapons[s].Template)
 		{
 			Weapons[s].Template = New;
@@ -231,7 +307,27 @@ const FString& FGenObject::GetCommandSet() const
 
 int32 FGenObject::GetEnergyProduction() const
 {
-	return Template->EnergyProduction + (bPowerPlantUpgraded ? Template->EnergyBonus : 0);
+	// (Player::addPowerBonus: the rods upgrade and an overcharge each add the bonus.)
+	return Template->EnergyProduction + (bPowerPlantUpgraded ? Template->EnergyBonus : 0) + (bOverchargeActive ? Template->EnergyBonus : 0);
+}
+
+bool FGenObject::CanOvercharge() const
+{
+	// ControlBar::getCommandAvailability: "not allowed when health below" - and not while it is being built or sold.
+	return Template->bOvercharge && !bDead && !bUnderConstruction && SellFrame == 0 && Health >= MaxHealth * Template->OverchargeMinHealth;
+}
+
+void FGenObject::SetOvercharge(bool bOn)
+{
+	// OverchargeBehavior::enable: the rods come out (PowerPlantUpdate::extendRods) and the player gets the bonus.
+	if (bOn == bOverchargeActive || (bOn && !CanOvercharge()))
+	{
+		return;
+	}
+	bOverchargeActive = bOn;
+	static const int32 Upgraded = GenConditions::Index(TEXT("POWER_PLANT_UPGRADED"));
+	SetModelCondition(Upgraded, bOn || bPowerPlantUpgraded);
+	UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [power f%u] #%u %s overcharge %s"), Logic->GetFrame(), ID, *Template->Name, bOn ? TEXT("on") : TEXT("off"));
 }
 
 float FGenObject::GetWeaponBonus(const FGenWeaponTemplate& Weapon, int32 Field) const
@@ -255,6 +351,226 @@ float FGenObject::GetWeaponBonus(const FGenWeaponTemplate& Weapon, int32 Field) 
 		}
 	}
 	return FMath::Max(Factor, 0.01f);
+}
+
+void FGenObject::DoTempWeaponBonus(const FString& Condition, int32 DurationFrames)
+{
+	// TempWeaponBonusHelper::doTempWeaponBonus
+	if (!TempBonus.IsEmpty() && !TempBonus.Equals(Condition, ESearchCase::IgnoreCase))
+	{
+		BonusConditions.Remove(TempBonus);
+	}
+	TempBonus = Condition.ToUpper();
+	BonusConditions.AddUnique(TempBonus);
+	TempBonusEndFrame = Logic->GetFrame() + uint32(FMath::Max(1, DurationFrames));
+}
+
+void FGenObject::UpdateWeaponBonusPulse(uint32 Frame)
+{
+	// WeaponBonusUpdate::update: whatever of ours (and our allies') within range is of the right kind -
+	// and whoever rides in it - gets the bonus for its duration.
+	const FGenThingTemplate::FWeaponBonusPulse& P = Template->WeaponBonusPulse;
+	NextBonusPulseFrame = Frame + uint32(FMath::Max(1, P.Delay));
+	auto RightKind = [&P](const FGenObject& O)
+	{
+		for (const FString& K : P.RequiredKindOf) { if (!O.IsKindOf(*K)) { return false; } }
+		for (const FString& K : P.ForbiddenKindOf) { if (O.IsKindOf(*K)) { return false; } }
+		return true;
+	};
+	int32 Num = 0;
+	Logic->GetPartition().ForEachInRange(FVector2f(Position.X, Position.Y), P.Range, [&](FGenObject& Other)
+	{
+		if (Other.bDead || Other.bPendingDestroy || Logic->GetRelationship(Owner, Other.Owner) != EGenRelationship::Allies)
+		{
+			return;
+		}
+		if (RightKind(Other))
+		{
+			Other.DoTempWeaponBonus(P.Condition, P.Duration);
+			++Num;
+		}
+		for (FGenObjectID RiderId : Other.GetContain() ? Other.GetContain()->Riders : TArray<FGenObjectID>())
+		{
+			FGenObject* Rider = Logic->FindObject(RiderId);
+			if (Rider && RightKind(*Rider))
+			{
+				Rider->DoTempWeaponBonus(P.Condition, P.Duration);
+				++Num;
+			}
+		}
+	});
+	UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [power f%u] #%u %s: %s for %d frames to %d units within %.0f"), Frame, ID, *Template->Name, *P.Condition,
+		P.Duration, Num, P.Range);
+}
+
+// ---- PropagandaTowerBehavior ---------------------------------------------------------------------
+
+namespace
+{
+	const FString EnthusiasticBonus(TEXT("ENTHUSIASTIC"));
+	const FString SubliminalBonus(TEXT("SUBLIMINAL"));
+}
+
+void FGenObject::RemovePropagandaInfluence()
+{
+	// PropagandaTowerBehavior::removeAllInfluence
+	for (FGenObjectID Id : PropagandaInside)
+	{
+		if (FGenObject* O = Logic->FindObject(Id))
+		{
+			O->BonusConditions.Remove(EnthusiasticBonus);
+			O->BonusConditions.Remove(SubliminalBonus);
+		}
+	}
+	PropagandaInside.Reset();
+}
+
+void FGenObject::UpdatePropagandaTower(uint32 Frame)
+{
+	// PropagandaTowerBehavior::update
+	const FGenThingTemplate::FPropagandaTower& P = Template->Propaganda;
+	if (bUnderConstruction)
+	{
+		return;
+	}
+	const FGenObject* Carrier = IsContained() ? Logic->FindObject(ContainedBy) : nullptr;
+	// Sold, or knocked out ("we need to let go of everyone if we are EMPd or underpowered"), or "our
+	// container is contained: we work in a container, but not in a double container".
+	if (IsBeingSold() || IsDisabled() || (Carrier && Carrier->IsContained()))
+	{
+		RemovePropagandaInfluence();
+		return;
+	}
+	if (Frame - PropagandaScanFrame >= uint32(P.Delay))
+	{
+		DoPropagandaScan();
+		PropagandaScanFrame = Frame;
+	}
+
+	// "Go through any objects in our area of influence and do the effect logic on them": every frame.
+	const bool bUpgraded = !P.UpgradeRequired.IsEmpty() && Logic->HasUpgradeComplete(Owner, P.UpgradeRequired);
+	const float Share = (bUpgraded ? P.UpgradedHealPercent : P.HealPercent) / float(GenLogic::GetLogicFPS());
+	for (int32 i = PropagandaInside.Num() - 1; i >= 0; --i)
+	{
+		FGenObject* O = Logic->FindObject(PropagandaInside[i]);
+		if (!O || O->bDead || O->bPendingDestroy
+			|| !(O->IsKindOf(TEXT("SCORE")) || O->IsKindOf(TEXT("SCORE_CREATE")) || O->IsKindOf(TEXT("SCORE_DESTROY")) || O->IsKindOf(TEXT("MP_COUNT_FOR_VICTORY"))))
+		{
+			PropagandaInside.RemoveAtSwap(i);
+			continue;
+		}
+		if (O->HasWeapons())
+		{
+			O->BonusConditions.AddUnique(EnthusiasticBonus);
+			if (bUpgraded)
+			{
+				O->BonusConditions.AddUnique(SubliminalBonus);
+			}
+		}
+		// "Dustin wants the healing effect not to stack from multiple propaganda towers."
+		O->AttemptHealingFromSoleBenefactor(Share * O->MaxHealth, ID, uint32(P.Delay));
+	}
+}
+
+void FGenObject::DoPropagandaScan()
+{
+	// PropagandaTowerBehavior::doScan: "the act of scanning is when we play our effect".
+	const FGenThingTemplate::FPropagandaTower& P = Template->Propaganda;
+	const bool bUpgradePresent = !P.UpgradeRequired.IsEmpty() && HasUpgrade(P.UpgradeRequired);
+	bool bDoFX = true;
+	if (const FGenObject* Carrier = IsContained() ? Logic->FindObject(ContainedBy) : nullptr)
+	{
+		if (Owner != Logic->GetLocalPlayer() && Carrier->IsStealthedAndUndetected())
+		{
+			bDoFX = false; // "so they don't give up their position"
+		}
+		if (IsKindOf(TEXT("VEHICLE")) && !IsKindOf(TEXT("PORTABLE_STRUCTURE")))
+		{
+			return; // "I am not a propaganda tower, I am an Emperor tank": riding in something, it does nothing
+		}
+	}
+	if (Owner != Logic->GetLocalPlayer() && IsStealthedAndUndetected())
+	{
+		bDoFX = false;
+	}
+	const FString& Pulse = bUpgradePresent ? P.UpgradedPulseFX : P.PulseFX;
+	if (bDoFX && !Pulse.IsEmpty())
+	{
+		Logic->DoFXObj(Pulse, *this);
+	}
+
+	// Our own and our allies', alive, not buildings, within the radius (centre to centre).
+	TArray<FGenObjectID> NowInside;
+	const float RadiusSq = P.Radius * P.Radius;
+	Logic->GetPartition().ForEachInRange(FVector2f(Position.X, Position.Y), P.Radius, [&](FGenObject& Other)
+	{
+		if (Other.bDead || Other.bPendingDestroy || (&Other == this && !P.bAffectsSelf) || Other.IsKindOf(TEXT("STRUCTURE"))
+			|| (Other.IsContained() && Other.bHidden) || Logic->GetRelationship(Owner, Other.Owner) != EGenRelationship::Allies)
+		{
+			return;
+		}
+		if (FVector2f::DistSquared(FVector2f(Other.Position.X, Other.Position.Y), FVector2f(Position.X, Position.Y)) <= RadiusSq)
+		{
+			NowInside.Add(Other.ID);
+		}
+	});
+	// Who has left loses the bonus ("if they are within the area of effect of another tower it's OK,
+	// they'll get the bonus back again").
+	for (FGenObjectID Id : PropagandaInside)
+	{
+		if (!NowInside.Contains(Id))
+		{
+			if (FGenObject* O = Logic->FindObject(Id))
+			{
+				O->BonusConditions.Remove(EnthusiasticBonus);
+				O->BonusConditions.Remove(SubliminalBonus);
+			}
+		}
+	}
+	UE_CLOG(Logic->IsTracing() && NowInside.Num() != PropagandaInside.Num(), LogGenerals, Log, TEXT("  [propaganda f%u] #%u %s has %d unit(s) within %.0f%s"),
+		Logic->GetFrame(), ID, *Template->Name, NowInside.Num(), P.Radius, bUpgradePresent ? TEXT(" (upgraded)") : TEXT(""));
+	PropagandaInside = MoveTemp(NowInside);
+}
+
+void FGenObject::UpdateLeafletDrop(uint32 Frame)
+{
+	// LeafletDropBehavior::update
+	const FGenThingTemplate::FLeafletDrop& L = Template->LeafletDrop;
+	if (LeafletStartFrame == 0)
+	{
+		LeafletStartFrame = Frame + uint32(FMath::Max(1, L.Delay));
+		if (!L.ParticleSystem.IsEmpty())
+		{
+			Logic->AttachParticleSystem(L.ParticleSystem, ID);
+		}
+	}
+	if (Frame >= LeafletStartFrame)
+	{
+		DoLeafletDisable(Frame);
+	}
+}
+
+void FGenObject::DoLeafletDisable(uint32 Frame)
+{
+	// LeafletDropBehavior::doDisableAttack: "both commuters and pedestrians", "only enemies".
+	const FGenThingTemplate::FLeafletDrop& L = Template->LeafletDrop;
+	int32 Num = 0;
+	Logic->GetPartition().ForEachInRange(FVector2f(Position.X, Position.Y), L.Radius + 40.f, [&](FGenObject& Other)
+	{
+		if (&Other == this || Other.bDead || !(Other.IsKindOf(TEXT("INFANTRY")) || Other.IsKindOf(TEXT("VEHICLE")))
+			|| Logic->GetRelationship(Owner, Other.Owner) != EGenRelationship::Enemies)
+		{
+			return;
+		}
+		// (FROM_BOUNDINGSPHERE_3D)
+		if ((Other.Position - Position).Size() - Other.Template->GetBoundingCircleRadius() <= L.Radius)
+		{
+			Num += Other.DisabledUntilFrame <= Frame ? 1 : 0;
+			Other.DisableUntil(Frame + uint32(L.DisabledDuration));
+		}
+	});
+	UE_CLOG(Logic->IsTracing() && Num > 0, LogGenerals, Log, TEXT("  [power f%u] #%u %s: leaflets disable %d more units for %d frames"), Frame, ID,
+		*Template->Name, Num, L.DisabledDuration);
 }
 
 float FGenObject::GetAttackRange(const FGenWeaponTemplate& Weapon) const
@@ -366,7 +682,7 @@ bool UGenGameLogic::QueueUpgrade(FGenObject& Researcher, const FGenUpgradeTempla
 		return false;
 	}
 	FGenPlayer& P = Players[Researcher.GetOwner()];
-	P.Money -= Upgrade.BuildCost;
+	Withdraw(Researcher.GetOwner(), Upgrade.BuildCost);
 	FGenObject::FProduction& Entry = Researcher.Production.AddDefaulted_GetRef();
 	Entry.Upgrade = &Upgrade;
 	Entry.Cost = Upgrade.BuildCost;
@@ -380,20 +696,26 @@ bool UGenGameLogic::QueueUpgrade(FGenObject& Researcher, const FGenUpgradeTempla
 
 void UGenGameLogic::IssueQueueUpgrade(FGenObjectID Researcher, const FString& Upgrade)
 {
-	PendingCommands.Add([this, Researcher, Upgrade]()
+	FGenCommand C(EGenCommandType::QueueUpgrade);
+	C.Units = { Researcher };
+	C.Name = Upgrade;
+	SubmitCommand(MoveTemp(C));
+}
+
+void UGenGameLogic::ExecQueueUpgrade(const FGenCommand& C)
+{
+	FGenObject* R = C.Units.Num() > 0 ? FindObject(C.Units[0]) : nullptr;
+	const FGenUpgradeTemplate* U = FGenUpgradeData::Get().FindUpgrade(C.Name);
+	if (R && U)
 	{
-		FGenObject* R = FindObject(Researcher);
-		const FGenUpgradeTemplate* U = FGenUpgradeData::Get().FindUpgrade(Upgrade);
-		if (R && U)
-		{
-			QueueUpgrade(*R, *U);
-		}
-	});
+		QueueUpgrade(*R, *U);
+	}
 }
 
 void UGenGameLogic::FinishUpgrade(FGenObject& Researcher, const FGenUpgradeTemplate& Upgrade)
 {
 	UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [upgrade f%u] p%d finished %s"), Frame, Researcher.GetOwner(), *Upgrade.Name);
+	ScoreMoneySpent(Researcher.GetOwner(), Upgrade.BuildCost);
 	if (Players.IsValidIndex(Researcher.GetOwner()))
 	{
 		Players[Researcher.GetOwner()].UpgradeEvents.Add(Upgrade.Name.ToLower()); // ScriptEngine::notifyOfCompletedUpgrade
@@ -405,6 +727,17 @@ void UGenGameLogic::FinishUpgrade(FGenObject& Researcher, const FGenUpgradeTempl
 	else
 	{
 		GrantPlayerUpgrade(Researcher.GetOwner(), Upgrade);
+	}
+	if (Researcher.GetOwner() == LocalPlayer)
+	{
+		// ProductionUpdate: "upgrades are a more rare event, play a nifty radar event thingie"
+		CreateRadarEvent(Researcher.GetPosition(), EGenRadarEvent::Upgrade);
+		// "Play the sound for the upgrade, because we just built it!"
+		if (Audio && !Upgrade.ResearchSound.IsEmpty())
+		{
+			Audio->PlayUI(Upgrade.ResearchSound, LocalPlayer);
+		}
+		EvaEvent(TEXT("UpgradeComplete"), LocalPlayer);
 	}
 }
 
@@ -517,7 +850,10 @@ bool UGenGameLogic::PurchaseScience(int32 Player, const FString& Science)
 
 void UGenGameLogic::IssuePurchaseScience(int32 Player, const FString& Science)
 {
-	PendingCommands.Add([this, Player, Science]() { PurchaseScience(Player, Science); });
+	FGenCommand C(EGenCommandType::PurchaseScience);
+	C.Player = Player;
+	C.Name = Science;
+	SubmitCommand(MoveTemp(C));
 }
 
 bool UGenGameLogic::GrantScience(int32 Player, const FString& Science)
@@ -607,6 +943,7 @@ void UGenGameLogic::AddSkillPoints(int32 Player, int32 Points)
 			P.SkillPoints, P.SciencePurchasePoints);
 		if (Player == LocalPlayer)
 		{
+			EvaEvent(TEXT("GeneralLevelUp"), Player); // Player::setRankLevel
 			FGenFloatingText& Text = FloatingTexts.AddDefaulted_GetRef();
 			Text.Text = FString::Printf(TEXT("Promoted: rank %d"), P.RankLevel);
 			Text.Color = FLinearColor(1.f, 0.85f, 0.2f);
@@ -621,6 +958,10 @@ void UGenGameLogic::OnObjectKilled(const FGenObject& Victim, FGenObjectID Killer
 	// Object::scoreTheKill: the killer's player earns skill points towards the next rank, and (GLA's
 	// Cash Bounty) a share of what the victim cost.
 	FGenObject* Killer = FindObject(KillerId);
+	if (Killer)
+	{
+		ScoreKill(Victim, *Killer);
+	}
 	if (!Killer || Victim.IsUnderConstruction() || !Players.IsValidIndex(Killer->GetOwner())
 		|| GetRelationship(Killer->GetOwner(), Victim.GetOwner()) != EGenRelationship::Enemies
 		|| Victim.IsKindOf(TEXT("IGNORED_IN_GUI")))
@@ -631,14 +972,20 @@ void UGenGameLogic::OnObjectKilled(const FGenObject& Victim, FGenObjectID Killer
 	const FGenThingTemplate* T = Victim.GetTemplate();
 	const int32 Level = FMath::Clamp(Victim.GetVeterancyLevel(), 0, 3);
 	AddSkillPoints(Killer->GetOwner(), T->SkillPointValues[Level] >= 0 ? T->SkillPointValues[Level] : T->ExperienceValues[Level]);
-	// ... and the killer itself learns from it (a shot that outlived its launcher teaches nobody).
-	Killer->AddExperience(T->ExperienceValues[Level]);
+	// ... and the killer itself learns from it (a shot that outlived its launcher teaches nobody); what
+	// a planted charge kills teaches whoever planted it.
+	FGenObject* Learner = Killer->XPSink != GenInvalidObjectID ? FindObject(Killer->XPSink) : Killer;
+	if (Learner && !Learner->IsDead())
+	{
+		Learner->AddExperience(T->ExperienceValues[Level]);
+	}
 
 	FGenPlayer& P = Players[Killer->GetOwner()];
 	const int32 Bounty = FMath::CeilToInt32(T->BuildCost * P.CashBounty);
 	if (Bounty > 0)
 	{
-		P.Money += Bounty;
+		Deposit(Killer->GetOwner(), Bounty);
+		P.Score.MoneyEarned += Bounty;
 		FGenFloatingText& Text = FloatingTexts.AddDefaulted_GetRef();
 		Text.Text = FString::Printf(TEXT("+$%d"), Bounty);
 		Text.Pos = Victim.GetPosition();

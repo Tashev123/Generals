@@ -16,6 +16,28 @@ namespace
 	int32 ActivelyBeingConstructed() { static const int32 I = GenConditions::Index(TEXT("ACTIVELY_BEING_CONSTRUCTED")); return I; }
 	int32 ActivelyConstructing() { static const int32 I = GenConditions::Index(TEXT("ACTIVELY_CONSTRUCTING")); return I; }
 	int32 Sold() { static const int32 I = GenConditions::Index(TEXT("SOLD")); return I; }
+	int32 ConstructionComplete() { static const int32 I = GenConditions::Index(TEXT("CONSTRUCTION_COMPLETE")); return I; }
+
+	/** MODELCONDITION_DOOR_n_OPENING / _WAITING_OPEN / _CLOSING */
+	enum { DoorOpening, DoorWaitingOpen, DoorClosing };
+	int32 DoorCondition(int32 Door, int32 Which)
+	{
+		static int32 Index[4][3];
+		static bool bInit = false;
+		if (!bInit)
+		{
+			static const TCHAR* const Suffix[3] = { TEXT("OPENING"), TEXT("WAITING_OPEN"), TEXT("CLOSING") };
+			for (int32 d = 0; d < 4; ++d)
+			{
+				for (int32 w = 0; w < 3; ++w)
+				{
+					Index[d][w] = GenConditions::Index(FString::Printf(TEXT("DOOR_%d_%s"), d + 1, Suffix[w]));
+				}
+			}
+			bInit = true;
+		}
+		return Index[FMath::Clamp(Door, 0, 3)][Which];
+	}
 
 	/** Distance from a point to an object's footprint (0 inside). */
 	float DistanceToFootprint(const FGenObject& Obj, const FVector3f& P)
@@ -53,28 +75,169 @@ namespace
 
 // ---- objects ------------------------------------------------------------------------------------
 
+void FGenObject::UpdateFactoryDoors(uint32 Frame)
+{
+	// ProductionUpdate::updateDoors: opening for DoorOpeningTime, then standing open for DoorWaitOpenTime,
+	// then closing for DoorCloseTime.
+	for (int32 i = 0; i < 4; ++i)
+	{
+		FFactoryDoor& D = FactoryDoors[i];
+		if (D.OpenedFrame != 0)
+		{
+			if (Frame - D.OpenedFrame > uint32(Template->DoorOpeningTime))
+			{
+				D.OpenedFrame = 0;
+				D.WaitOpenFrame = Frame;
+				SetModelCondition(DoorCondition(i, DoorOpening), false);
+				SetModelCondition(DoorCondition(i, DoorWaitingOpen), true);
+			}
+		}
+		else if (D.WaitOpenFrame != 0)
+		{
+			if (Frame - D.WaitOpenFrame > uint32(Template->DoorWaitOpenTime))
+			{
+				D.WaitOpenFrame = 0;
+				D.ClosedFrame = Frame;
+				SetModelCondition(DoorCondition(i, DoorWaitingOpen), false);
+				SetModelCondition(DoorCondition(i, DoorClosing), true);
+				UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [door f%u] #%u %s: door %d closes"), Frame, ID, *Template->Name, i + 1);
+			}
+		}
+		else if (D.ClosedFrame != 0)
+		{
+			if (Frame - D.ClosedFrame > uint32(Template->DoorCloseTime))
+			{
+				D.ClosedFrame = 0;
+				SetModelCondition(DoorCondition(i, DoorClosing), false);
+			}
+		}
+	}
+}
+
 void FGenObject::UpdateProduction(uint32 Frame)
 {
-	// ProductionUpdate::update: the head of the queue advances one frame; when done the unit leaves by the door.
-	FProduction& P = Production[0];
-	P.FramesDone += 1.f;
-	if (P.Upgrade)
+	// ProductionUpdate::update. (An airfield's hangar doors are its parking spaces' business: they stand
+	// open for as long as an aircraft is at home - FGenParkingPlace::UpdateDoors.)
+	const bool bDoors = Template->NumDoorAnimations > 0 && !Parking;
+	if (bDoors)
+	{
+		UpdateFactoryDoors(Frame);
+	}
+	if (ConstructionCompleteFrame != 0 && Frame - ConstructionCompleteFrame > uint32(Template->ConstructionCompleteDuration))
+	{
+		ConstructionCompleteFrame = 0;
+		SetModelCondition(ConstructionComplete(), false);
+	}
+	// QueueProductionExitUpdate::update: the door is free again one ExitDelay after somebody left by it.
+	if (ExitDelayLeft > 0 && ExitBurstLeft <= 0)
+	{
+		--ExitDelayLeft;
+	}
+	// "when something is in the queue ... we are in the actively constructing state"
+	SetModelCondition(ActivelyConstructing(), Production.Num() > 0);
+	if (Production.Num() == 0)
+	{
+		return;
+	}
+
+	// The head of the queue advances one frame.
+	Production[0].FramesDone += 1.f;
+	if (Production[0].Upgrade)
 	{
 		// UpgradeTemplate::calcTimeToBuild: research takes its BuildTime, power or no power.
-		if (P.FramesDone >= P.Upgrade->BuildTime * float(GenLogic::GetLogicFPS()))
+		if (Production[0].FramesDone >= Production[0].Upgrade->BuildTime * float(GenLogic::GetLogicFPS()))
 		{
-			const FGenUpgradeTemplate* Upgrade = P.Upgrade;
+			const FGenUpgradeTemplate* Upgrade = Production[0].Upgrade;
 			Production.RemoveAt(0);
 			Logic->FinishUpgrade(*this, *Upgrade);
 		}
 		return;
 	}
-	if (P.FramesDone >= Logic->CalcTimeToBuild(*P.Unit, Owner))
+	const FGenThingTemplate* Unit = Production[0].Unit;
+	if (Production[0].FramesDone < Logic->CalcTimeToBuild(*Unit, Owner))
 	{
-		const FGenThingTemplate* Unit = P.Unit;
-		const int32 ExitDoor = P.ExitDoor;
+		return;
+	}
+	if (Production[0].QuantityRemaining < 0)
+	{
+		// ProductionUpdate's QuantityModifier: some things come in numbers for the price of one.
+		Production[0].QuantityRemaining = 1;
+		for (const TPair<FString, int32>& Q : Template->QuantityModifiers)
+		{
+			if (Q.Key.Equals(Unit->Name, ESearchCase::IgnoreCase) || Q.Key.Equals(Unit->Canonical()->Name, ESearchCase::IgnoreCase))
+			{
+				Production[0].QuantityRemaining = Q.Value;
+			}
+		}
+	}
+	// It is finished, and leaves when the door lets it: "if we can't we'll just keep this unit in the
+	// production and keep "overbuilding" it, every frame we will check to see if we can exit".
+	const int32 ToTry = Production[0].QuantityRemaining;
+	const int32 ReservedDoor = Production[0].ExitDoor;
+	for (int32 n = 0; n < ToTry; ++n)
+	{
+		int32 ExitDoor = n == 0 ? ReservedDoor : int32(FGenParkingPlace::DoorNoneNeeded);
+		if (!Parking)
+		{
+			// The one door there is: always (DefaultProductionExitUpdate and the like), or - a barracks'
+			// QueueProductionExitUpdate - when nobody has just gone out by it.
+			const bool bFree = !Template->bQueueExit || ExitBurstLeft > 0 || ExitDelayLeft == 0;
+			ExitDoor = bFree ? 0 : int32(FGenParkingPlace::DoorNoneAvailable);
+		}
+		if (ExitDoor == FGenParkingPlace::DoorNoneAvailable)
+		{
+			continue;
+		}
+		FFactoryDoor* Door = bDoors && ExitDoor >= 0 && ExitDoor < 4 ? &FactoryDoors[ExitDoor] : nullptr;
+		if (Door)
+		{
+			if (Door->OpenedFrame == 0 && Door->WaitOpenFrame == 0 && Door->ClosedFrame == 0)
+			{
+				// closed: open it
+				Door->OpenedFrame = Frame;
+				SetModelCondition(DoorCondition(ExitDoor, DoorOpening), true);
+				UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [door f%u] #%u %s: door %d opens for a finished %s"), Frame, ID, *Template->Name, ExitDoor + 1, *Unit->Name);
+			}
+			else if (Door->WaitOpenFrame != 0)
+			{
+				Door->WaitOpenFrame = Frame; // standing open: it stays so
+			}
+			else if (Door->ClosedFrame != 0)
+			{
+				// "if the door is closing, for now, pop it to waiting open"
+				Door->ClosedFrame = 0;
+				Door->WaitOpenFrame = Frame;
+				SetModelCondition(DoorCondition(ExitDoor, DoorOpening), false);
+				SetModelCondition(DoorCondition(ExitDoor, DoorClosing), false);
+				SetModelCondition(DoorCondition(ExitDoor, DoorWaitingOpen), true);
+			}
+		}
+		if (ConstructionCompleteFrame == 0)
+		{
+			ConstructionCompleteFrame = Frame;
+			SetModelCondition(ConstructionComplete(), true);
+		}
+		// "for production buildings that have door animations we will not make the object until the door
+		// has been totally opened"
+		if (!Door || Door->WaitOpenFrame != 0)
+		{
+			Logic->SpawnProducedUnit(*this, *Unit, ExitDoor);
+			UE_CLOG(Logic->IsTracing() && !Parking, LogGenerals, Log, TEXT("  [door f%u] #%u %s: a %s leaves"), Frame, ID, *Template->Name, *Unit->Name);
+			if (Template->bQueueExit)
+			{
+				ExitDelayLeft = Template->ProductionExitDelay;
+				ExitBurstLeft = FMath::Max(0, ExitBurstLeft - 1);
+			}
+			if (Production.Num() == 0)
+			{
+				return; // (the building changed hands, or was sold, by what the new unit set off)
+			}
+			--Production[0].QuantityRemaining;
+		}
+	}
+	if (Production.Num() > 0 && Production[0].QuantityRemaining == 0)
+	{
 		Production.RemoveAt(0);
-		Logic->SpawnProducedUnit(*this, *Unit, ExitDoor);
 	}
 }
 
@@ -238,8 +401,11 @@ void FGenObject::UpdateDozer(uint32 Frame)
 		}
 		return;
 	}
+	// "the object is now no longer awaiting construction, it is being constructed" (and stays flagged as
+	// that until it is finished, or the dozer is no more: the original never clears it when one drives off)
 	B->SetModelCondition(AwaitingConstruction(), false);
 	B->SetModelCondition(PartiallyConstructed(), true);
+	B->SetModelCondition(ActivelyBeingConstructed(), true);
 	B->LastBuiltFrame = Frame;
 
 	const float FramesToBuild = Logic->CalcTimeToBuild(*B->Template, Owner);
@@ -250,9 +416,32 @@ void FGenObject::UpdateDozer(uint32 Frame)
 		B->ConstructionPercent = 100.f;
 		B->bUnderConstruction = false;
 		B->Health = B->MaxHealth;
+		Logic->ClearMinesUnder(*B);
+		Logic->ScoreObjectBuilt(*B);
+		Logic->ScoreMoneySpent(B->GetOwner(), Logic->CalcCostToBuild(B->GetOwner(), *B->Template));
 		B->SetModelCondition(AwaitingConstruction(), false);
 		B->SetModelCondition(PartiallyConstructed(), false);
 		B->SetModelCondition(ActivelyBeingConstructed(), false);
+		if (Owner == Logic->GetLocalPlayer())
+		{
+			// DozerAIUpdate: "message the the building player" ("DOZER:ConstructionComplete") and the dozer's
+			// VoiceTaskComplete.
+			const FGenCommandData& CD = FGenCommandData::Get();
+			FString Name = CD.GetText(B->Template->DisplayName);
+			if (Name.IsEmpty() || Name == B->Template->DisplayName)
+			{
+				Name = B->Template->Name;
+			}
+			FString Message = CD.GetText(TEXT("DOZER:ConstructionComplete"));
+			if (Message.IsEmpty() || Message.StartsWith(TEXT("DOZER:")))
+			{
+				Message = TEXT("%s construction complete.");
+			}
+			Message.ReplaceInline(TEXT("%ls"), TEXT("%s"));
+			Message.ReplaceInline(TEXT("%s"), *Name);
+			Logic->AddScreenMessage(Message);
+			Logic->PlayObjectSound(*this, { TEXT("VoiceTaskComplete") });
+		}
 		StopConstructing();
 		Logic->OnBuildingCompleted(*B);
 	}
@@ -263,11 +452,10 @@ void FGenObject::UpdateDozer(uint32 Frame)
 void UGenGameLogic::GetEnergy(int32 Player, int32& OutProduction, int32& OutConsumption) const
 {
 	OutProduction = OutConsumption = 0;
-	for (FGenObjectID Id : ObjectOrder)
+	for (const FGenObject* O : GetObjectsOf(Player))
 	{
-		const FGenObject* O = Objects[Id].Get();
 		const int32 Energy = O->GetEnergyProduction();
-		if (Energy == 0 || O->GetOwner() != Player || O->IsDead() || O->IsUnderConstruction() || O->IsBeingSold())
+		if (Energy == 0 || O->IsDead() || O->IsUnderConstruction() || O->IsBeingSold())
 		{
 			continue;
 		}
@@ -290,13 +478,41 @@ float UGenGameLogic::CalcTimeToBuild(const FGenThingTemplate& Template, int32 Pl
 	{
 		Rate = FMath::Min(Rate, GD.MaxLowEnergyProductionSpeed);
 	}
-	return FMath::Max(1.f, Frames / FMath::Max(Rate, 0.01f));
+	float Time = Frames / FMath::Max(Rate, 0.01f);
+	// "Multiple build facilities can have an added production bonus": the time is multiplied by
+	// MultipleFactory for every factory of the kind beyond the first. (GameData.ini has 1.0: none.)
+	if (GD.MultipleFactory > 0.f && GD.MultipleFactory != 1.f && !Template.IsKindOf(TEXT("STRUCTURE")))
+	{
+		int32 Factories = 0;
+		const FGenThingTemplate* Facility = nullptr;
+		for (const FGenObject* O : GetObjectsOf(Player))
+		{
+			if (!O->IsDead() && !O->IsUnderConstruction() && O->GetTemplate()->bHasProduction
+				&& (Facility ? O->GetTemplate()->Canonical() == Facility : CanFactoryMake(*O, Template)))
+			{
+				Facility = O->GetTemplate()->Canonical(); // ThingTemplate::getBuildFacilityTemplate: the first kind of building that can make it
+				++Factories;
+			}
+		}
+		for (int32 i = 1; i < Factories; ++i)
+		{
+			Time *= GD.MultipleFactory;
+		}
+	}
+	return FMath::Max(1.f, Time);
 }
 
 bool UGenGameLogic::CanMake(int32 Player, const FGenThingTemplate& Template, FString* OutWhy, bool bCheckMoney) const
 {
 	const FGenGameData& GD = FGenGameData::Get();
-	for (const TArray<FString>& AnyOf : Template.Prerequisites)
+	// Player::canBuild: "Buildable = No" never; Only_By_AI for the computer alone; Ignore_Prerequisites without them.
+	if (Template.Buildable == 1 || (Template.Buildable == 2 && Players.IsValidIndex(Player) && !Players[Player].bSkirmishAI))
+	{
+		if (OutWhy) { *OutWhy = TEXT("Not available"); }
+		return false;
+	}
+	static const TArray<TArray<FString>> NoPrerequisites;
+	for (const TArray<FString>& AnyOf : Template.Buildable == 3 ? NoPrerequisites : Template.Prerequisites)
 	{
 		bool bHave = false;
 		for (FGenObjectID Id : ObjectOrder)
@@ -332,7 +548,7 @@ bool UGenGameLogic::CanMake(int32 Player, const FGenThingTemplate& Template, FSt
 			return false;
 		}
 	}
-	if (bCheckMoney && GetMoney(Player) < int32(Template.BuildCost))
+	if (bCheckMoney && GetMoney(Player) < CalcCostToBuild(Player, Template))
 	{
 		if (OutWhy) { *OutWhy = TEXT("Not enough money"); }
 		return false;
@@ -340,38 +556,60 @@ bool UGenGameLogic::CanMake(int32 Player, const FGenThingTemplate& Template, FSt
 	return true;
 }
 
-bool UGenGameLogic::IsLocationLegalToBuild(const FGenThingTemplate& Template, const FVector3f& Pos, float Angle) const
+bool UGenGameLogic::IsLocationLegalToBuild(const FGenThingTemplate& Template, const FVector3f& Pos, float Angle, const TCHAR** OutWhy) const
 {
+	auto Refuse = [OutWhy](const TCHAR* Why)
+	{
+		if (OutWhy) { *OutWhy = Why; }
+		return false;
+	};
 	const FGenMapData* Map = GetMap();
 	if (!Map)
 	{
-		return false;
+		return Refuse(TEXT("GUI:CantBuildThere"));
 	}
 	const bool bBox = Template.IsBox();
 	const float Major = Template.GeometryMajorRadius;
 	const float Minor = bBox ? Template.GeometryMinorRadius : Major;
 	const FVector2f Center(Pos.X, Pos.Y);
-	if (!Pathfinder.IsAreaClear(Center, Angle, Major, Minor, bBox))
-	{
-		return false; // cliff, water, map edge or another building
-	}
-
-	// Flat enough: the footprint's corners and edge midpoints stay within the allowed height variation.
 	const float C = FMath::Cos(Angle), S = FMath::Sin(Angle);
-	float MinZ = FLT_MAX, MaxZ = -FLT_MAX;
-	for (int32 i = -1; i <= 1; ++i)
+
+	// Nothing alive standing in the way, apart from mobile units (they get out of the way).
+	const float Reach = FMath::Sqrt(Major * Major + Minor * Minor);
+	for (FGenObjectID Id : ObjectOrder)
 	{
-		for (int32 j = -1; j <= 1; ++j)
+		const FGenObject* O = Objects[Id].Get();
+		if (!O->IsTargetable() || O->CanMove())
 		{
-			const float LX = Major * float(i), LY = Minor * float(j);
-			const float Z = Map->GetGroundHeight(Pos.X + LX * C - LY * S, Pos.Y + LX * S + LY * C);
-			MinZ = FMath::Min(MinZ, Z);
-			MaxZ = FMath::Max(MaxZ, Z);
+			continue;
 		}
-	}
-	if (MaxZ - MinZ > FGenGameData::Get().AllowedHeightVariationForBuilding)
-	{
-		return false;
+		// BuildAssistant::isRemovableForConstruction: "all shrubbery can be removed", "anything with a kindof
+		// marked as cleared by build can be removed" (the site clears them when the building is laid down).
+		if (O->IsKindOf(TEXT("SHRUBBERY")) || O->IsKindOf(TEXT("CLEARED_BY_BUILD")))
+		{
+			continue;
+		}
+		// "ignore land mines, cluster mines and demo traps, since you can build on them"; "same story for
+		// inert things: ie, radiation fields, pings, and projectile streams"
+		if (O->IsKindOf(TEXT("MINE")) || O->IsKindOf(TEXT("INERT")))
+		{
+			continue;
+		}
+		// BuildAssistant: something stealthed that hasn't been found doesn't give itself away by being in the way.
+		if (O->IsStealthedAndUndetected() && GetRelationship(LocalPlayer, O->GetOwner()) != EGenRelationship::Allies)
+		{
+			continue;
+		}
+		const float DX = O->GetPosition().X - Pos.X, DY = O->GetPosition().Y - Pos.Y;
+		const float ObjRadius = O->GetTemplate()->GetBoundingCircleRadius();
+		if (DX * DX + DY * DY > FMath::Square(Reach + ObjRadius))
+		{
+			continue;
+		}
+		if (FMath::Abs(DX * C + DY * S) <= Major + ObjRadius * 0.7f && FMath::Abs(-DX * S + DY * C) <= Minor + ObjRadius * 0.7f)
+		{
+			return Refuse(TEXT("GUI:CantBuildObjectsInTheWay"));
+		}
 	}
 
 	// Supply centers keep a border free around supply piles, so the gatherers can get at them.
@@ -389,30 +627,37 @@ bool UGenGameLogic::IsLocationLegalToBuild(const FGenThingTemplate& Template, co
 			const FVector2f Half(ST->GeometryMajorRadius + Border, (ST->IsBox() ? ST->GeometryMinorRadius : ST->GeometryMajorRadius) + Border);
 			if (RectanglesOverlap(Center, Angle, FVector2f(Major, Minor), FVector2f(O->GetPosition().X, O->GetPosition().Y), O->GetOrientation(), Half))
 			{
-				return false;
+				return Refuse(TEXT("GUI:CantBuildTooCloseToSupplies"));
 			}
 		}
 	}
 
-	// Nothing alive standing in the way, apart from mobile units (they get out of the way).
-	const float Reach = FMath::Sqrt(Major * Major + Minor * Minor);
-	for (FGenObjectID Id : ObjectOrder)
+	// The terrain. "if (TheTerrainLogic->getLayerForDestination(worldPos) != LAYER_GROUND) { // we're on a
+	// bridge. This is somewhat restricted." (The cursor's point is the deck's where it is in front of the ground.)
+	if (Pathfinder.GetLayerForDestination(Pos, GetGroundHeight(Pos.X, Pos.Y)) != 0)
 	{
-		const FGenObject* O = Objects[Id].Get();
-		if (!O->IsTargetable() || O->CanMove())
+		return Refuse(TEXT("GUI:CantBuildRestrictedTerrain"));
+	}
+	if (!Pathfinder.IsAreaClear(Center, Angle, Major, Minor, bBox))
+	{
+		return Refuse(TEXT("GUI:CantBuildRestrictedTerrain")); // cliff, water, map edge (another building: in the way, above)
+	}
+
+	// Flat enough: the footprint's corners and edge midpoints stay within the allowed height variation.
+	float MinZ = FLT_MAX, MaxZ = -FLT_MAX;
+	for (int32 i = -1; i <= 1; ++i)
+	{
+		for (int32 j = -1; j <= 1; ++j)
 		{
-			continue;
+			const float LX = Major * float(i), LY = Minor * float(j);
+			const float Z = Map->GetGroundHeight(Pos.X + LX * C - LY * S, Pos.Y + LX * S + LY * C);
+			MinZ = FMath::Min(MinZ, Z);
+			MaxZ = FMath::Max(MaxZ, Z);
 		}
-		const float DX = O->GetPosition().X - Pos.X, DY = O->GetPosition().Y - Pos.Y;
-		const float ObjRadius = O->GetTemplate()->GetBoundingCircleRadius();
-		if (DX * DX + DY * DY > FMath::Square(Reach + ObjRadius))
-		{
-			continue;
-		}
-		if (FMath::Abs(DX * C + DY * S) <= Major + ObjRadius * 0.7f && FMath::Abs(-DX * S + DY * C) <= Minor + ObjRadius * 0.7f)
-		{
-			return false;
-		}
+	}
+	if (MaxZ - MinZ > FGenGameData::Get().AllowedHeightVariationForBuilding)
+	{
+		return Refuse(TEXT("GUI:CantBuildNotFlatEnough"));
 	}
 	return true;
 }
@@ -421,15 +666,20 @@ bool UGenGameLogic::IsLocationLegalToBuild(const FGenThingTemplate& Template, co
 
 void UGenGameLogic::IssueQueueUnit(FGenObjectID Factory, const FString& UnitTemplate)
 {
-	PendingCommands.Add([this, Factory, UnitTemplate]()
+	FGenCommand C(EGenCommandType::QueueUnit);
+	C.Units = { Factory };
+	C.Name = UnitTemplate;
+	SubmitCommand(MoveTemp(C));
+}
+
+void UGenGameLogic::ExecQueueUnit(const FGenCommand& C)
+{
+	FGenObject* F = C.Units.Num() > 0 ? FindObject(C.Units[0]) : nullptr;
+	const FGenThingTemplate* Unit = FGenGameData::Get().FindTemplate(C.Name);
+	if (F && Unit)
 	{
-		FGenObject* F = FindObject(Factory);
-		const FGenThingTemplate* Unit = FGenGameData::Get().FindTemplate(UnitTemplate);
-		if (F && Unit)
-		{
-			QueueUnit(*F, *Unit);
-		}
-	});
+		QueueUnit(*F, *Unit);
+	}
 }
 
 bool UGenGameLogic::QueueUnit(FGenObject& Factory, const FGenThingTemplate& Unit)
@@ -450,8 +700,8 @@ bool UGenGameLogic::QueueUnit(FGenObject& Factory, const FGenThingTemplate& Unit
 		}
 	}
 	// The unit is paid for when it is queued (and refunded if cancelled).
-	const int32 Cost = int32(Unit.BuildCost);
-	Players[Factory.GetOwner()].Money -= Cost;
+	const int32 Cost = CalcCostToBuild(Factory.GetOwner(), Unit);
+	Withdraw(Factory.GetOwner(), Cost);
 	FGenObject::FProduction& P = Factory.Production.AddDefaulted_GetRef();
 	P.Unit = &Unit;
 	P.Cost = Cost;
@@ -480,46 +730,95 @@ bool UGenGameLogic::CanFactoryMake(const FGenObject& Factory, const FGenThingTem
 
 void UGenGameLogic::AddMoney(int32 Player, int32 Amount)
 {
-	if (Players.IsValidIndex(Player))
+	if (Amount >= 0)
 	{
-		Players[Player].Money = FMath::Max(0, Players[Player].Money + Amount);
+		Deposit(Player, Amount);
 	}
+	else
+	{
+		Withdraw(Player, -Amount);
+	}
+}
+
+void UGenGameLogic::Deposit(int32 Player, int32 Amount, bool bPlaySound)
+{
+	if (!Players.IsValidIndex(Player) || Amount <= 0)
+	{
+		return;
+	}
+	if (bPlaySound)
+	{
+		PlayMiscSound(TEXT("MoneyDepositSound"), Player);
+	}
+	Players[Player].Money += Amount;
+}
+
+int32 UGenGameLogic::Withdraw(int32 Player, int32 Amount, bool bPlaySound)
+{
+	if (!Players.IsValidIndex(Player))
+	{
+		return 0;
+	}
+	Amount = FMath::Min(Amount, Players[Player].Money);
+	if (Amount <= 0)
+	{
+		return 0;
+	}
+	if (bPlaySound)
+	{
+		PlayMiscSound(TEXT("MoneyWithdrawSound"), Player);
+	}
+	Players[Player].Money -= Amount;
+	return Amount;
 }
 
 void UGenGameLogic::IssueCancelUnit(FGenObjectID Factory, int32 QueueIndex)
 {
-	PendingCommands.Add([this, Factory, QueueIndex]()
+	FGenCommand C(EGenCommandType::CancelUnit);
+	C.Units = { Factory };
+	C.A = QueueIndex;
+	SubmitCommand(MoveTemp(C));
+}
+
+void UGenGameLogic::ExecCancelUnit(const FGenCommand& C)
+{
+	FGenObject* F = C.Units.Num() > 0 ? FindObject(C.Units[0]) : nullptr;
+	const int32 QueueIndex = C.A;
+	if (F && F->Production.IsValidIndex(QueueIndex))
 	{
-		FGenObject* F = FindObject(Factory);
-		if (F && F->Production.IsValidIndex(QueueIndex))
+		Deposit(F->GetOwner(), F->Production[QueueIndex].Cost);
+		if (F->Production[QueueIndex].Upgrade)
 		{
-			Players[F->GetOwner()].Money += F->Production[QueueIndex].Cost;
-			if (F->Production[QueueIndex].Upgrade)
-			{
-				CancelUpgradeInProduction(F->GetOwner(), *F->Production[QueueIndex].Upgrade);
-			}
-			if (F->GetParking())
-			{
-				F->GetParking()->UnreserveDoorForExit(F->Production[QueueIndex].ExitDoor);
-			}
-			F->Production.RemoveAt(QueueIndex);
+			CancelUpgradeInProduction(F->GetOwner(), *F->Production[QueueIndex].Upgrade);
 		}
-	});
+		if (F->GetParking())
+		{
+			F->GetParking()->UnreserveDoorForExit(F->Production[QueueIndex].ExitDoor);
+		}
+		F->Production.RemoveAt(QueueIndex);
+	}
 }
 
 void UGenGameLogic::IssueConstruct(FGenObjectID Dozer, const FString& BuildingTemplate, const FVector3f& Pos, float Angle)
 {
-	PendingCommands.Add([this, Dozer, BuildingTemplate, Pos, Angle]()
+	FGenCommand C(EGenCommandType::Construct);
+	C.Units = { Dozer };
+	C.Name = BuildingTemplate;
+	C.Pos = Pos;
+	C.F = Angle;
+	SubmitCommand(MoveTemp(C));
+}
+
+void UGenGameLogic::ExecConstruct(const FGenCommand& C)
+{
+	FGenObject* D = C.Units.Num() > 0 ? FindObject(C.Units[0]) : nullptr;
+	const FGenThingTemplate* T = FGenGameData::Get().FindTemplate(C.Name);
+	if (!D || !T || D->IsDead() || !D->GetTemplate()->bIsDozer || !CanMake(D->GetOwner(), *T) || !IsLocationLegalToBuild(*T, C.Pos, C.F))
 	{
-		FGenObject* D = FindObject(Dozer);
-		const FGenThingTemplate* T = FGenGameData::Get().FindTemplate(BuildingTemplate);
-		if (!D || !T || D->IsDead() || !D->GetTemplate()->bIsDozer || !CanMake(D->GetOwner(), *T) || !IsLocationLegalToBuild(*T, Pos, Angle))
-		{
-			return;
-		}
-		D->OnPlayerCommand(false); // a worker on a supply run drops it
-		ConstructBuilding(D, *T, Pos, Angle, D->GetOwner());
-	});
+		return;
+	}
+	D->OnPlayerCommand(false); // a worker on a supply run drops it
+	ConstructBuilding(D, *T, C.Pos, C.F, D->GetOwner());
 }
 
 FGenObject* UGenGameLogic::ConstructBuilding(FGenObject* Dozer, const FGenThingTemplate& Template, const FVector3f& Pos, float Angle, int32 Player)
@@ -529,7 +828,7 @@ FGenObject* UGenGameLogic::ConstructBuilding(FGenObject* Dozer, const FGenThingT
 	{
 		return nullptr;
 	}
-	Players[Player].Money -= int32(Template.BuildCost);
+	Withdraw(Player, CalcCostToBuild(Player, Template));
 
 	// Shrubs, rocks and other lifeless props under the footprint are cleared away.
 	const float C = FMath::Cos(Angle), S = FMath::Sin(Angle);
@@ -542,12 +841,31 @@ FGenObject* UGenGameLogic::ConstructBuilding(FGenObject* Dozer, const FGenThingT
 	for (int32 i = ObjectOrder.Num() - 1; i >= 0; --i)
 	{
 		const FGenObject* O = Objects[ObjectOrder[i]].Get();
-		if (!O->IsTargetable() && !O->IsDead() && !O->IsProjectile() && !O->CanMove() && InFootprint(O->GetPosition(), 2.f))
+		if (O->IsDead() || O->IsProjectile() || O->CanMove())
+		{
+			continue;
+		}
+		// BuildAssistant::clearRemovableForConstruction: KINDOF_SHRUBBERY and KINDOF_CLEARED_BY_BUILD - lamp
+		// posts, fences - make way wherever their own shape reaches into the building's ("iteratePotentialCollisions").
+		bool bClear = !O->IsTargetable() && InFootprint(O->GetPosition(), 2.f);
+		if (!bClear && (O->IsKindOf(TEXT("CLEARED_BY_BUILD")) || O->IsKindOf(TEXT("SHRUBBERY"))))
+		{
+			const FGenThingTemplate* OT = O->GetTemplate();
+			const FVector2f Half(OT->GeometryMajorRadius, OT->IsBox() ? OT->GeometryMinorRadius : OT->GeometryMajorRadius);
+			bClear = RectanglesOverlap(FVector2f(Pos.X, Pos.Y), Angle, FVector2f(Template.GeometryMajorRadius, Minor),
+				FVector2f(O->GetPosition().X, O->GetPosition().Y), O->GetOrientation(), Half);
+		}
+		if (bClear)
 		{
 			DestroyObject(ObjectOrder[i]);
 		}
 	}
 
+	if (Dozer)
+	{
+		// DozerAIUpdate::construct: "Flatten the terrain underneath the object, then adjust to the flattened height."
+		FlattenTerrain(Template, Pos, Angle);
+	}
 	FGenObject* B = CreateObject(&Template, Player, FVector3f(Pos.X, Pos.Y, GetGroundHeight(Pos.X, Pos.Y)), Angle);
 	if (!B)
 	{
@@ -560,6 +878,7 @@ FGenObject* UGenGameLogic::ConstructBuilding(FGenObject* Dozer, const FGenThingT
 		B->ConstructionPercent = 0.f;
 		B->Health = 1.f;
 		B->SetModelCondition(AwaitingConstruction(), true);
+		ClearMinesUnder(*B);
 	}
 
 	// Units standing where the building goes move out.
@@ -632,41 +951,51 @@ bool UGenGameLogic::CanGetRepairedAt(const FGenObject& Unit, const FGenObject& R
 
 void UGenGameLogic::IssueRepair(const TArray<FGenObjectID>& Dozers, FGenObjectID Building)
 {
-	PendingCommands.Add([this, Dozers, Building]()
+	FGenCommand C(EGenCommandType::Repair);
+	C.Units = Dozers;
+	C.Target = Building;
+	SubmitCommand(MoveTemp(C));
+}
+
+void UGenGameLogic::ExecRepair(const FGenCommand& C)
+{
+	FGenObject* B = FindObject(C.Target);
+	for (FGenObjectID Id : C.Units)
 	{
-		FGenObject* B = FindObject(Building);
-		for (FGenObjectID Id : Dozers)
+		FGenObject* D = FindObject(Id);
+		if (B && D && CanRepairObject(*D, *B))
 		{
-			FGenObject* D = FindObject(Id);
-			if (B && D && CanRepairObject(*D, *B))
+			D->OnPlayerCommand(false);
+			// (One repairer per building: the first to be told goes, the others stay where they are.)
+			if (D->StartRepair(*B))
 			{
-				D->OnPlayerCommand(false);
-				// (One repairer per building: the first to be told goes, the others stay where they are.)
-				if (D->StartRepair(*B))
-				{
-					break;
-				}
+				break;
 			}
 		}
-	});
+	}
 }
 
 void UGenGameLogic::IssueGetRepaired(const TArray<FGenObjectID>& Units, FGenObjectID RepairDest)
 {
-	PendingCommands.Add([this, Units, RepairDest]()
+	FGenCommand C(EGenCommandType::GetRepaired);
+	C.Units = Units;
+	C.Target = RepairDest;
+	SubmitCommand(MoveTemp(C));
+}
+
+void UGenGameLogic::ExecGetRepaired(const FGenCommand& C)
+{
+	FGenObject* D = FindObject(C.Target);
+	for (FGenObjectID Id : C.Units)
 	{
-		FGenObject* D = FindObject(RepairDest);
-		for (FGenObjectID Id : Units)
+		FGenObject* U = FindObject(Id);
+		if (D && U && D->GetDock() && CanGetRepairedAt(*U, *D))
 		{
-			FGenObject* U = FindObject(Id);
-			if (D && U && D->GetDock() && CanGetRepairedAt(*U, *D))
-			{
-				U->OnPlayerCommand(true);
-				U->StopConstructing();
-				U->StartDock(*D);
-			}
+			U->OnPlayerCommand(true);
+			U->StopConstructing();
+			U->StartDock(*D);
 		}
-	});
+	}
 }
 
 bool UGenGameLogic::CanSetRallyPoint(const FGenObject& Obj) const
@@ -708,90 +1037,191 @@ bool UGenGameLogic::SetRallyPoint(FGenObject& Obj, const FVector3f& InPos)
 
 void UGenGameLogic::IssueSetRallyPoint(const TArray<FGenObjectID>& Buildings, const FVector3f& Pos)
 {
-	PendingCommands.Add([this, Buildings, Pos]()
+	FGenCommand C(EGenCommandType::SetRallyPoint);
+	C.Units = Buildings;
+	C.Pos = Pos;
+	SubmitCommand(MoveTemp(C));
+}
+
+void UGenGameLogic::ExecSetRallyPoint(const FGenCommand& C)
+{
+	for (FGenObjectID Id : C.Units)
 	{
-		for (FGenObjectID Id : Buildings)
+		FGenObject* B = FindObject(Id);
+		if (B && CanSetRallyPoint(*B) && !SetRallyPoint(*B, C.Pos))
 		{
-			FGenObject* B = FindObject(Id);
-			if (B && CanSetRallyPoint(*B) && !SetRallyPoint(*B, Pos))
-			{
-				break; // (one refusal says it for all of them)
-			}
+			break; // (one refusal says it for all of them)
 		}
-	});
+	}
 }
 
 void UGenGameLogic::IssueResumeConstruction(const TArray<FGenObjectID>& Dozers, FGenObjectID Building)
 {
-	PendingCommands.Add([this, Dozers, Building]()
+	FGenCommand C(EGenCommandType::ResumeConstruction);
+	C.Units = Dozers;
+	C.Target = Building;
+	SubmitCommand(MoveTemp(C));
+}
+
+void UGenGameLogic::ExecResumeConstruction(const FGenCommand& C)
+{
+	FGenObject* B = FindObject(C.Target);
+	if (!B || !B->IsUnderConstruction() || B->IsDead())
 	{
-		FGenObject* B = FindObject(Building);
-		if (!B || !B->IsUnderConstruction() || B->IsDead())
+		return;
+	}
+	// One dozer per building.
+	for (FGenObjectID Id : C.Units)
+	{
+		FGenObject* D = FindObject(Id);
+		if (D && !D->IsDead() && D->GetTemplate()->bIsDozer && D->GetOwner() == B->GetOwner())
 		{
-			return;
+			D->OnPlayerCommand(false);
+			ResumeConstruction(*D, *B);
+			break;
 		}
-		// One dozer per building.
-		for (FGenObjectID Id : Dozers)
-		{
-			FGenObject* D = FindObject(Id);
-			if (D && !D->IsDead() && D->GetTemplate()->bIsDozer && D->GetOwner() == B->GetOwner())
-			{
-				D->OnPlayerCommand(false);
-				ResumeConstruction(*D, *B);
-				break;
-			}
-		}
-	});
+	}
 }
 
 void UGenGameLogic::OnBuildingCompleted(FGenObject& Building)
 {
+	// Player::onStructureConstructionComplete: "This object may require us to play some EVA sounds."
+	for (const FGenSpecialPowerModule& M : Building.GetTemplate()->PowerModules)
+	{
+		if (const FGenSpecialPowerTemplate* Power = FGenUpgradeData::Get().FindPower(M.Power))
+		{
+			EvaSuperweapon(TEXT("Detected"), Building, *Power);
+		}
+	}
+	if (Building.GetOwner() == LocalPlayer && Frame > 1)
+	{
+		// DozerAIUpdate: "make radar neat-o attention grabber event at build location"
+		CreateRadarEvent(Building.GetPosition(), EGenRadarEvent::Construction);
+	}
 	if (FGenSkirmishAI* AI = GetAI(Building.GetOwner()))
 	{
 		AI->OnStructureProduced(Building);
 	}
 }
 
+void UGenGameLogic::IssueCancelConstruction(FGenObjectID Building)
+{
+	FGenCommand C(EGenCommandType::CancelConstruction);
+	C.Units = { Building };
+	SubmitCommand(MoveTemp(C));
+}
+
+void UGenGameLogic::ExecCancelConstruction(const FGenCommand& C)
+{
+	// GameLogicDispatch MSG_DOZER_CANCEL_CONSTRUCT: "refund the money to the player", then "killing the building
+	// will automatically cause the dozer also cancel its own building behavior".
+	FGenObject* B = C.Units.Num() > 0 ? FindObject(C.Units[0]) : nullptr;
+	if (!B || B->IsDead() || !B->IsUnderConstruction())
+	{
+		return;
+	}
+	Deposit(B->GetOwner(), CalcCostToBuild(B->GetOwner(), *B->GetTemplate()));
+	UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [build f%u] #%u %s: construction cancelled"), Frame, B->GetID(), *B->GetTemplate()->Name);
+	B->Kill();
+}
+
+void UGenGameLogic::IssueToggleOvercharge(FGenObjectID Building)
+{
+	FGenCommand C(EGenCommandType::ToggleOvercharge);
+	C.Units = { Building };
+	SubmitCommand(MoveTemp(C));
+}
+
+void UGenGameLogic::ExecToggleOvercharge(const FGenCommand& C)
+{
+	if (FGenObject* B = C.Units.Num() > 0 ? FindObject(C.Units[0]) : nullptr)
+	{
+		B->SetOvercharge(!B->IsOverchargeActive());
+	}
+}
+
 void UGenGameLogic::IssueSell(FGenObjectID Building)
 {
-	PendingCommands.Add([this, Building]()
+	FGenCommand C(EGenCommandType::Sell);
+	C.Units = { Building };
+	SubmitCommand(MoveTemp(C));
+}
+
+void UGenGameLogic::ExecSell(const FGenCommand& C)
+{
+	const FGenObjectID Building = C.Units.Num() > 0 ? C.Units[0] : GenInvalidObjectID;
+	FGenObject* B = FindObject(Building);
+	if (!B || B->IsDead() || B->IsBeingSold() || !B->GetTemplate()->IsKindOf(TEXT("STRUCTURE")))
 	{
-		FGenObject* B = FindObject(Building);
-		if (!B || B->IsDead() || B->IsBeingSold() || !B->GetTemplate()->IsKindOf(TEXT("STRUCTURE")))
+		return;
+	}
+	OnContainerSold(*B);
+	// BuildAssistant::sellObject: "destroy any mines that are owned by this structure, right now"
+	for (int32 i = bAnyMines ? ObjectOrder.Num() - 1 : -1; i >= 0; --i)
+	{
+		const FGenObject* MineObj = Objects[ObjectOrder[i]].Get();
+		if (MineObj->GetProducer() == Building && MineObj->IsKindOf(TEXT("MINE")))
 		{
-			return;
+			DestroyObject(ObjectOrder[i]);
 		}
-		OnContainerSold(*B);
-		// Whatever was queued is refunded.
-		for (const FGenObject::FProduction& P : B->Production)
+	}
+	// Whatever was queued is refunded.
+	for (const FGenObject::FProduction& P : B->Production)
+	{
+		Deposit(B->GetOwner(), P.Cost);
+		if (P.Upgrade)
 		{
-			Players[B->GetOwner()].Money += P.Cost;
-			if (P.Upgrade)
-			{
-				CancelUpgradeInProduction(B->GetOwner(), *P.Upgrade);
-			}
-			if (B->GetParking())
-			{
-				B->GetParking()->UnreserveDoorForExit(P.ExitDoor);
-			}
+			CancelUpgradeInProduction(B->GetOwner(), *P.Upgrade);
 		}
-		B->Production.Reset();
-		B->ClearAttack();
-		B->SetModelCondition(Sold(), true);
-		// BuildAssistant: the building comes down over three seconds, then the refund is paid.
-		B->SellFrame = Frame + uint32(GenLogic::GetLogicFPS() * 3);
-	});
+		if (B->GetParking())
+		{
+			B->GetParking()->UnreserveDoorForExit(P.ExitDoor);
+		}
+	}
+	B->Production.Reset();
+	B->ClearAttack();
+	// BuildAssistant::sellObject: its construction percent starts just under a hundred and is counted
+	// down (FGenObject::Update); the scaffolding goes up as for a building site, at twice the pace.
+	B->ConstructionPercent = 99.9f;
+	B->SellFrame = FMath::Max(Frame, 1u);
+	B->SetModelCondition(PartiallyConstructed(), true);
+	B->SetModelCondition(ActivelyBeingConstructed(), true);
+	B->SetDrawAnimDuration(GenLogic::GetLogicFPS() * 3 / 2);
+	UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [build f%u] #%u %s is being sold"), Frame, B->GetID(), *B->GetTemplate()->Name);
 }
 
 void UGenGameLogic::FinishSell(const FGenObject& Building)
 {
+	UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [build f%u] #%u %s is sold"), Frame, Building.GetID(), *Building.GetTemplate()->Name);
 	if (!Players.IsValidIndex(Building.GetOwner()))
 	{
 		return;
 	}
 	// A site that was never finished gives everything back.
 	const float Share = Building.IsUnderConstruction() ? 1.f : FGenGameData::Get().SellPercentage;
-	Players[Building.GetOwner()].Money += FMath::RoundToInt32(Building.GetTemplate()->BuildCost * Share);
+	Deposit(Building.GetOwner(), FMath::RoundToInt32(float(CalcCostToBuild(Building.GetOwner(), *Building.GetTemplate())) * Share));
+}
+
+void UGenGameLogic::CancelAllProduction(FGenObject& Building)
+{
+	// ProductionUpdate::cancelAndRefundAllProduction
+	if (!Players.IsValidIndex(Building.GetOwner()))
+	{
+		return;
+	}
+	for (const FGenObject::FProduction& P : Building.Production)
+	{
+		Deposit(Building.GetOwner(), P.Cost);
+		if (P.Upgrade)
+		{
+			CancelUpgradeInProduction(Building.GetOwner(), *P.Upgrade);
+		}
+		if (Building.GetParking())
+		{
+			Building.GetParking()->UnreserveDoorForExit(P.ExitDoor);
+		}
+	}
+	Building.Production.Reset();
 }
 
 void UGenGameLogic::SpawnProducedUnit(const FGenObject& Factory, const FGenThingTemplate& Unit, int32 ExitDoor)
@@ -833,6 +1263,9 @@ void UGenGameLogic::SpawnProducedUnit(const FGenObject& Factory, const FGenThing
 		}
 		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [jet f%u] #%u %s built at #%u %s (space %d)"), Frame, U->GetID(), *Unit.Name, Factory.GetID(),
 			*Factory.GetTemplate()->Name, ExitDoor);
+		PlayObjectSound(*U, { TEXT("VoiceCreated") });
+		PlayObjectSound(*U, { TEXT("VoiceCreate") });
+		ScoreObjectBuilt(*U);
 		if (FGenSkirmishAI* AI = GetAI(Factory.GetOwner()))
 		{
 			AI->OnUnitProduced(Factory, *U);
@@ -862,10 +1295,24 @@ void UGenGameLogic::SpawnProducedUnit(const FGenObject& Factory, const FGenThing
 	{
 		// SupplyCenterProductionExitUpdate: gatherers leaving a supply center go straight to work, and
 		// the flying ones don't bother with the rally point first.
+		PlayObjectSound(*U, { TEXT("VoiceCreated") });
+		PlayObjectSound(*U, { TEXT("VoiceCreate") });
+		ScoreObjectBuilt(*U);
 		const bool bGatherer = FT->bSupplyCenter && Unit.bIsSupplyTruck;
 		if (!(bGatherer && U->IsFlying()))
 		{
-			U->CommandMoveTo(FVector3f(Rally.X, Rally.Y, GetGroundHeight(Rally.X, Rally.Y)));
+			if (FT->bHasExit && !U->IsFlying() && U->CanMove())
+			{
+				// aiFollowExitProductionPath: straight out of the door along the exit path, the factory it was made
+				// in no obstacle on the way (no path is looked for: one from inside the building went round
+				// whichever side came first).
+				U->StartDirectMove(FVector3f(Rally.X, Rally.Y, GetGroundHeight(Rally.X, Rally.Y)));
+				U->IgnoreObstacle = Factory.GetID();
+			}
+			else
+			{
+				U->CommandMoveTo(FVector3f(Rally.X, Rally.Y, GetGroundHeight(Rally.X, Rally.Y)));
+			}
 			// aiFollowExitProductionPath: out by the door first, then on to the building's rally point
 			// (only what moves on the ground; the move there ends on the nearest free spot).
 			if (Factory.HasRallyPoint() && !U->IsFlying())

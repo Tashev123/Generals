@@ -1,4 +1,5 @@
 #include "Map/GenTerrain.h"
+#include "Core/GenMeshUtil.h"
 #include "Core/GenCoords.h"
 #include "Core/GenFileSystem.h"
 #include "Logic/GenGameData.h"
@@ -80,7 +81,10 @@ void UGenTerrainComponent::Clear()
 		if (C) { C->DestroyComponent(); }
 	}
 	Chunks.Reset();
+	ChunkRects.Reset();
+	DirtyChunks.Reset();
 	TileOrigins.Reset();
+	TileColors.Reset();
 	Atlas = nullptr;
 	Material = nullptr;
 }
@@ -148,6 +152,7 @@ bool UGenTerrainComponent::BuildAtlas(const FGenMapData& Map)
 	int32 MaxTile = 0;
 	for (const FGenTextureClass& TC : Map.TextureClasses) { MaxTile = FMath::Max(MaxTile, TC.FirstTile + TC.NumTiles); }
 	TileOrigins.Init(FIntPoint(-1, -1), MaxTile + 1);
+	TileColors.Init(FColor::Black, MaxTile + 1);
 
 	for (const FClassImage& CI : Images)
 	{
@@ -173,6 +178,19 @@ bool UGenTerrainComponent::BuildAtlas(const FGenMapData& Map)
 				if (TileOrigins.IsValidIndex(Tile))
 				{
 					TileOrigins[Tile] = FIntPoint(CI.Pos.X + AtlasPadding + tx * TilePixels, CI.Pos.Y + AtlasPadding + ty * TilePixels);
+					// TileData::getRGBDataForWidth(1): the whole tile averaged into one pixel (the radar's terrain colour).
+					uint32 SumR = 0, SumG = 0, SumB = 0;
+					for (int32 py = 0; py < TilePixels; ++py)
+					{
+						for (int32 px = 0; px < TilePixels; ++px)
+						{
+							const int32 SX = tx * TilePixels + px, SY = ty * TilePixels + py;
+							const FColor C = (SX < CI.Image.Width && SY < CI.Image.Height) ? CI.Image.At(SX, SY) : FColor::Black;
+							SumR += C.R; SumG += C.G; SumB += C.B;
+						}
+					}
+					const uint32 N = TilePixels * TilePixels;
+					TileColors[Tile] = FColor(uint8(SumR / N), uint8(SumG / N), uint8(SumB / N), 255);
 				}
 			}
 		}
@@ -180,6 +198,39 @@ bool UGenTerrainComponent::BuildAtlas(const FGenMapData& Map)
 
 	Atlas = GenTextureLoader::CreateFromImage(Img, TEXT("TerrainAtlas"), true, true);
 	return Atlas != nullptr;
+}
+
+FLinearColor UGenTerrainComponent::GetTerrainColorAt(const FGenMapData& Map, float WorldX, float WorldY) const
+{
+	const int32 X = FMath::Clamp(FMath::FloorToInt32(WorldX / GenCoords::MapXYFactor) + Map.Border, 0, Map.Width - 1);
+	const int32 Y = FMath::Clamp(FMath::FloorToInt32(WorldY / GenCoords::MapXYFactor) + Map.Border, 0, Map.Height - 1);
+	const int32 Ndx = Y * Map.Width + X;
+	const int32 Tile = Map.TileNdx.IsValidIndex(Ndx) ? (Map.TileNdx[Ndx] >> 2) : -1; // "we pack 4 grids into a tile"
+	if (!TileColors.IsValidIndex(Tile))
+	{
+		return FLinearColor::Black;
+	}
+	const FColor C = TileColors[Tile];
+	return FLinearColor(C.R / 255.f, C.G / 255.f, C.B / 255.f, 1.f); // (gamma-space values, as the original works with)
+}
+
+void UGenTerrainComponent::ApplyCloudAndLightMap(UMaterialInstanceDynamic* Material, const FGenMapData& Map)
+{
+	// FlatHeightMapRenderObjClass::Render: "if (TheGlobalData->m_timeOfDay == TIME_OF_DAY_NIGHT) doCloud = false".
+	const FGenGameData& GD = FGenGameData::Get();
+	UGenAssetSubsystem* Assets = UGenAssetSubsystem::Get();
+	if (!Material || !Assets)
+	{
+		return;
+	}
+	constexpr int32 TimeOfDayNight = 4;
+	const bool bClouds = GD.bUseCloudMap && Map.TimeOfDay != TimeOfDayNight;
+	UTexture2D* Cloud = bClouds ? Assets->GetTexture(TEXT("TSCloudMed.tga")) : nullptr;
+	UTexture2D* Noise = GD.bUseLightMap ? Assets->GetTexture(TEXT("TSNoiseUrb.tga")) : nullptr;
+	if (Cloud) { Material->SetTextureParameterValue(TEXT("CloudTexture"), Cloud); }
+	if (Noise) { Material->SetTextureParameterValue(TEXT("LightMapTexture"), Noise); }
+	Material->SetScalarParameterValue(TEXT("CloudAmount"), Cloud ? 1.f : 0.f);
+	Material->SetScalarParameterValue(TEXT("LightMapAmount"), Noise ? 1.f : 0.f);
 }
 
 bool UGenTerrainComponent::Build(const FGenMapData& Map)
@@ -196,6 +247,7 @@ bool UGenTerrainComponent::Build(const FGenMapData& Map)
 	{
 		Material->SetTextureParameterValue(TEXT("Atlas"), Atlas);
 	}
+	ApplyCloudAndLightMap(Material, Map);
 
 	const int32 CellsX = Map.Width - 1;
 	const int32 CellsY = Map.Height - 1;
@@ -210,7 +262,55 @@ bool UGenTerrainComponent::Build(const FGenMapData& Map)
 	return true;
 }
 
-void UGenTerrainComponent::BuildChunk(const FGenMapData& Map, int32 X0, int32 Y0, int32 X1, int32 Y1)
+bool UGenTerrainComponent::IsCellFlipped(const FGenMapData& Map, int32 X, int32 Y) const
+{
+	// (as BuildChunk decides it: by the cell's first blend)
+	const int32 Ndx = Y * Map.Width + X;
+	const int32 B1 = Map.BlendNdx.IsValidIndex(Ndx) ? Map.BlendNdx[Ndx] : 0;
+	if (B1 <= 0 || !Map.BlendedTiles.IsValidIndex(B1))
+	{
+		return false;
+	}
+	const FGenBlendedTile& BT = Map.BlendedTiles[B1];
+	const int32 Base = BT.BlendNdx >> 2;
+	if (!TileOrigins.IsValidIndex(Base) || TileOrigins[Base].X < 0)
+	{
+		return false;
+	}
+	uint8 Alpha[4];
+	bool bFlip = false;
+	BlendAlpha(BT, Alpha, bFlip);
+	return bFlip;
+}
+
+void UGenTerrainComponent::MarkCellsDirty(const FGenMapData& Map, int32 X0, int32 Y0, int32 X1, int32 Y1)
+{
+	for (int32 i = 0; i < ChunkRects.Num(); ++i)
+	{
+		const FIntRect& R = ChunkRects[i];
+		if (X0 < R.Max.X && X1 >= R.Min.X && Y0 < R.Max.Y && Y1 >= R.Min.Y)
+		{
+			DirtyChunks.AddUnique(i);
+		}
+	}
+}
+
+bool UGenTerrainComponent::RebuildDirtyChunk(const FGenMapData& Map)
+{
+	if (DirtyChunks.Num() == 0)
+	{
+		return false;
+	}
+	const int32 Index = DirtyChunks.Pop(EAllowShrinking::No);
+	if (ChunkRects.IsValidIndex(Index))
+	{
+		const FIntRect R = ChunkRects[Index];
+		BuildChunk(Map, R.Min.X, R.Min.Y, R.Max.X, R.Max.Y, Index);
+	}
+	return true;
+}
+
+void UGenTerrainComponent::BuildChunk(const FGenMapData& Map, int32 X0, int32 Y0, int32 X1, int32 Y1, int32 ReplaceIndex)
 {
 	const float InvW = AtlasSize.X > 0 ? 1.f / float(AtlasSize.X) : 0.f;
 	const float InvH = AtlasSize.Y > 0 ? 1.f / float(AtlasSize.Y) : 0.f;
@@ -338,7 +438,7 @@ void UGenTerrainComponent::BuildChunk(const FGenMapData& Map, int32 X0, int32 Y0
 	}
 
 	UStaticMesh* SM = NewObject<UStaticMesh>(this, NAME_None, RF_Transient);
-	SM->GetStaticMaterials().Add(FStaticMaterial(Material, TEXT("Terrain"), TEXT("Terrain")));
+	SM->GetStaticMaterials().Add(GenRuntimeMaterialSlot(Material, TEXT("Terrain")));
 	UStaticMesh::FBuildMeshDescriptionsParams Params;
 	Params.bFastBuild = true;
 	Params.bBuildSimpleCollision = false;
@@ -346,6 +446,13 @@ void UGenTerrainComponent::BuildChunk(const FGenMapData& Map, int32 X0, int32 Y0
 	Params.bMarkPackageDirty = false;
 	SM->BuildFromMeshDescriptions({ &MD }, Params);
 
+	if (Chunks.IsValidIndex(ReplaceIndex) && Chunks[ReplaceIndex])
+	{
+		// (The same component, a new mesh: nothing of the old one is left on screen for a frame.)
+		Chunks[ReplaceIndex]->SetStaticMesh(SM);
+		Chunks[ReplaceIndex]->SetMaterial(0, Material);
+		return;
+	}
 	UStaticMeshComponent* C = NewObject<UStaticMeshComponent>(GetOwner() ? (UObject*)GetOwner() : (UObject*)this, NAME_None, RF_Transient);
 	C->SetStaticMesh(SM);
 	C->SetMaterial(0, Material);
@@ -354,4 +461,5 @@ void UGenTerrainComponent::BuildChunk(const FGenMapData& Map, int32 X0, int32 Y0
 	C->SetupAttachment(this);
 	C->RegisterComponent();
 	Chunks.Add(C);
+	ChunkRects.Add(FIntRect(X0, Y0, X1, Y1));
 }

@@ -3,6 +3,7 @@
 // is decided by the original skirmish scripts (GenSkirmishScripts.cpp).
 
 #include "Logic/GenSkirmishAI.h"
+#include "Core/GenPerf.h"
 #include "Logic/GenCommandData.h"
 #include "Logic/GenGameData.h"
 #include "Logic/GenGameLogic.h"
@@ -94,10 +95,9 @@ void FGenSkirmishAI::AdjustBuildList()
 	// AISkirmishPlayer::adjustBuildList: the layout is given around its command center; ours replaces
 	// the one the game start placed, and everything else moves (and turns) with it.
 	FGenObject* Start = nullptr;
-	for (FGenObjectID Id : Logic->GetObjectIDs())
+	for (FGenObject* O : Logic->GetObjectsOf(Player))
 	{
-		FGenObject* O = Logic->FindObject(Id);
-		if (O && O->GetOwner() == Player && O->IsKindOf(TEXT("COMMANDCENTER")))
+		if (O->IsKindOf(TEXT("COMMANDCENTER")))
 		{
 			Start = O;
 			break;
@@ -181,18 +181,22 @@ void FGenSkirmishAI::ComputeCenterAndRadiusOfBase()
 
 void FGenSkirmishAI::Update(uint32 InFrame)
 {
+	GEN_PERF_SCOPE("AI");
 	Frame = InFrame;
 	PurgeDeadMembers();
 
 	// ScriptEngine::update
 	UpdateScripts();
+	Logic->SimYield(TEXT("a computer player's team states"));
 
 	// AIPlayer::update
 	DoUpgradesAndSkills();
 	DoBaseBuilding();
+	Logic->SimYield(TEXT("a computer player's base building"));
 	CheckReadyTeams();
 	CheckQueuedTeams();
 	DoTeamBuilding();
+	Logic->SimYield(TEXT("a computer player's team building"));
 
 	// Player::update: teams run their generic scripts.
 	UpdateGenericScripts();
@@ -269,10 +273,9 @@ void FGenSkirmishAI::ProcessBaseBuilding()
 				bPowerUnderConstruction |= bIsPower;
 				// Make sure a dozer is working on it.
 				bool bHasBuilder = false;
-				for (FGenObjectID Id : Logic->GetObjectIDs())
+				for (const FGenObject* D : Logic->GetObjectsOf(Player))
 				{
-					const FGenObject* D = Logic->FindObject(Id);
-					if (IsAlive(D) && D->GetOwner() == Player && D->GetBuildTarget() == Bldg->GetID())
+					if (IsAlive(D) && D->GetBuildTarget() == Bldg->GetID())
 					{
 						bHasBuilder = true;
 						break;
@@ -396,7 +399,7 @@ bool FGenSkirmishAI::FindPlaceToBuild(const FGenThingTemplate& Thing, float Angl
 FGenObject* FGenSkirmishAI::BuildStructureWithDozer(FGenBuildListInfo& Info)
 {
 	FGenObject* Dozer = FindDozer(Info.Location);
-	if (!Dozer || GetMoney() < int32(Info.Template->BuildCost))
+	if (!Dozer || GetMoney() < Logic->CalcCostToBuild(Player, *Info.Template))
 	{
 		return nullptr;
 	}
@@ -480,21 +483,23 @@ bool FGenSkirmishAI::IsLocationSafe(const FVector3f& Pos, const FGenThingTemplat
 {
 	// AIPlayer::isLocationSafe: no enemies (other than harvesters and dozers) near the spot.
 	const float Radius = FGenAIData::Get().SupplyCenterSafeRadius + Thing.GetBoundingCircleRadius();
-	for (FGenObjectID Id : Logic->GetObjectIDs())
+	// (Only what stands near the spot is looked at: the building list asks this for every building on it.)
+	bool bSafe = true;
+	Logic->GetPartition().ForEachInRange(FVector2f(Pos.X, Pos.Y), Radius, [&](FGenObject& Near)
 	{
-		const FGenObject* O = Logic->FindObject(Id);
-		if (!IsAlive(O) || O->IsProjectile() || Logic->GetRelationship(Player, O->GetOwner()) != EGenRelationship::Enemies
-			|| O->IsKindOf(TEXT("HARVESTER")) || O->IsKindOf(TEXT("DOZER")) || !O->IsTargetable())
+		const FGenObject* O = &Near;
+		if (!bSafe || !IsAlive(O) || O->IsProjectile() || Logic->GetRelationship(Player, O->GetOwner()) != EGenRelationship::Enemies
+			|| O->IsKindOf(TEXT("HARVESTER")) || O->IsKindOf(TEXT("DOZER")) || !O->IsAttackable())
 		{
-			continue;
+			return;
 		}
 		const float Reach = Radius + O->GetTemplate()->GetBoundingCircleRadius();
 		if (FVector2f::DistSquared(FVector2f(O->GetPosition().X, O->GetPosition().Y), FVector2f(Pos.X, Pos.Y)) <= Reach * Reach)
 		{
-			return false;
+			bSafe = false;
 		}
-	}
-	return true;
+	});
+	return bSafe;
 }
 
 FGenObject* FGenSkirmishAI::FindSupplyCenter(int32 MinimumCash)
@@ -715,10 +720,9 @@ FGenObject* FGenSkirmishAI::FindDozer(const FVector3f& Pos)
 	FGenObject* Closest = nullptr;
 	float ClosestDistSq = 0.f;
 	bool bNeedDozer = true;
-	for (FGenObjectID Id : Logic->GetObjectIDs())
+	for (FGenObject* O : Logic->GetObjectsOf(Player))
 	{
-		FGenObject* O = Logic->FindObject(Id);
-		if (!IsAlive(O) || O->GetOwner() != Player || !O->GetTemplate()->bIsDozer)
+		if (!IsAlive(O) || !O->GetTemplate()->bIsDozer)
 		{
 			continue;
 		}
@@ -857,10 +861,9 @@ bool FGenSkirmishAI::StartTraining(FGenWorkOrder& Order, bool bBusyOK)
 int32 FGenSkirmishAI::CountGatherers(FGenObjectID Center, bool bRedock)
 {
 	int32 Count = 0;
-	for (FGenObjectID Id : Logic->GetObjectIDs())
+	for (FGenObject* O : Logic->GetObjectsOf(Player))
 	{
-		FGenObject* O = Logic->FindObject(Id);
-		if (!IsAlive(O) || O->GetOwner() != Player || !IsGathererType(*O->GetTemplate()))
+		if (!IsAlive(O) || !IsGathererType(*O->GetTemplate()))
 		{
 			continue;
 		}
@@ -933,10 +936,9 @@ void FGenSkirmishAI::QueueSupplyTruck()
 		}
 		// Gatherers that lost their supply center join this one.
 		bool bAdopted = false;
-		for (FGenObjectID Id : Logic->GetObjectIDs())
+		for (FGenObject* O : Logic->GetObjectsOf(Player))
 		{
-			FGenObject* O = Logic->FindObject(Id);
-			if (IsAlive(O) && O->GetOwner() == Player && IsGathererType(*O->GetTemplate()) && !IsAlive(Logic->FindObject(O->PreferredDock))
+			if (IsAlive(O) && IsGathererType(*O->GetTemplate()) && !IsAlive(Logic->FindObject(O->PreferredDock))
 				&& (O->GetSupplyState() == EGenSupplyState::Wanting || O->GetSupplyState() == EGenSupplyState::Docking
 					|| O->GetSupplyState() == EGenSupplyState::Regrouping || O->bForceWanting))
 			{
@@ -1535,7 +1537,7 @@ bool FGenSkirmishAI::DoCommandButton(FGenObject& Obj, const FGenCommandButton& B
 	case EGenCommand::ObjectUpgrade:
 	{
 		const FGenUpgradeTemplate* Upgrade = FGenUpgradeData::Get().FindUpgrade(Button.Upgrade);
-		// (An object upgrade whose effect isn't there yet -- drones, the Overlord's add-ons -- would be money for nothing.)
+		// (An object upgrade whose effect isn't there yet would be money for nothing.)
 		return Upgrade && (!Upgrade->bObjectUpgrade || Obj.HasPortedUpgradeEffect(*Upgrade)) && Logic->QueueUpgrade(Obj, *Upgrade);
 	}
 	case EGenCommand::UnitBuild:
@@ -1543,6 +1545,13 @@ bool FGenSkirmishAI::DoCommandButton(FGenObject& Obj, const FGenCommandButton& B
 		const FGenThingTemplate* Thing = FGenGameData::Get().FindTemplate(Button.Object);
 		return Thing && Logic->QueueUnit(Obj, *Thing);
 	}
+	case EGenCommand::HackInternet:
+		if (!Obj.GetTemplate()->HackInternet.bValid || Obj.IsContained())
+		{
+			return false;
+		}
+		Obj.CommandHackInternet();
+		return true;
 	default:
 		return false;
 	}
@@ -1553,10 +1562,9 @@ int32 FGenSkirmishAI::GetPlayerSuperweaponValue(const FVector2f& Center, int32 E
 	// AIPlayer::getPlayerSuperweaponValue: what the enemy has around that spot is worth, things near the middle counting most.
 	Radius = FMath::Max(Radius, 4.f * GenLogic::PathfindCellSize);
 	float Cash = 0.f;
-	for (FGenObjectID Id : Logic->GetObjectIDs())
+	for (const FGenObject* O : Logic->GetObjectsOf(EnemyIndex))
 	{
-		const FGenObject* O = Logic->FindObject(Id);
-		if (!IsAlive(O) || O->GetOwner() != EnemyIndex || O->IsProjectile())
+		if (!IsAlive(O) || O->IsProjectile())
 		{
 			continue;
 		}
@@ -1599,10 +1607,9 @@ bool FGenSkirmishAI::ComputeSuperweaponTarget(bool bTargetMilitaryUnits, int32 E
 	// AIPlayer::computeSuperweaponTarget: a coarse grid over the enemy's base, then a finer look around the best cell.
 	FBox2f Bounds(ForceInit);
 	bool bHasStructures = false;
-	for (FGenObjectID Id : Logic->GetObjectIDs())
+	for (const FGenObject* O : Logic->GetObjectsOf(EnemyIndex))
 	{
-		const FGenObject* O = Logic->FindObject(Id);
-		if (IsAlive(O) && O->GetOwner() == EnemyIndex && O->IsKindOf(TEXT("STRUCTURE")))
+		if (IsAlive(O) && O->IsKindOf(TEXT("STRUCTURE")))
 		{
 			Bounds += FVector2f(O->GetPosition().X, O->GetPosition().Y);
 			bHasStructures = true;
@@ -1630,6 +1637,7 @@ bool FGenSkirmishAI::ComputeSuperweaponTarget(bool bTargetMilitaryUnits, int32 E
 	FVector2f BestPos = Bounds.Min;
 	for (int32 x = 0, XIndex = XStart; x < XCount; ++x, XIndex += XDelta)
 	{
+		Logic->SimYield(TEXT("a superweapon's target"));
 		for (int32 y = 0, YIndex = YStart; y < YCount; ++y, YIndex += YDelta)
 		{
 			const FVector2f Pos(Bounds.Min.X + Size.X * XIndex / XCount, Bounds.Min.Y + Size.Y * YIndex / YCount);
@@ -1648,6 +1656,7 @@ bool FGenSkirmishAI::ComputeSuperweaponTarget(bool bTargetMilitaryUnits, int32 E
 	Cash = -1;
 	for (int32 x = 0; x < 11; ++x)
 	{
+		Logic->SimYield(TEXT("a superweapon's target"));
 		for (int32 y = 0; y < 11; ++y)
 		{
 			const FVector2f Pos(BestPos.X + (x - 5) * (WeaponRadius / 10.f), BestPos.Y + (x - 5) * (WeaponRadius / 10.f));
@@ -1694,6 +1703,17 @@ void FGenSkirmishAI::FireSpecialPowerAtMostCost(const FString& PowerName)
 	{
 		return;
 	}
+	// "We've already calculated the sweet spot, but we need to modify that position if we can't place it in
+	// the current location" (Player::calcClosestConstructionZoneLocation, for the sneak attack's tunnel).
+	const FString& ReferenceName = Source->GetTemplate()->PowerModules[Module].ReferenceObject;
+	if (const FGenThingTemplate* Reference = ReferenceName.IsEmpty() ? nullptr : FGenGameData::Get().FindTemplate(ReferenceName))
+	{
+		if (!Logic->IsLocationLegalToBuild(*Reference, Location, Reference->PlacementViewAngle)
+			&& !FindPlaceToBuild(*Reference, Reference->PlacementViewAngle, 40.f * GenLogic::PathfindCellSize, Location))
+		{
+			return;
+		}
+	}
 	// (A power aimed at a building -- the cash hack -- takes the supply center nearest that spot.)
 	FGenObjectID TargetObject = GenInvalidObjectID;
 	if (Source->GetTemplate()->PowerModules[Module].Type == EGenPowerModule::CashHack)
@@ -1722,10 +1742,9 @@ void FGenSkirmishAI::FireSpecialPowerAtMostCost(const FString& PowerName)
 void FGenSkirmishAI::GetPlayerStructureBounds(int32 PlayerIndex, FBox2f& OutBounds) const
 {
 	OutBounds = FBox2f(ForceInit);
-	for (FGenObjectID Id : Logic->GetObjectIDs())
+	for (const FGenObject* O : Logic->GetObjectsOf(PlayerIndex))
 	{
-		const FGenObject* O = Logic->FindObject(Id);
-		if (IsAlive(O) && O->GetOwner() == PlayerIndex && O->IsKindOf(TEXT("STRUCTURE")))
+		if (IsAlive(O) && O->IsKindOf(TEXT("STRUCTURE")))
 		{
 			OutBounds += FVector2f(O->GetPosition().X, O->GetPosition().Y);
 		}
@@ -1743,10 +1762,9 @@ void FGenSkirmishAI::AcquireEnemy()
 	const TArray<FGenPlayer>& Players = Logic->GetPlayers();
 	auto HasObjects = [this](int32 P, bool bStructuresOnly)
 	{
-		for (FGenObjectID Id : Logic->GetObjectIDs())
+		for (const FGenObject* O : Logic->GetObjectsOf(P))
 		{
-			const FGenObject* O = Logic->FindObject(Id);
-			if (IsAlive(O) && O->GetOwner() == P && O->IsTargetable() && (!bStructuresOnly || O->GetTemplate()->bHasProduction))
+			if (IsAlive(O) && O->IsTargetable() && (!bStructuresOnly || O->GetTemplate()->bHasProduction))
 			{
 				return true;
 			}
@@ -2000,14 +2018,13 @@ FGenObject* FGenSkirmishAI::TryToRecruit(const FGenTeam& ForTeam, const FGenThin
 	const int32 MyPriority = Protos.IsValidIndex(ForTeam.Proto) ? Protos[ForTeam.Proto].ProductionPriority : 0;
 	FGenObject* Recruit = nullptr;
 	float DistSq = MaxDist * MaxDist;
-	for (FGenObjectID Id : Logic->GetObjectIDs())
+	for (FGenObject* O : Logic->GetObjectsOf(Player))
 	{
-		FGenObject* O = Logic->FindObject(Id);
-		if (!IsAlive(O) || O->GetOwner() != Player || O->GetTemplate()->Canonical() != Thing.Canonical() || O->IsUnderConstruction())
+		if (!IsAlive(O) || O->GetTemplate()->Canonical() != Thing.Canonical() || O->IsUnderConstruction())
 		{
 			continue;
 		}
-		const int32 TeamId = GetObjectTeam(Id);
+		const int32 TeamId = GetObjectTeam(O->GetID());
 		if (TeamId == ForTeam.Id)
 		{
 			continue;
@@ -2052,6 +2069,7 @@ FGenObject* FGenSkirmishAI::TryToRecruit(const FGenTeam& ForTeam, const FGenThin
 
 void FGenSkirmishAI::UpdateTeamStates()
 {
+	GEN_PERF_SCOPE("AI.Teams");
 	// TeamPrototype::updateState / Team::updateState: on-create, on-destroyed and on-idle scripts;
 	// active teams without members are removed.
 	TArray<int32, TInlineAllocator<32>> TeamIds;
@@ -2122,6 +2140,7 @@ void FGenSkirmishAI::UpdateTeamStates()
 
 void FGenSkirmishAI::UpdateGenericScripts()
 {
+	GEN_PERF_SCOPE("AI.GenericScripts");
 	// Team::updateGenericScripts: every team instance tries its generic scripts each frame.
 	for (int32 t = 0; t < Teams.Num(); ++t)
 	{

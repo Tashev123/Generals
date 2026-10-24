@@ -5,6 +5,7 @@
 // calculateMaxBlockedSpeed, SquishCollide and the crush test of PhysicsBehavior::checkForOverlapCollision.
 
 #include "Logic/GenGameLogic.h"
+#include "Core/GenPerf.h"
 #include "Logic/GenGameData.h"
 #include "Logic/GenObject.h"
 #include "Logic/GenPathfinder.h"
@@ -36,12 +37,17 @@ bool FGenObject::CanCrushOrSquish(const FGenObject& Other) const
 	return Other.Template->bSquishable || Template->CrusherLevel > Other.Template->CrushableLevel;
 }
 
-void FGenObject::TryCrush(FGenObject& Other) const
+void FGenObject::TryCrush(FGenObject& Other)
 {
 	// Unless I am moving right now, I may not crush anything.
 	if (!CanCrushOrSquish(Other) || (FMath::Abs(Velocity.X) < 0.01f && FMath::Abs(Velocity.Y) < 0.01f))
 	{
 		return;
+	}
+	// "ok, add this to our list-of-overlapped-things" (addOverlap: the body rides up over it).
+	if (Other.GetID() != CurrentOverlap)
+	{
+		CurrentOverlap = Other.GetID();
 	}
 	const FVector2f To(Other.Position.X - Position.X, Other.Position.Y - Position.Y);
 	bool bCrush;
@@ -52,13 +58,35 @@ void FGenObject::TryCrush(FGenObject& Other) const
 	}
 	else
 	{
-		// Vehicles are flattened once the crusher's center has driven past theirs.
+		// PhysicsBehavior::checkForOverlapCollision: a vehicle has three crush points - its middle and, half
+		// its length out, its front and its back. The one whose line the crusher's course passes closest to
+		// is the one it is going for ("perpsLogicallyEqual": on a tie, the nearer), and the vehicle is
+		// flattened once the crusher's center has driven past that point, close by.
 		const FVector2f Dir = GetDirection2D();
 		const float Offset = Other.Template->GeometryMajorRadius * 0.5f;
-		bCrush = (Dir.X * To.X + Dir.Y * To.Y) < 0.f && To.SizeSquared() < 2.25f * Offset * Offset;
+		const FVector2f OtherDir = Other.GetDirection2D();
+		const FVector2f Points[3] = { To, To + OtherDir * Offset, To - OtherDir * Offset }; // middle, front, back - from the crusher
+		float Perp[3], Dist[3];
+		for (int32 i = 0; i < 3; ++i)
+		{
+			const float Along = Points[i].X * Dir.X + Points[i].Y * Dir.Y;
+			Perp[i] = (Dir * Along - Points[i]).Size();
+			Dist[i] = Points[i].Size();
+		}
+		int32 Aim = 0;
+		for (int32 i = 1; i < 3; ++i)
+		{
+			const bool bEqual = FMath::Abs(Perp[i] - Perp[Aim]) <= 0.15f;
+			if (bEqual ? Dist[i] < Dist[Aim] : Perp[i] < Perp[Aim])
+			{
+				Aim = i;
+			}
+		}
+		bCrush = (Dir.X * Points[Aim].X + Dir.Y * Points[Aim].Y) < 0.f && Points[Aim].SizeSquared() < 2.25f * Offset * Offset;
 	}
 	if (bCrush)
 	{
+		Other.CrushedBy = ID;
 		Other.Kill(TEXT("CRUSHED"));
 	}
 }
@@ -98,7 +126,12 @@ float FGenObject::CalculateMaxBlockedSpeed(const FGenObject& Other) const
 	{
 		return CurMaxBlockedSpeed;
 	}
-	return FMath::Min(AwaySpeed / Towards, CurMaxBlockedSpeed);
+	float MaxSpeed = AwaySpeed / Towards;
+	if (Other.FormationID != 0 && FormationID == Other.FormationID)
+	{
+		MaxSpeed *= 0.55f; // "don't let formations crowd each other."
+	}
+	return FMath::Min(MaxSpeed, CurMaxBlockedSpeed);
 }
 
 bool FGenObject::NeedToRotate() const
@@ -215,6 +248,13 @@ void FGenObject::MoveToFreeGround()
 {
 	// Pathfinder::adjustToPossibleDestination + aiMoveToPosition: shuffle over to the nearest free spot
 	// (one we can still shoot from, if we are attacking something).
+	if (!bFlies && Logic->ShouldQueuePath())
+	{
+		FPendingPath Request;
+		Request.Kind = FPendingPath::FreeGround;
+		DeferPath(Request);
+		return;
+	}
 	const FGenObject* Target = TargetID != GenInvalidObjectID ? Logic->FindObject(TargetID) : nullptr;
 	const int32 Slot = Target ? ChooseWeapon(*Target) : INDEX_NONE;
 	const float Range = Slot != INDEX_NONE ? GetAttackRange(*Weapons[Slot].Template) : 0.f;
@@ -278,7 +318,7 @@ void FGenObject::ProcessCollision(FGenObject& Other)
 {
 	// AIUpdateInterface::processCollision
 	const uint32 Frame = Logic->GetFrame();
-	if (IgnoreCollisionsUntil > Frame)
+	if (IgnoreCollisionsUntil > Frame || Other.ID == IgnoreObstacle)
 	{
 		return;
 	}
@@ -335,6 +375,7 @@ void FGenObject::ProcessCollision(FGenObject& Other)
 
 void UGenGameLogic::UpdateCollisions()
 {
+	GEN_PERF_SCOPE("Collisions");
 	// PartitionManager collision pass: find overlapping pairs of ground units with a coarse hash grid.
 	constexpr float Bucket = 64.f;
 	struct FEntry { FGenObject* Obj; FVector2f Pos; float Radius; };
@@ -348,13 +389,17 @@ void UGenGameLogic::UpdateCollisions()
 		}
 		const FVector2f Pos(O->GetPosition().X, O->GetPosition().Y);
 		// Parked units hold their cells; moving ones only their destination.
-		Pathfinder.UpdateUnitPos(Id, Pos, O->GetTemplate()->GetBoundingCircleRadius(), O->IsMoving());
+		Pathfinder.UpdateUnitPos(Id, Pos, O->GetTemplate()->GetBoundingCircleRadius(), O->IsMoving(), O->GetLayer());
 		Units.Add({ O, Pos, O->GetTemplate()->GetBoundingCircleRadius() });
 	}
 
 	TMap<FIntPoint, TArray<int32, TInlineAllocator<8>>> Grid;
 	for (int32 i = 0; i < Units.Num(); ++i)
 	{
+		if ((i & 63) == 63)
+		{
+			SimYield(TEXT("collisions"));
+		}
 		const FEntry& A = Units[i];
 		const FIntPoint Cell(FMath::FloorToInt32(A.Pos.X / Bucket), FMath::FloorToInt32(A.Pos.Y / Bucket));
 		for (int32 DY = -1; DY <= 1; ++DY)
@@ -374,6 +419,11 @@ void UGenGameLogic::UpdateCollisions()
 					const float Reach = A.Radius + B.Radius;
 					if (FVector2f::DistSquared(A.Pos, B.Pos) > Reach * Reach || A.Obj->IsDead() || B.Obj->IsDead()
 						|| !A.Obj->GeometryOverlaps(*B.Obj, 1.f))
+					{
+						continue;
+					}
+					// One on a bridge and one under it don't meet.
+					if (A.Obj->GetLayer() != B.Obj->GetLayer() && FMath::Abs(A.Obj->GetPosition().Z - B.Obj->GetPosition().Z) > 10.f)
 					{
 						continue;
 					}

@@ -5,6 +5,8 @@
 #include "Logic/GenGameLogic.h"
 #include "Logic/GenGameData.h"
 #include "Logic/GenObject.h"
+#include "Audio/GenAudioManager.h"
+#include "Audio/GenAudioData.h"
 #include "W3D/GenAssets.h"
 #include "Generals1.h"
 
@@ -540,7 +542,11 @@ void FGenObject::ChooseLocomotorSet(const TCHAR* SetName)
 				if (New) { break; }
 			}
 		}
-		if (New) { break; }
+		if (New)
+		{
+			bLocoSupersonic = Try == TEXT("SET_SUPERSONIC");
+			break;
+		}
 	}
 	if (!New || New == Locomotor)
 	{
@@ -877,6 +883,15 @@ void FGenObject::UpdateJet(uint32 Frame)
 	{
 		JetAttackLocoExpireFrame = 0;
 	}
+	// AttackersMissPersistTime: "how long after our attack we continue immunity"
+	if (TargetID != GenInvalidObjectID)
+	{
+		JetAttackersMissExpireFrame = Frame + uint32(Template->JetAttackersMissPersistTime);
+	}
+	else if (JetAttackersMissExpireFrame != 0 && Frame >= JetAttackersMissExpireFrame)
+	{
+		JetAttackersMissExpireFrame = 0;
+	}
 	if (bJetAllowAirLoco && (!Template->JetAttackLocoSet.IsEmpty() || !Template->JetReturnLocoSet.IsEmpty()))
 	{
 		ChooseLocomotorSet(TEXT("SET_NORMAL"));
@@ -1081,6 +1096,8 @@ FGenObject::EJetResult FGenObject::JetEnterState(uint32 Frame)
 			return EJetResult::Failure;
 		}
 		JetCheckAirfield = GenLogic::GetLogicFPS();
+		// "Play the "low fuel" voice whenever the craft is circling above the airfield."
+		Logic->PlayObjectSound(*this, { TEXT("VoiceLowFuel") });
 		return EJetResult::Continue;
 
 	case S::TakeoffAwaitClearance:
@@ -1104,6 +1121,10 @@ FGenObject::EJetResult FGenObject::JetEnterState(uint32 Frame)
 		bJetTakeoffInProgress = !bToParking;
 		bJetLandingInProgress = bToParking;
 		bJetTaxiInProgress = true;
+		if (bToParking)
+		{
+			ReloadCountermeasures(); // "Instantly reload flares."
+		}
 		bJetAllowAirLoco = false;
 		ChooseLocomotorSet(TEXT("SET_TAXIING"));
 		if (!PP)
@@ -1163,6 +1184,7 @@ FGenObject::EJetResult FGenObject::JetEnterState(uint32 Frame)
 	case S::Landing:
 	{
 		const bool bLanding = JetState == S::Landing;
+		bJetLandingSoundPlayed = false;
 		bJetTakeoffInProgress = !bLanding;
 		bJetLandingInProgress = bLanding;
 		bJetAllowAirLoco = true;
@@ -1384,6 +1406,12 @@ FGenObject::EJetResult FGenObject::JetUpdateState(uint32 Frame)
 		if (JetState == S::Landing)
 		{
 			LocoMaxLift = BigLift;
+			if (!bJetLandingSoundPlayed && Position.Z - 0.25f <= Logic->GetGroundHeight(Position.X, Position.Y))
+			{
+				// "zPos - zSlop <= groundZ": the wheels touch the runway (MiscAudio's AircraftWheelScreech).
+				bJetLandingSoundPlayed = true;
+				Logic->PlaySoundAt(FGenAudioData::Get().GetMisc(TEXT("AircraftWheelScreech")), *this);
+			}
 			// The approach and the roll-out are flown as slowly as the plane can.
 			return JetFollowPath(Frame, Locomotor->MinSpeed) ? EJetResult::Success : EJetResult::Continue;
 		}
@@ -1641,6 +1669,12 @@ void FGenObject::UpdateJetDying(uint32 Frame)
 
 // ---- helicopters: shot down (HelicopterSlowDeathBehavior) ---------------------------------------
 
+namespace
+{
+	/** The audio manager's slot for the sound of a helicopter going down (0 move, 1 ambient, 2-4 weapons). */
+	constexpr int32 HeliDeathSoundSlot = 5;
+}
+
 bool FGenObject::BeginHeliDeath(uint32 Frame)
 {
 	const FGenHeliDeath& H = Template->HeliDeath;
@@ -1656,9 +1690,17 @@ bool FGenObject::BeginHeliDeath(uint32 Frame)
 	bHeliSpinTowardsMax = true;
 	HeliLastSpinFrame = Frame;
 	HeliBladeFrames = Logic->GetRandom().RandRange(H.MinBladeFlyOffDelay, FMath::Max(H.MinBladeFlyOffDelay, H.MaxBladeFlyOffDelay));
+	// "The fall of the helicopter": the locomotor is left with only so much lift against gravity.
+	LocoMaxLift = -FGenGameData::Get().Gravity * (1.f - H.FallHowFast);
+	bLocoPreciseZ = false;
+	bLocoUltraAccurate = false;
 	if (!H.AttachParticle.IsEmpty())
 	{
 		Logic->AttachParticleSystem(H.AttachParticle, ID);
+	}
+	if (UGenAudioManager* Audio = Logic->GetAudio())
+	{
+		Audio->SetObjectLoop(ID, HeliDeathSoundSlot, H.SoundDeathLoop);
 	}
 	return true;
 }
@@ -1687,8 +1729,13 @@ void FGenObject::UpdateHeliDying(uint32 Frame)
 		const float Drag = 1.f - FMath::Clamp(LateralFriction, 0.01f, 0.99f);
 		Velocity.X *= Drag;
 		Velocity.Y *= Drag;
-		Velocity.Z += FGenGameData::Get().Gravity * FMath::Max(H.FallHowFast, 0.f);
+		// Gravity, against what lift the locomotor still gives: all it has left while the helicopter is
+		// sinking (so it comes down at FallHowFast of gravity), none while it is still on its way up.
+		const float Gravity = FGenGameData::Get().Gravity;
+		Velocity.Z += Gravity + ((Locomotor && Locomotor->UsesLift()) ? CalcLiftToUse() : -Gravity * (1.f - FMath::Max(H.FallHowFast, 0.f)));
 		Position += Velocity;
+		UE_CLOG(Logic->IsTracing() && Frame % 30 == 0, LogGenerals, Log, TEXT("  [jet f%u] #%u %s going down: %.0f above the ground, %.2f a frame"), Frame, ID, *Template->Name,
+			Position.Z - Logic->GetGroundHeight(Position.X, Position.Y), Velocity.Z);
 
 		if (HeliBladeFrames > 0 && --HeliBladeFrames == 0)
 		{
@@ -1703,6 +1750,11 @@ void FGenObject::UpdateHeliDying(uint32 Frame)
 			}
 			Logic->DoFXPos(H.FXBlade, BladePos, nullptr, 0.f, nullptr, 0.f);
 			Logic->DoOCL(H.OCLBlade, *this);
+			// "if we have (potentially) a pilot ejection, do it here. ... constrains to veteran-or-better status."
+			if (!H.OCLEjectPilot.IsEmpty() && VeterancyLevel > 0)
+			{
+				EjectPilotBy(H.OCLEjectPilot);
+			}
 			static const int32 SpecialDamaged = GenConditions::Index(TEXT("SPECIAL_DAMAGED"));
 			SetModelCondition(SpecialDamaged, true); // (the model without its rotor)
 		}
@@ -1715,6 +1767,11 @@ void FGenObject::UpdateHeliDying(uint32 Frame)
 			JetGroundFrame = Frame;
 			Logic->DoFXObj(H.FXHitGround, *this);
 			Logic->DoOCL(H.OCLHitGround, *this);
+			if (UGenAudioManager* Audio = Logic->GetAudio())
+			{
+				Audio->SetObjectLoop(ID, HeliDeathSoundSlot, FString());
+			}
+			UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [jet f%u] #%u %s hits the ground"), Frame, ID, *Template->Name);
 			static const int32 SpecialDamaged = GenConditions::Index(TEXT("SPECIAL_DAMAGED"));
 			SetModelCondition(SpecialDamaged, true);
 		}

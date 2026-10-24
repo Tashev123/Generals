@@ -4,6 +4,7 @@
 // ChinookAIUpdate.cpp that lands the helicopter for its passengers.
 
 #include "Logic/GenGameLogic.h"
+#include "Core/GenPerf.h"
 #include "Logic/GenGameData.h"
 #include "Logic/GenObject.h"
 #include "W3D/GenAssets.h"
@@ -62,9 +63,39 @@ namespace
 
 // ---- who may go where ---------------------------------------------------------------------------
 
-const TArray<FGenObjectID>& UGenGameLogic::GetRiders(const FGenObject& Container) const
+const FGenObject& UGenGameLogic::ResolveContainer(const FGenObject& Container) const
+{
+	if (Container.Contain && Container.GetTemplate()->Contain.bOverlord)
+	{
+		const FGenObject* Rider = FindObject(Container.Contain->Portable);
+		if (Rider && Rider->Contain && !Rider->IsDead() && !Rider->IsDestroyed())
+		{
+			return *Rider;
+		}
+	}
+	return Container;
+}
+
+FGenObject* UGenGameLogic::GetPortableRider(const FGenObject& Container) const
+{
+	FGenObject* Rider = Container.Contain ? FindObject(Container.Contain->Portable) : nullptr;
+	return (Rider && !Rider->IsDead() && !Rider->IsDestroyed()) ? Rider : nullptr;
+}
+
+bool UGenGameLogic::ShowsContainPips(const FGenObject& Container) const
+{
+	const FGenObject& Real = ResolveContainer(Container);
+	if (!Real.Contain || (Container.GetTemplate()->Contain.bOverlord && &Real == &Container))
+	{
+		return false;
+	}
+	return Real.GetTemplate()->Contain.bShouldDrawPips && GetContainMax(Real) > 0;
+}
+
+const TArray<FGenObjectID>& UGenGameLogic::GetRiders(const FGenObject& Asked) const
 {
 	static const TArray<FGenObjectID> None;
+	const FGenObject& Container = ResolveContainer(Asked);
 	if (!Container.Contain)
 	{
 		return None;
@@ -76,14 +107,15 @@ const TArray<FGenObjectID>& UGenGameLogic::GetRiders(const FGenObject& Container
 	return Container.Contain->Riders;
 }
 
-int32 UGenGameLogic::GetContainMax(const FGenObject& Container) const
+int32 UGenGameLogic::GetContainMax(const FGenObject& Asked) const
 {
-	const FGenContainData& D = Container.GetTemplate()->Contain;
+	const FGenContainData& D = ResolveContainer(Asked).GetTemplate()->Contain;
 	return D.Type == EGenContainType::Tunnel ? FGenGameData::Get().MaxTunnelCapacity : D.ContainMax;
 }
 
-int32 UGenGameLogic::GetContainCount(const FGenObject& Container) const
+int32 UGenGameLogic::GetContainCount(const FGenObject& Asked) const
 {
+	const FGenObject& Container = ResolveContainer(Asked);
 	return GetRiders(Container).Num() + (Container.Contain ? Container.Contain->ExtraSlotsInUse : 0);
 }
 
@@ -94,6 +126,16 @@ bool UGenGameLogic::IsValidContainerFor(const FGenObject& Container, const FGenO
 	if (D.Type == EGenContainType::None || !Container.Contain)
 	{
 		return false;
+	}
+	const FGenObject& Real = ResolveContainer(Container);
+	if (&Real != &Container)
+	{
+		return IsValidContainerFor(Real, Rider, bCheckCapacity); // (an Overlord with a bunker on it takes what the bunker takes)
+	}
+	if ((D.bHelix || D.bOverlord) && RT.IsKindOf(TEXT("PORTABLE_STRUCTURE")))
+	{
+		// HelixContain::isValidContainerFor (and an Overlord's one slot): there is room for one add-on.
+		return Rider.GetOwner() == Container.GetOwner() && !GetPortableRider(Container);
 	}
 	// OpenContain::isValidContainerFor: the kinds let in, and how the rider stands to the container.
 	if ((D.AllowInsideKindOf.Num() > 0 && !HasAnyKind(RT, D.AllowInsideKindOf)) || HasAnyKind(RT, D.ForbidInsideKindOf))
@@ -146,6 +188,27 @@ bool UGenGameLogic::CanEnterObject(const FGenObject& Unit, const FGenObject& Con
 	{
 		return false;
 	}
+	// (A unit also "enters" what one of its collide modules would like to collide with: a pilot climbs into
+	// a vehicle by his VeterancyCrateCollide.)
+	if (Unit.CanPilotEnter(Container))
+	{
+		return true;
+	}
+	// "Special case for unmanned vehicles. Any infantry unit can take over any unmanned vehicle!"
+	if (Unit.IsKindOf(TEXT("INFANTRY")) && Container.IsUnmanned() && !Unit.IsKindOf(TEXT("REJECT_UNMANNED")))
+	{
+		return true;
+	}
+	// (A hijacker's or a terrorist's way into a vehicle: the enter order is how the original sends them.)
+	if (CanTakeOverVehicle(Unit, Container))
+	{
+		return true;
+	}
+	// (... and a saboteur's into an enemy building.)
+	if (CanSabotage(Unit, Container))
+	{
+		return true;
+	}
 	if (Unit.IsKindOf(TEXT("IGNORED_IN_GUI")) || Unit.IsKindOf(TEXT("MOB_NEXUS")) || Container.IsKindOf(TEXT("IGNORED_IN_GUI")))
 	{
 		return false;
@@ -178,12 +241,124 @@ bool UGenGameLogic::CanEnterObject(const FGenObject& Unit, const FGenObject& Con
 bool UGenGameLogic::IsPassengerAllowedToFire(const FGenObject& Container, const FGenObject& Rider) const
 {
 	const FGenContainData& D = Container.GetTemplate()->Contain;
-	if (!D.bPassengersAllowedToFire || Container.IsDisabled())
+	if (!Container.Contain || Container.IsDisabled())
 	{
 		return false;
 	}
-	// (TransportContain: only the infantry on board shoot out.)
-	return D.Type != EGenContainType::Transport || Rider.IsKindOf(TEXT("INFANTRY"));
+	const bool bInfantry = Rider.IsKindOf(TEXT("INFANTRY"));
+	const FGenObject* Carrier = Container.IsContained() ? FindObject(Container.GetContainedBy()) : nullptr;
+	if (D.bHelix)
+	{
+		// HelixContain: "nested containment voids firing, always"; "riders are always allowed to fire
+		// (gattling cannons)"; "passengers (proper) may only if the flag is true" - and only the soldiers.
+		if (Carrier)
+		{
+			return false;
+		}
+		return Container.Contain->Portable == Rider.GetID() || (bInfantry && Container.Contain->bPassengersFire);
+	}
+	if (D.bOverlord)
+	{
+		// OverlordContain: "only allow infantry, and turrets and such. no vehicles."
+		return !Carrier && (bInfantry || Rider.IsKindOf(TEXT("PORTABLE_STRUCTURE"))) && Container.Contain->bPassengersFire;
+	}
+	if (D.Type == EGenContainType::Transport)
+	{
+		if (!bInfantry)
+		{
+			return false;
+		}
+		// "But wait! I may be riding on an Overlord": then it is the Overlord's say.
+		if (Carrier && Carrier->Contain && (Carrier->GetTemplate()->Contain.bOverlord || Carrier->GetTemplate()->Contain.bHelix))
+		{
+			return IsPassengerAllowedToFire(*Carrier, Rider);
+		}
+	}
+	// OpenContain::isPassengerAllowedToFire: "if we are ourselves contained, our passengers need to check
+	// with them if they get past us".
+	return Container.Contain->bPassengersFire && (!Carrier || IsPassengerAllowedToFireFrom(*Carrier));
+}
+
+bool UGenGameLogic::CanSnipeVehicle(const FGenObject& Sniper, const FGenObject& Target) const
+{
+	return !Target.IsDead() && GetRelationship(Sniper.GetOwner(), Target.GetOwner()) == EGenRelationship::Enemies && Target.IsKindOf(TEXT("VEHICLE"))
+		&& !Target.IsKindOf(TEXT("DRONE")) && !Target.IsAirborneTarget() && !Target.IsUnmanned();
+}
+
+int32 UGenGameLogic::GetNeutralPlayer() const
+{
+	for (int32 i = 0; i < Players.Num(); ++i)
+	{
+		if (Players[i].bNeutral)
+		{
+			return i;
+		}
+	}
+	return INDEX_NONE;
+}
+
+bool UGenGameLogic::IsClearableGarrison(const FGenObject& Building) const
+{
+	const FGenContainData& D = Building.GetTemplate()->Contain;
+	return Building.Contain && D.Type == EGenContainType::Garrison && !D.bImmuneToClearBuildingAttacks && GetContainCount(Building) > 0;
+}
+
+int32 UGenGameLogic::KillGarrisoned(FGenObject& Building, int32 Count, const TArray<FString>& RequiredKindOf, const TArray<FString>& ForbiddenKindOf, FGenObjectID Killer)
+{
+	// DumbProjectileBehavior::projectileHandleCollision / ActiveBody::attemptDamage (DAMAGE_KILL_GARRISONED):
+	// "garrisonable buildings subvert the normal process here".
+	if (!IsClearableGarrison(Building))
+	{
+		return 0;
+	}
+	int32 Killed = 0;
+	const TArray<FGenObjectID> Inside = GetRiders(Building);
+	for (FGenObjectID Id : Inside)
+	{
+		if (Killed >= Count)
+		{
+			break;
+		}
+		FGenObject* R = FindObject(Id);
+		if (!R || R->IsDead())
+		{
+			continue;
+		}
+		bool bKinds = true;
+		for (const FString& K : RequiredKindOf) { bKinds = bKinds && R->IsKindOf(*K); }
+		for (const FString& K : ForbiddenKindOf) { bKinds = bKinds && !R->IsKindOf(*K); }
+		if (bKinds)
+		{
+			R->Kill(TEXT("NORMAL"), Killer); // (scoreTheKill: the killer's side is credited)
+			++Killed;
+		}
+	}
+	UE_CLOG(bTrace && Killed > 0, LogGenerals, Log, TEXT("  [contain f%u] #%u %s cleared: %d killed inside by #%u (%d left)"), Frame, Building.GetID(),
+		*Building.GetTemplate()->Name, Killed, Killer, Inside.Num() - Killed);
+	return Killed;
+}
+
+void UGenGameLogic::OrderRidersToAttack(const FGenObject& Container, FGenObjectID Target, bool bForce)
+{
+	if (!IsPassengerAllowedToFireFrom(Container))
+	{
+		return;
+	}
+	// (OverlordContain::getContainedItemsList: the bunker's soldiers when it carries a bunker, its add-on otherwise.)
+	TArray<FGenObjectID> Who = GetRiders(Container);
+	if (Container.GetTemplate()->Contain.bOverlord && &ResolveContainer(Container) == &Container && Container.Contain->Portable != GenInvalidObjectID)
+	{
+		Who.Add(Container.Contain->Portable);
+	}
+	for (FGenObjectID Id : Who)
+	{
+		FGenObject* R = FindObject(Id);
+		const FGenObject* In = R ? FindObject(R->GetContainedBy()) : nullptr;
+		if (R && In && !R->IsDead() && !R->IsDisabled() && R->HasWeapons() && IsPassengerAllowedToFire(*In, *R))
+		{
+			R->CommandAttack(Target, bForce);
+		}
+	}
 }
 
 // ---- in and out ---------------------------------------------------------------------------------
@@ -212,9 +387,46 @@ void UGenGameLogic::AddToContain(FGenObject& Container, FGenObject& Rider)
 	{
 		return;
 	}
+	// OverlordContain::addToContain: with a bunker on it, whoever comes aboard goes into the bunker.
+	FGenObject& Real = const_cast<FGenObject&>(ResolveContainer(Container));
+	if (&Real != &Container)
+	{
+		AddToContain(Real, Rider);
+		return;
+	}
 	const FGenContainData& D = Container.GetTemplate()->Contain;
+	if ((D.bHelix || D.bOverlord) && Rider.IsKindOf(TEXT("PORTABLE_STRUCTURE")) && !GetPortableRider(Container))
+	{
+		// HelixContain::addToContain / OverlordContain::onContaining: the add-on takes nobody's seat and
+		// rides where everybody sees it ("fool portable into thinking my object is his container").
+		Rider.ClearAttack();
+		Rider.CommandStop();
+		Rider.Velocity = FVector3f::ZeroVector;
+		Pathfinder.RemoveUnit(Rider.GetID());
+		Container.Contain->Portable = Rider.GetID();
+		Rider.ContainedBy = Container.GetID();
+		Rider.ContainedFrame = Frame;
+		Rider.bWantsExit = false;
+		Rider.bHidden = false;
+		Rider.GarrisonPoint = INDEX_NONE;
+		Rider.SetPosition(Container.GetPosition());
+		Rider.SetOrientation(Container.GetOrientation());
+		Rider.SnapshotPrevious();
+		if (D.bExperienceSinkForRider)
+		{
+			Rider.XPSink = Container.GetID(); // "this contain style explicitly sucks XP from our little friend"
+		}
+		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [contain f%u] #%u %s rides on #%u %s"), Frame, Rider.GetID(), *Rider.GetTemplate()->Name,
+			Container.GetID(), *Container.GetTemplate()->Name);
+		return;
+	}
 	const bool bTunnel = D.Type == EGenContainType::Tunnel;
 	if (bTunnel && !Players.IsValidIndex(Container.GetOwner()))
+	{
+		return;
+	}
+	// "Whoops, it was mined": a trap on the building goes off under whoever walks in (unless a friend of the trapper's).
+	if (Container.CheckAndDetonateBoobyTrap(&Rider) && (Container.IsDead() || Rider.IsDead()))
 	{
 		return;
 	}
@@ -246,6 +458,10 @@ void UGenGameLogic::AddToContain(FGenObject& Container, FGenObject& Rider)
 	case EGenContainType::Transport:
 		Container.Contain->ExtraSlotsInUse += Rider.GetTemplate()->TransportSlotCount - 1;
 		Container.SetModelCondition(LoadedBit(), true);
+		if (D.bHelix)
+		{
+			Rider.BonusConditions.AddUnique(GarrisonedBonus); // HelixContain::onContaining: "a garrisoned version of its weapon"
+		}
 		break;
 	case EGenContainType::Garrison:
 		Rider.BonusConditions.AddUnique(GarrisonedBonus);
@@ -254,6 +470,20 @@ void UGenGameLogic::AddToContain(FGenObject& Container, FGenObject& Rider)
 		break;
 	}
 	OnContainChanged(Container);
+	if (bLoadSoundsEnabled)
+	{
+		PlayObjectSound(Container, { TEXT("SoundEnter") });
+		// OpenContain::doLoadSound: the container's own EnterSound, not more than once a frame.
+		if (Container.Contain->LastLoadSoundFrame != Frame)
+		{
+			Container.Contain->LastLoadSoundFrame = Frame;
+			PlayEventForObject(D.EnterSound, Container);
+		}
+	}
+	if (D.bInternetHack)
+	{
+		Rider.CommandHackInternet(); // InternetHackContain::onContaining
+	}
 	UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [contain f%u] #%u %s enters #%u %s (%d / %d)"), Frame, Rider.GetID(), *Rider.GetTemplate()->Name,
 		Container.GetID(), *Container.GetTemplate()->Name, GetContainCount(Container), GetContainMax(Container));
 }
@@ -263,6 +493,19 @@ void UGenGameLogic::RemoveFromContain(FGenObject& Container, FGenObject& Rider)
 	// OpenContain::removeFromContain: the rider is back in the world, where the container is.
 	if (!Container.Contain)
 	{
+		return;
+	}
+	if (Container.Contain->Portable == Rider.GetID())
+	{
+		// HelixContain::removeFromContain (an add-on never gets off; this is its end)
+		Container.Contain->Portable = GenInvalidObjectID;
+		Rider.ContainedBy = GenInvalidObjectID;
+		return;
+	}
+	FGenObject& Real = const_cast<FGenObject&>(ResolveContainer(Container));
+	if (&Real != &Container)
+	{
+		RemoveFromContain(Real, Rider);
 		return;
 	}
 	const FGenContainData& D = Container.GetTemplate()->Contain;
@@ -299,6 +542,15 @@ void UGenGameLogic::RemoveFromContain(FGenObject& Container, FGenObject& Rider)
 		Container.SetModelCondition(LoadedBit(), Riders.Num() > 0);
 	}
 	OnContainChanged(Container);
+	// OpenContain::doUnloadSound: "don't play more than one per frame (we can do meta unload all commands)".
+	if (K.LastUnloadSoundFrame != Frame)
+	{
+		K.LastUnloadSoundFrame = Frame;
+		PlayEventForObject(D.ExitSound, Container);
+	}
+	PlayObjectSound(Container, { TEXT("SoundExit") });
+	// ("This is a misnomer": whatever the rider has for falling from a plane is heard on leaving anything.)
+	PlayObjectSound(Rider, { TEXT("SoundFallingFromPlane") });
 	UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [contain f%u] #%u %s leaves #%u %s (%d / %d)"), Frame, Rider.GetID(), *Rider.GetTemplate()->Name,
 		Container.GetID(), *Container.GetTemplate()->Name, GetContainCount(Container), GetContainMax(Container));
 }
@@ -351,7 +603,7 @@ bool UGenGameLogic::ExitViaDoor(FGenObject& Container, FGenObject& Rider)
 	{
 		return false;
 	}
-	const bool bAirborne = Container.GetPosition().Z - GetGroundHeight(Container.GetPosition().X, Container.GetPosition().Y) > 9.f;
+	const bool bAirborne = Container.GetPosition().Z - Container.GetSurfaceHeight() > 9.f;
 	if ((Container.GetTemplate()->bChinookAI && Container.GetChinookFlight() != EGenChinookFlight::Landed) || (D.bDelayExitInAir && bAirborne))
 	{
 		return false;
@@ -359,8 +611,10 @@ bool UGenGameLogic::ExitViaDoor(FGenObject& Container, FGenObject& Rider)
 	RemoveFromContain(Container, Rider);
 	K.ExitNotBusyFrame = Frame + uint32(D.ExitDelay);
 
-	const uint32 Surfaces = Rider.Locomotor ? Rider.Locomotor->Surfaces : uint32(GenSurface::Ground);
-	const float Radius = Container.GetTemplate()->GetBoundingCircleRadius();
+	const uint32 Surfaces = Rider.GetPathSurfaces();
+	// (What rides on something else lets its people out around that: a bunker on an Overlord.)
+	const FGenObject* Carrier = Container.IsContained() ? FindObject(Container.GetContainedBy()) : nullptr;
+	const float Radius = (Carrier ? Carrier : &Container)->GetTemplate()->GetBoundingCircleRadius();
 	FVector3f Start = Rider.GetPosition(), End = Rider.GetPosition();
 	bool bHavePath = false;
 	UGenAssetSubsystem* Assets = UGenAssetSubsystem::Get();
@@ -438,6 +692,12 @@ void UGenGameLogic::PlaceAtGarrisonPoint(FGenObject& Container, FGenObject& Ride
 	}
 	int32& Index = Rider.GarrisonPoint;
 	const bool bHolds = K.FirePointUsers.IsValidIndex(Index) && K.FirePointUsers[Index] == Rider.GetID();
+	if (!bHolds)
+	{
+		// (The window it remembers went with the building's old look, or somebody else has it now. With
+		// every window taken it then has none - it used to index the windows with "none" here.)
+		Index = INDEX_NONE;
+	}
 	if (!Victim || K.FirePoints.Num() == 0)
 	{
 		if (bHolds)
@@ -459,7 +719,7 @@ void UGenGameLogic::PlaceAtGarrisonPoint(FGenObject& Container, FGenObject& Ride
 			BestDistSq = DistSq;
 		}
 	}
-	if (Best != Index)
+	if (Best != Index && K.FirePointUsers.IsValidIndex(Best))
 	{
 		if (bHolds)
 		{
@@ -475,6 +735,7 @@ void UGenGameLogic::PlaceAtGarrisonPoint(FGenObject& Container, FGenObject& Ride
 
 void UGenGameLogic::UpdateContain(FGenObject& Container)
 {
+	GEN_PERF_SCOPE("Obj.Contain");
 	const FGenContainData& D = Container.GetTemplate()->Contain;
 	FGenContain& K = *Container.Contain;
 	const bool bTunnel = D.Type == EGenContainType::Tunnel;
@@ -488,6 +749,7 @@ void UGenGameLogic::UpdateContain(FGenObject& Container)
 	{
 		K.bPayloadCreated = true;
 		const FGenThingTemplate* Payload = D.InitialPayload.IsEmpty() ? nullptr : FGenGameData::Get().FindTemplate(D.InitialPayload);
+		TGuardValue<bool> NoLoadSounds(bLoadSoundsEnabled, false); // (enableLoadSounds: nobody is heard boarding)
 		for (int32 i = 0; Payload && i < D.InitialPayloadCount; ++i)
 		{
 			FGenObject* Rider = CreateObject(Payload, Container.GetOwner(), Container.GetPosition(), Container.GetOrientation());
@@ -500,17 +762,44 @@ void UGenGameLogic::UpdateContain(FGenObject& Container)
 				Rider->bPendingDestroy = true;
 			}
 		}
+		// OverlordContain / HelixContain::createPayload: "any number of different passengers can be loaded
+		// here at init time".
+		for (const FString& Name : D.PayloadTemplateNames)
+		{
+			const FGenThingTemplate* RiderT = FGenGameData::Get().FindTemplate(Name);
+			FGenObject* Rider = RiderT ? CreateObject(RiderT, Container.GetOwner(), Container.GetPosition(), Container.GetOrientation()) : nullptr;
+			if (Rider && IsValidContainerFor(Container, *Rider, true))
+			{
+				AddToContain(Container, *Rider);
+			}
+			else if (Rider)
+			{
+				Rider->bPendingDestroy = true;
+			}
+		}
 	}
 
+	if (K.Portable != GenInvalidObjectID && !GetPortableRider(Container))
+	{
+		K.Portable = GenInvalidObjectID;
+	}
 	TArray<FGenObjectID>& Riders = bTunnel ? Players[Container.GetOwner()].TunnelRiders : K.Riders;
-	// Riders that died, and units that gave up coming.
+	// Riders that died, and units that gave up coming. (OpenContain::removeFromContain on a rider's death:
+	// a building whose last occupant is killed goes back to its owner, and an armed transport's weapons
+	// to what they were.)
+	bool bLost = false;
 	for (int32 i = Riders.Num() - 1; i >= 0; --i)
 	{
 		const FGenObject* R = FindObject(Riders[i]);
 		if (!R || R->IsDead() || R->IsDestroyed() || !R->IsContained())
 		{
 			Riders.RemoveAt(i);
+			bLost = true;
 		}
+	}
+	if (bLost && !bTunnel)
+	{
+		OnContainChanged(Container);
 	}
 	for (int32 i = K.Wanters.Num() - 1; i >= 0; --i)
 	{
@@ -596,7 +885,7 @@ void UGenGameLogic::OnContainerSold(FGenObject& Container)
 	{
 		if (FGenObject* R = FindObject(Id))
 		{
-			R->ContainedBy = Container.GetID();
+			R->ContainedBy = ResolveContainer(Container).GetID();
 			Container.Contain->ExitNotBusyFrame = 0; // no time to queue at the door
 			if (!ExitViaDoor(Container, *R))
 			{
@@ -643,10 +932,19 @@ void UGenGameLogic::OnContainerDied(FGenObject& Container)
 		return;
 	}
 
+	// HelixContain / OverlordContain::onDie: the add-on goes with what carried it (and a bunker's
+	// soldiers tumble out of the bunker as it does).
+	if (FGenObject* AddOn = GetPortableRider(Container))
+	{
+		Container.Contain->Portable = GenInvalidObjectID;
+		AddOn->Kill();
+	}
+
 	// OpenContain::onDie: the occupants take DamagePercentToUnits of their health, and whoever is left
 	// tumbles out around the wreck.
 	const TArray<FGenObjectID> Riders = Container.Contain->Riders;
-	const float Radius = Container.GetTemplate()->GetBoundingCircleRadius();
+	const FGenObject* Carrier = Container.IsContained() ? FindObject(Container.GetContainedBy()) : nullptr;
+	const float Radius = (Carrier ? Carrier : &Container)->GetTemplate()->GetBoundingCircleRadius();
 	for (FGenObjectID Id : Riders)
 	{
 		FGenObject* R = FindObject(Id);
@@ -680,52 +978,81 @@ void UGenGameLogic::OnContainerDied(FGenObject& Container)
 
 void UGenGameLogic::IssueEnter(const TArray<FGenObjectID>& Units, FGenObjectID ContainerId)
 {
-	PendingCommands.Add([this, Units, ContainerId]()
+	FGenCommand C(EGenCommandType::Enter);
+	C.Units = Units;
+	C.Target = ContainerId;
+	SubmitCommand(MoveTemp(C));
+}
+
+void UGenGameLogic::ExecEnter(const FGenCommand& Cmd)
+{
+	FGenObject* C = FindObject(Cmd.Target);
+	for (FGenObjectID Id : Cmd.Units)
 	{
-		FGenObject* C = FindObject(ContainerId);
-		for (FGenObjectID Id : Units)
+		FGenObject* U = FindObject(Id);
+		if (C && U && CanEnterObject(*U, *C, true))
 		{
-			FGenObject* U = FindObject(Id);
-			if (C && U && CanEnterObject(*U, *C, true))
-			{
-				U->OnPlayerCommand(false);
-				U->CommandEnter(*C);
-			}
+			U->OnPlayerCommand(false);
+			U->CommandEnter(*C);
 		}
-	});
+	}
 }
 
 void UGenGameLogic::IssueExit(FGenObjectID Rider)
 {
-	PendingCommands.Add([this, Rider]()
+	FGenCommand C(EGenCommandType::Exit);
+	C.Units = { Rider };
+	SubmitCommand(MoveTemp(C));
+}
+
+void UGenGameLogic::ExecExit(const FGenCommand& Cmd)
+{
+	for (FGenObjectID Id : Cmd.Units)
 	{
-		if (FGenObject* R = FindObject(Rider))
+		if (FGenObject* R = FindObject(Id))
 		{
 			R->CommandExit();
 		}
-	});
+	}
+}
+
+void UGenGameLogic::EvacuateContainer(const FGenObject& Container)
+{
+	const TArray<FGenObjectID> Riders = GetRiders(Container);
+	for (FGenObjectID Id : Riders)
+	{
+		if (FGenObject* R = FindObject(Id))
+		{
+			R->ContainedBy = ResolveContainer(Container).GetID();
+			R->CommandExit();
+		}
+	}
 }
 
 void UGenGameLogic::IssueEvacuate(FGenObjectID ContainerId)
 {
-	PendingCommands.Add([this, ContainerId]()
+	FGenCommand C(EGenCommandType::Evacuate);
+	C.Units = { ContainerId };
+	SubmitCommand(MoveTemp(C));
+}
+
+void UGenGameLogic::ExecEvacuate(const FGenCommand& Cmd)
+{
+	const FGenObject* C = Cmd.Units.Num() > 0 ? FindObject(Cmd.Units[0]) : nullptr;
+	if (!C || !C->GetContain())
 	{
-		const FGenObject* C = FindObject(ContainerId);
-		if (!C || !C->GetContain())
+		return;
+	}
+	// OpenContain::orderAllPassengersToExit (a tunnel lets out everybody in the network).
+	const TArray<FGenObjectID> Riders = GetRiders(*C);
+	for (FGenObjectID Id : Riders)
+	{
+		if (FGenObject* R = FindObject(Id))
 		{
-			return;
+			R->ContainedBy = ResolveContainer(*C).GetID(); // (out of this tunnel, whichever one they went in by)
+			R->CommandExit();
 		}
-		// OpenContain::orderAllPassengersToExit (a tunnel lets out everybody in the network).
-		const TArray<FGenObjectID> Riders = GetRiders(*C);
-		for (FGenObjectID Id : Riders)
-		{
-			if (FGenObject* R = FindObject(Id))
-			{
-				R->ContainedBy = ContainerId; // (out of this tunnel, whichever one they went in by)
-				R->CommandExit();
-			}
-		}
-	});
+	}
 }
 
 // ---- the units --------------------------------------------------------------------------------------
@@ -735,6 +1062,7 @@ void FGenObject::InitContain()
 	if (Template->Contain.Type != EGenContainType::None)
 	{
 		Contain = MakeUnique<FGenContain>();
+		Contain->bPassengersFire = Template->Contain.bPassengersAllowedToFire;
 	}
 }
 
@@ -754,7 +1082,10 @@ void FGenObject::CommandEnter(FGenObject& Container)
 	bMovingOutOfWay = false;
 	bHasResumeGoal = false;
 	EnterTarget = Container.ID;
-	Container.Contain->Wanters.AddUnique(ID);
+	if (Container.Contain)
+	{
+		Container.Contain->Wanters.AddUnique(ID);
+	}
 	NextRepathFrame = 0;
 	CommandStop();
 }
@@ -805,6 +1136,29 @@ void FGenObject::UpdateEnter(uint32 Frame)
 		}
 		return;
 	}
+	if (CanPilotEnter(*C))
+	{
+		PilotEnterVehicle(*C);
+		return;
+	}
+	if (C->IsUnmanned() && IsKindOf(TEXT("INFANTRY")))
+	{
+		StopEntering();
+		C->ClaimUnmanned(*this);
+		return;
+	}
+	if (Logic->CanTakeOverVehicle(*this, *C))
+	{
+		StopEntering();
+		TakeOverVehicle(*C);
+		return;
+	}
+	if (Logic->CanSabotage(*this, *C))
+	{
+		StopEntering();
+		Logic->SabotageBuilding(*this, *C);
+		return;
+	}
 	if (C->Template->bChinookAI && C->ChinookFlight != EGenChinookFlight::Landed)
 	{
 		if (bMoving)
@@ -840,6 +1194,15 @@ void FGenObject::UpdateContained(uint32 Frame)
 	{
 		Position = C->Position;
 	}
+	if (C->Contain->Portable == ID)
+	{
+		// HelixContain::update / OpenContain::putObjAtNextFirePoint: the add-on faces the way its carrier
+		// does - or the turret it stands on - and looks as battered (onBodyDamageStateChange; nothing can
+		// hurt the add-on itself).
+		Orientation = GenLogic::NormalizeAngle(C->Orientation + (C->Template->Contain.bPassengersInTurret ? C->TurretAngle[0] : 0.f));
+		SetModelCondition(GenConditions::Damaged(), C->ModelConditions.Test(GenConditions::Damaged()));
+		SetModelCondition(GenConditions::ReallyDamaged(), C->ModelConditions.Test(GenConditions::ReallyDamaged()));
+	}
 	if (bMayFire)
 	{
 		UpdateCombat(Frame);
@@ -847,6 +1210,10 @@ void FGenObject::UpdateContained(uint32 Frame)
 	else if (TargetID != GenInvalidObjectID)
 	{
 		ClearAttack();
+	}
+	if (Contain)
+	{
+		Logic->UpdateContain(*this); // (a bunker on an Overlord looks after who is in it)
 	}
 	SnapshotPrevious();
 }
@@ -861,6 +1228,10 @@ void FGenObject::UpdateChinookFlight(uint32 Frame)
 	{
 		const FGenObject* R = Logic->FindObject(Id);
 		bWaiting |= R && R->bWantsExit;
+	}
+	if (CombatDrop)
+	{
+		bWaiting = false; // on its way to a combat drop it lands for nobody
 	}
 	const bool bIdle = IsAIIdle();
 	switch (ChinookFlight)
@@ -889,4 +1260,417 @@ void FGenObject::UpdateChinookFlight(uint32 Frame)
 	bLocoPreciseZ = bDown;
 	bLocoUltraAccurate = bDown;
 	PreciseGoalZ = Ground;
+	if (CombatDrop)
+	{
+		UpdateCombatDropApproach(Frame);
+	}
+}
+
+// ---- the combat drop ------------------------------------------------------------------------------
+
+bool UGenGameLogic::CanCombatDropInto(const FGenObject& Building) const
+{
+	// ActionManager::canEnterObject with COMBATDROP_INTO: "we don't care about valid container-ness, but we
+	// DO care about faction structures... we aren't allowed to combat drop into them".
+	return !Building.IsDead() && !Building.IsDestroyed() && Building.GetContain() && !IsSideStructure(*Building.GetTemplate());
+}
+
+bool UGenGameLogic::HasRappeller(const FGenObject& Container) const
+{
+	// getPotentialRappeller
+	if (!Container.GetTemplate()->bChinookAI || !Container.GetContain())
+	{
+		return false;
+	}
+	for (FGenObjectID Id : GetRiders(Container))
+	{
+		const FGenObject* R = FindObject(Id);
+		if (R && R->IsKindOf(TEXT("CAN_RAPPEL")))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+void UGenGameLogic::IssueCombatDrop(const TArray<FGenObjectID>& Units, FGenObjectID Target, const FVector3f& Pos)
+{
+	FGenCommand C(EGenCommandType::CombatDrop);
+	C.Units = Units;
+	C.Target = Target;
+	C.Pos = Pos;
+	SubmitCommand(MoveTemp(C));
+}
+
+void UGenGameLogic::ExecCombatDrop(const FGenCommand& C)
+{
+	for (FGenObjectID Id : C.Units)
+	{
+		FGenObject* U = FindObject(Id);
+		if (U && !U->IsDead() && U->GetTemplate()->bChinookAI && U->Contain && !(U->CombatDrop && U->CombatDrop->bDropping))
+		{
+			U->OnPlayerCommand(false);
+			U->CommandCombatDrop(FindObject(C.Target), C.Pos);
+		}
+	}
+}
+
+void UGenGameLogic::UpdateFallingRopes()
+{
+	// (W3DRopeDraw::doDrawModule after setRopeSpeed: a rope let go falls, and is gone five seconds later.)
+	for (int32 i = FallingRopes.Num() - 1; i >= 0; --i)
+	{
+		FGenFallingRope& R = FallingRopes[i];
+		R.Top.Z += R.Speed;
+		R.Speed += FGenGameData::Get().Gravity;
+		R.Phase += R.WobbleRate;
+		if (Frame >= R.ExpireFrame)
+		{
+			FallingRopes.RemoveAtSwap(i);
+		}
+	}
+}
+
+void UGenGameLogic::GetVisibleRopes(TArray<FGenRopeDraw>& Out) const
+{
+	for (FGenObjectID Id : ObjectOrder)
+	{
+		const FGenObject* O = Objects[Id].Get();
+		const FGenCombatDrop* Drop = O ? O->GetCombatDrop() : nullptr;
+		if (!Drop || !Drop->bDropping || O->GetLocalShroud() == EGenObjectShroud::Fogged || O->GetLocalShroud() == EGenObjectShroud::Shrouded
+			|| GetStealthLook(*O) == EGenStealthLook::Invisible)
+		{
+			continue;
+		}
+		const FGenThingTemplate& T = *O->GetTemplate();
+		for (const FGenCombatDrop::FRope& Rope : Drop->Ropes)
+		{
+			FGenRopeDraw& D = Out.AddDefaulted_GetRef();
+			D.Top = Rope.Top;
+			D.Len = FMath::Min(Rope.Len, Rope.LenMax);
+			D.LenMax = Rope.LenMax;
+			D.Width = T.ChinookRopeWidth;
+			D.WobbleLen = T.ChinookRopeWobbleLen;
+			D.WobbleAmp = T.ChinookRopeWobbleAmp;
+			D.Phase = Drop->WobblePhase;
+		}
+	}
+	for (const FGenFallingRope& R : FallingRopes)
+	{
+		FGenRopeDraw& D = Out.AddDefaulted_GetRef();
+		D.Top = R.Top;
+		D.Len = D.LenMax = R.Len;
+		D.Width = R.Width;
+		D.WobbleLen = R.WobbleLen;
+		D.WobbleAmp = R.WobbleAmp;
+		D.Phase = R.Phase;
+	}
+}
+
+void FGenObject::CommandCombatDrop(FGenObject* Target, const FVector3f& InPos)
+{
+	// ChinookAIUpdate::privateCombatDrop
+	if (!Template->bChinookAI || !Contain || bDead || !Locomotor)
+	{
+		return;
+	}
+	if (Target && !Logic->CanCombatDropInto(*Target))
+	{
+		return;
+	}
+	FVector3f Pos = Target ? Target->Position : InPos;
+	if (!Target)
+	{
+		// "if target is null, we are dropping at a pos, not into a bldg. in this case, ensure there is no
+		// structure at the pos... this can happen if you combat-drop into a spot in the fog-of-war."
+		Pos = Logic->FindGroundSpotAround(InPos, 0.f, 200.f);
+	}
+	ClearAttack();
+	CommandMoveTo(Pos);
+
+	// ChinookMoveToBldgState::onEnter: over a building, at least MinDropHeight above its roof.
+	CombatDrop = MakeUnique<FGenCombatDrop>();
+	CombatDrop->Target = Target ? Target->ID : GenInvalidObjectID;
+	CombatDrop->Pos = Pos;
+	float Height = Locomotor->PreferredHeight;
+	if (Target && Target->IsKindOf(TEXT("STRUCTURE")))
+	{
+		Height = FMath::Max(Height, Target->Template->GetMaxHeightAbovePosition() + Template->ChinookMinDropHeight);
+	}
+	CombatDrop->DestZ = Logic->GetGroundHeight(Pos.X, Pos.Y) + Height;
+	UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [drop f%u] #%u %s flies to a combat drop at (%.0f, %.0f) height %.0f%s%s"), Logic->GetFrame(), ID, *Template->Name,
+		Pos.X, Pos.Y, Height, Target ? TEXT(" into ") : TEXT(""), Target ? *Target->Template->Name : TEXT(""));
+}
+
+void FGenObject::UpdateCombatDropApproach(uint32 Frame)
+{
+	// ChinookMoveToBldgState: "the normal moveto state will bail when 2d pos matches; we need z, too"
+	FGenCombatDrop& D = *CombatDrop;
+	if (D.Target != GenInvalidObjectID)
+	{
+		const FGenObject* B = Logic->FindObject(D.Target);
+		if (!B || B->bDead || B->bPendingDestroy)
+		{
+			EndCombatDrop(); // the building is gone: nothing to drop into
+			CommandStop();
+			return;
+		}
+	}
+	if (ChinookFlight != EGenChinookFlight::Flying)
+	{
+		return; // still getting off the ground
+	}
+	bLocoPreciseZ = true;
+	bLocoUltraAccurate = true;
+	PreciseGoalZ = D.DestZ;
+	if (!bMoving && !IsWaitingForPath() && FMath::Abs(Position.Z - D.DestZ) <= 3.f)
+	{
+		if (!BeginCombatDrop(Frame))
+		{
+			EndCombatDrop();
+		}
+	}
+}
+
+bool FGenObject::BeginCombatDrop(uint32 Frame)
+{
+	// ChinookCombatDropState::onEnter: a rope for each pair of RopeStart / RopeEnd bones of the model.
+	FGenCombatDrop& D = *CombatDrop;
+	UGenAssetSubsystem* Assets = UGenAssetSubsystem::Get();
+	const FGenDrawModule* Draw = Template->PrimaryDraw();
+	if (!Assets || !Draw)
+	{
+		return false;
+	}
+	const FString Model = Draw->DefaultModel();
+	TArray<FTransform3f> Starts, Ends;
+	const int32 NumStarts = Assets->GetPristineBones(Model, TEXT("RopeStart"), 1, 32, Starts);
+	const int32 NumEnds = Assets->GetPristineBones(Model, TEXT("RopeEnd"), 1, 32, Ends);
+	const int32 NumRopes = FMath::Min3(Template->ChinookNumRopes, NumStarts, NumEnds);
+	if (NumRopes <= 0)
+	{
+		return false;
+	}
+	SetBoxes(0); // "A chinook given combat drop duty also loses his supplies."
+	const FTransform3f Xf = GetTransform();
+	FRandomStream& Rand = Logic->GetRandom();
+	for (int32 i = 0; i < NumRopes; ++i)
+	{
+		FGenCombatDrop::FRope& Rope = D.Ropes.AddDefaulted_GetRef();
+		Rope.Top = Xf.TransformPositionNoScale(Starts[i].GetTranslation());
+		// ("rappeller->setTransformMatrix(&it->dropStartMtx)": the bone gives the soldier its attitude too.)
+		const FTransform3f DropXf = Ends[i] * Xf;
+		Rope.DropStart = DropXf.GetTranslation();
+		Rope.DropRotation = DropXf.GetRotation().GetNormalized();
+		Rope.LenMax = FMath::Max(1.f, Rope.Top.Z - Logic->GetGroundHeight(Rope.Top.X, Rope.Top.Y) - Template->ChinookRopeFinalHeight);
+		Rope.NextDropFrame = Frame + uint32(Rand.RandRange(Template->ChinookRopeDelayMin, FMath::Max(Template->ChinookRopeDelayMin, Template->ChinookRopeDelayMax))
+			- Template->ChinookRopeDelayMin);
+	}
+	D.bDropping = true;
+	ChinookFlight = EGenChinookFlight::CombatDrop;
+	bMoving = false;
+	Path.Reset();
+	Velocity.X = Velocity.Y = 0.f;
+	UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [drop f%u] #%u %s lets down %d ropes of %.0f, %d on board"), Frame, ID, *Template->Name, NumRopes,
+		D.Ropes[0].LenMax, Logic->GetRiders(*this).Num());
+	return true;
+}
+
+void FGenObject::UpdateCombatDrop(uint32 Frame)
+{
+	// ChinookCombatDropState::update
+	FGenCombatDrop& D = *CombatDrop;
+	D.WobblePhase = FMath::Fmod(D.WobblePhase + Template->ChinookRopeWobbleRate, 2.f * PI);
+	bLocoPreciseZ = true;
+	bLocoUltraAccurate = true;
+	PreciseGoalZ = D.DestZ;
+
+	auto NextRappeller = [this]() -> FGenObject*
+	{
+		for (FGenObjectID Id : Logic->GetRiders(*this))
+		{
+			FGenObject* R = Logic->FindObject(Id);
+			if (R && !R->bDead && R->IsKindOf(TEXT("CAN_RAPPEL")))
+			{
+				return R;
+			}
+		}
+		return nullptr;
+	};
+
+	int32 RopesInUse = 0;
+	const float Gravity = FMath::Abs(FGenGameData::Get().Gravity);
+	FRandomStream& Rand = Logic->GetRandom();
+	for (FGenCombatDrop::FRope& Rope : D.Ropes)
+	{
+		// "first, eliminate "done" rappellers"
+		Rope.Rappellers.RemoveAll([this](FGenObjectID Id)
+		{
+			const FGenObject* R = Logic->FindObject(Id);
+			return !R || R->bDead || !R->bRappelling;
+		});
+		if (Rope.Len < Rope.LenMax)
+		{
+			Rope.Speed = FMath::Min(Rope.Speed + Gravity, Template->ChinookRopeDropSpeed);
+			Rope.Len += Rope.Speed;
+			if (Template->bChinookWaitForRopes)
+			{
+				++Rope.NextDropFrame; // "can't use this rope till it's dropped all the way"
+				RopesInUse += Rope.Rappellers.Num() > 0 ? 1 : 0;
+				continue;
+			}
+		}
+		if (Frame >= Rope.NextDropFrame)
+		{
+			if (FGenObject* R = NextRappeller())
+			{
+				Logic->RemoveFromContain(*this, *R);
+				R->SetPosition(Rope.DropStart);
+				R->SetRotation(Rope.DropRotation);
+				R->bFreeRotation = true;
+				R->BeginRappel(Logic->FindObject(D.Target), Template->ChinookRappelSpeed);
+				R->SnapshotPrevious();
+				Rope.Rappellers.Add(R->ID);
+				Rope.NextDropFrame = Frame + uint32(Rand.RandRange(Template->ChinookRopeDelayMin, FMath::Max(Template->ChinookRopeDelayMin, Template->ChinookRopeDelayMax)));
+			}
+		}
+		RopesInUse += Rope.Rappellers.Num() > 0 ? 1 : 0;
+	}
+	if (RopesInUse == 0 && !NextRappeller())
+	{
+		UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [drop f%u] #%u %s: everybody is down"), Frame, ID, *Template->Name);
+		EndCombatDrop(); // "we're done!"
+	}
+}
+
+void FGenObject::EndCombatDrop()
+{
+	// ChinookCombatDropState::onExit: the ropes are let go ("give it a little kick") and fall.
+	if (!CombatDrop)
+	{
+		return;
+	}
+	if (CombatDrop->bDropping)
+	{
+		for (const FGenCombatDrop::FRope& Rope : CombatDrop->Ropes)
+		{
+			FGenFallingRope& F = Logic->FallingRopes.AddDefaulted_GetRef();
+			F.Top = Rope.Top;
+			F.Len = FMath::Min(Rope.Len, Rope.LenMax);
+			F.Speed = FGenGameData::Get().Gravity * 30.f;
+			F.Width = Template->ChinookRopeWidth;
+			F.WobbleLen = Template->ChinookRopeWobbleLen;
+			F.WobbleAmp = Template->ChinookRopeWobbleAmp;
+			F.WobbleRate = Template->ChinookRopeWobbleRate;
+			F.Phase = CombatDrop->WobblePhase;
+			F.ExpireFrame = Logic->GetFrame() + uint32(GenLogic::GetLogicFPS() * 5);
+		}
+		ChinookFlight = EGenChinookFlight::Flying;
+	}
+	CombatDrop.Reset();
+	bLocoPreciseZ = false;
+	bLocoUltraAccurate = false;
+}
+
+void FGenObject::BeginRappel(FGenObject* Target, float Speed)
+{
+	// AIRappelState::onEnter
+	static const int32 Rappelling = GenConditions::Index(TEXT("RAPPELLING"));
+	bRappelling = true;
+	bHeldByParachute = true; // (out of everybody's way, and deaf to orders, until it has landed)
+	SetModelCondition(Rappelling, true);
+	SetModelCondition(GenConditions::Moving(), false);
+	Velocity = FVector3f::ZeroVector;
+	bMoving = false;
+	Path.Reset();
+	RappelTarget = (Target && !Target->bDead && Target->IsKindOf(TEXT("STRUCTURE"))) ? Target->ID : GenInvalidObjectID;
+	RappelDestZ = Logic->GetGroundHeight(Position.X, Position.Y) + (RappelTarget != GenInvalidObjectID ? Target->Template->GetMaxHeightAbovePosition() : 0.f);
+	const float MaxRate = FMath::Abs(FGenGameData::Get().Gravity) * float(GenLogic::GetLogicFPS()) * 2.5f;
+	RappelRate = FMath::Min(Speed, MaxRate);
+}
+
+void FGenObject::UpdateRappel(uint32 Frame)
+{
+	// AIRappelState::update: straight down at the rappel rate.
+	static const int32 Rappelling = GenConditions::Index(TEXT("RAPPELLING"));
+	FGenObject* Bldg = RappelTarget != GenInvalidObjectID ? Logic->FindObject(RappelTarget) : nullptr;
+	if (RappelTarget != GenInvalidObjectID && (!Bldg || Bldg->bDead || Bldg->bPendingDestroy))
+	{
+		// "if bldg is destroyed, just head for the ground"
+		RappelTarget = GenInvalidObjectID;
+		Bldg = nullptr;
+	}
+	if (!Bldg)
+	{
+		RappelDestZ = Logic->GetGroundHeight(Position.X, Position.Y);
+	}
+	Position.Z -= RappelRate;
+	Velocity = FVector3f(0.f, 0.f, -RappelRate);
+	if (Position.Z > RappelDestZ)
+	{
+		return;
+	}
+	Position.Z = RappelDestZ;
+	Velocity = FVector3f::ZeroVector;
+	SetOrientation(Orientation); // on its feet again
+	bFreeRotation = false;
+	bRappelling = false;
+	bHeldByParachute = false;
+	RappelTarget = GenInvalidObjectID;
+	SetModelCondition(Rappelling, false);
+	NextAutoAcquireFrame = 0;
+	if (!Bldg)
+	{
+		UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [drop f%u] #%u %s is on the ground at (%.0f, %.0f)"), Frame, ID, *Template->Name, Position.X, Position.Y);
+		return;
+	}
+
+	// "if there are enemies... kill up to two. if we kill two, then we die ourselves, otherwise we enter the bldg."
+	constexpr int32 MaxToKill = 2;
+	int32 NumKilled = 0;
+	while (NumKilled < MaxToKill)
+	{
+		FGenObject* Enemy = nullptr;
+		for (FGenObjectID Id : Logic->GetRiders(*Bldg))
+		{
+			FGenObject* R = Logic->FindObject(Id);
+			if (R && !R->bDead && Logic->GetRelationship(Owner, R->Owner) == EGenRelationship::Enemies)
+			{
+				Enemy = R;
+				break;
+			}
+		}
+		if (!Enemy)
+		{
+			break;
+		}
+		Enemy->ContainedBy = Bldg->ID;
+		Logic->RemoveFromContain(*Bldg, *Enemy);
+		Enemy->Health = 0.f;
+		Enemy->Die(TEXT("NORMAL"), ID);
+		++NumKilled;
+	}
+	UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [drop f%u] #%u %s lands on #%u %s and kills %d inside"), Frame, ID, *Template->Name, Bldg->ID,
+		*Bldg->Template->Name, NumKilled);
+	if (NumKilled == MaxToKill)
+	{
+		Kill();
+		return;
+	}
+	if (Logic->CanEnterObject(*this, *Bldg, true))
+	{
+		Logic->AddToContain(*Bldg, *this);
+		return;
+	}
+	// "this can legitimately happen if you drop into a full (or nearly full) building. let's just place
+	// the guy on the ground nearby, since it sucks to fall from the top of a building."
+	const float Offset = FMath::Min(Template->GetBoundingCircleRadius(), Bldg->Template->GetBoundingCircleRadius());
+	const float Angle = Logic->GetRandom().FRandRange(PI, 2.f * PI);
+	FVector3f Start(Bldg->Position.X + Offset * FMath::Cos(Angle), Bldg->Position.Y + Offset * FMath::Sin(Angle), 0.f);
+	Start.Z = Logic->GetGroundHeight(Start.X, Start.Y);
+	SetPosition(Start);
+	SetOrientation(Bldg->Orientation);
+	SnapshotPrevious();
+	const float R = Bldg->Template->GetBoundingCircleRadius();
+	CommandMoveTo(Logic->FindGroundSpotAround(Bldg->Position, R + 5.f, R + 200.f));
 }

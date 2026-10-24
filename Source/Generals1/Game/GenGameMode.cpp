@@ -1,18 +1,29 @@
 #include "Game/GenGameMode.h"
+#include "Algo/Find.h"
+#include "Audio/GenAudioManager.h"
+#include "AudioDeviceManager.h"
+#include "AudioMixerDevice.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
 #include "Client/GenFXManager.h"
 #include "Core/GenCoords.h"
 #include "Game/GenCameraPawn.h"
+#include "Game/GenRadar.h"
 #include "Game/GenHUD.h"
 #include "Game/GenPlayerController.h"
+#include "Game/GenShellData.h"
+#include "Game/GenSkirmishSetup.h"
 #include "Logic/GenCommandData.h"
 #include "Logic/GenGameData.h"
 #include "Logic/GenGameLogic.h"
 #include "Logic/GenUpgrades.h"
+#include "Net/GenNetSubsystem.h"
 #include "Map/GenMapActor.h"
 #include "Map/GenMapData.h"
 #include "W3D/GenModelComponent.h"
 #include "Generals1.h"
 #include "Engine/World.h"
+#include "Engine/Engine.h"
 #include "EngineUtils.h"
 #include "HAL/PlatformMisc.h"
 #include "Kismet/GameplayStatics.h"
@@ -29,18 +40,48 @@ AGenGameMode::AGenGameMode()
 	PrimaryActorTick.bTickEvenWhenPaused = true;
 }
 
+namespace
+{
+	/** How long "victory" or "defeat" stands on the screen before the score screen comes. */
+	constexpr float ScoreScreenDelay = 4.f;
+
+	FRandomStream MakeSetupRandom()
+	{
+		int32 Seed = int32(FPlatformTime::Cycles64() & 0x7fffffff);
+		FParse::Value(FCommandLine::Get(), TEXT("GenSeed="), Seed);
+		return FRandomStream(Seed);
+	}
+}
+
 void AGenGameMode::StartPlay()
 {
+	// (Who is where, and who hits what, is the game logic's own business: the engine's physics has
+	// nothing to step, and stepping nothing still takes its share of every frame.)
+	if (UWorld* World = GetWorld())
+	{
+		World->bShouldSimulatePhysics = false;
+	}
 	Super::StartPlay();
 
-	FString MapName = UGameplayStatics::ParseOption(OptionsString, TEXT("GenMap"));
-	if (MapName.IsEmpty())
+	// The server of a network game (-GenServer, started by the host's game): no game of its own here, no
+	// screen; it runs until its match is over and the players have gone.
+	if (FParse::Param(FCommandLine::Get(), TEXT("GenServer")))
 	{
-		FParse::Value(FCommandLine::Get(), TEXT("GenMap="), MapName);
-	}
-	if (MapName.IsEmpty())
-	{
-		MapName = TEXT("Tournament Desert");
+		Phase = EGenGamePhase::Server;
+		int32 Port = GenNet::DefaultPort;
+		FParse::Value(FCommandLine::Get(), TEXT("GenPort="), Port);
+		FString Why;
+		UGenNetSubsystem* Net = UGenNetSubsystem::Get(this);
+		if (!Net || !Net->StartServerHere(Port, &Why))
+		{
+			UE_LOG(LogGenerals, Error, TEXT("Server: can't start: %s"), *Why);
+			FPlatformMisc::RequestExit(false, TEXT("GenServer failed"));
+		}
+		if (IConsoleVariable* MaxFPS = IConsoleManager::Get().FindConsoleVariable(TEXT("t.MaxFPS")))
+		{
+			MaxFPS->Set(60, ECVF_SetByCode); // (nothing is drawn: no frames to hurry)
+		}
+		return;
 	}
 
 	// Reuse a map actor placed in the level (editor preview), otherwise spawn one.
@@ -54,17 +95,106 @@ void AGenGameMode::StartPlay()
 		MapActor = GetWorld()->SpawnActor<AGenMapActor>(AGenMapActor::StaticClass(), FTransform::Identity);
 	}
 	MapActor->bSpawnMapObjects = false; // the simulation creates the map's objects
-	if (!MapActor->LoadMapByName(MapName))
+	ParseTestSwitches();
+
+	// A replay: the recorded game again, nothing else.
+	FString ReplayPath;
+	if (FParse::Value(FCommandLine::Get(), TEXT("GenReplay="), ReplayPath))
 	{
-		UE_LOG(LogGenerals, Error, TEXT("Failed to load map '%s'"), *MapName);
+		StartReplay(ReplayPath);
 		return;
 	}
 
-	// Skirmish setup (until the shell's skirmish menu exists).
+	// A network game: -GenHost[=port] starts the server and joins it, -GenJoin=host[:port] joins one,
+	// -GenRejoin goes back to the last match this game played (as the same player). Once per run: after a
+	// match the level is loaded again and the connection is already there (or has been left).
+	UGenNetSubsystem* Net = UGenNetSubsystem::Get(this);
+	static bool bNetSwitchesTaken = false;
+	if (Net && !bNetSwitchesTaken)
+	{
+		bNetSwitchesTaken = true;
+		const TCHAR* NetCmd = FCommandLine::Get();
+		UGenSkirmishSetup* NameSetup = UGenSkirmishSetup::Get(this);
+		if (NameSetup)
+		{
+			NameSetup->EnsureLoaded();
+		}
+		FString PlayerName = NameSetup ? NameSetup->PlayerName : FString(TEXT("Player"));
+		if (FParse::Value(NetCmd, TEXT("GenName="), PlayerName) && NameSetup)
+		{
+			NameSetup->PlayerName = PlayerName; // (the lobby shows the name the host knows)
+		}
+		FString Address, PortText;
+		uint64 Seat = 0;
+		if (FParse::Value(NetCmd, TEXT("GenJoin="), Address))
+		{
+			Net->Join(Address, PlayerName);
+		}
+		else if (FParse::Param(NetCmd, TEXT("GenHost")) || FParse::Value(NetCmd, TEXT("GenHost="), PortText))
+		{
+			FString Why;
+			const int32 Port = PortText.IsNumeric() ? FCString::Atoi(*PortText) : GenNet::DefaultPort;
+			if (!Net->Host(PlayerName, Port, &Why))
+			{
+				ShellError = Why;
+			}
+		}
+		else if (FParse::Param(NetCmd, TEXT("GenRejoin")) && Net->RecallSeat(Address, PlayerName, Seat))
+		{
+			Net->Join(Address, PlayerName, Seat);
+		}
+	}
+	if (Net && Net->IsInNetworkGame())
+	{
+		Phase = EGenGamePhase::NetLobby;
+		if (UGenAudioManager* Audio = UGenAudioManager::Get(this))
+		{
+			Audio->StartShell(MapActor);
+		}
+		return;
+	}
+
+	// A run with test switches goes straight into a game; otherwise (or with -GenTestMenu) the menu first.
+	FString MapName = UGameplayStatics::ParseOption(OptionsString, TEXT("GenMap"));
+	FString Ignored;
+	const TCHAR* Cmd = FCommandLine::Get();
+	const bool bDirect = !MapName.IsEmpty() || FParse::Value(Cmd, TEXT("GenMap="), MapName) || !ShotPath.IsEmpty() || FParse::Param(Cmd, TEXT("GenNoMenu"))
+		|| FParse::Value(Cmd, TEXT("GenFaction="), Ignored) || FParse::Value(Cmd, TEXT("GenEnemy="), Ignored)
+		|| FParse::Value(Cmd, TEXT("GenObject="), Ignored) || FParse::Value(Cmd, TEXT("GenModel="), Ignored);
+	const bool bMenuTest = FParse::Value(Cmd, TEXT("GenTestMenu="), Ignored, false);
+	UGenSkirmishSetup* Setup = UGenSkirmishSetup::Get(this);
+	if (Setup && (bMenuTest || !bDirect))
+	{
+		Setup->EnsureLoaded();
+		if (Setup->bStartAtOnce)
+		{
+			// "Restart": the same game again.
+			Setup->bStartAtOnce = false;
+			FRandomStream Random = MakeSetupRandom();
+			TArray<FGenSkirmishSlot> Slots;
+			ShellError = Setup->Resolve(Random, Slots);
+			if (ShellError.IsEmpty() && BeginGame(Setup->Map, Slots, Setup->StartingCash, true))
+			{
+				return;
+			}
+		}
+		Phase = EGenGamePhase::Menu;
+		if (UGenAudioManager* Audio = UGenAudioManager::Get(this))
+		{
+			Audio->StartShell(MapActor);
+		}
+		return;
+	}
+
+	// A test run: the local player against one opponent.
+	if (MapName.IsEmpty())
+	{
+		MapName = TEXT("Tournament Desert");
+	}
 	FString LocalFaction = TEXT("FactionAmerica");
 	FString EnemyFaction = TEXT("FactionChina");
-	FParse::Value(FCommandLine::Get(), TEXT("GenFaction="), LocalFaction);
-	FParse::Value(FCommandLine::Get(), TEXT("GenEnemy="), EnemyFaction);
+	FParse::Value(Cmd, TEXT("GenFaction="), LocalFaction);
+	FParse::Value(Cmd, TEXT("GenEnemy="), EnemyFaction);
 	TArray<FGenSkirmishSlot> Slots;
 	FGenSkirmishSlot& Me = Slots.AddDefaulted_GetRef();
 	Me.Faction = LocalFaction;
@@ -73,22 +203,84 @@ void AGenGameMode::StartPlay()
 	FGenSkirmishSlot& Enemy = Slots.AddDefaulted_GetRef();
 	Enemy.Faction = EnemyFaction;
 	Enemy.StartPosition = 1;
-
-	UGenGameLogic* Logic = UGenGameLogic::Get(this);
-	if (!Logic || !Logic->StartSkirmish(MapActor, Slots))
+	// -GenBots=N: that many computer players in all (the first is the one above), sides in turn.
+	int32 Bots = 1;
+	FParse::Value(Cmd, TEXT("GenBots="), Bots);
+	static const TCHAR* BotSides[] = { TEXT("FactionAmerica"), TEXT("FactionGLA"), TEXT("FactionChina") };
+	for (int32 b = 1; b < FMath::Clamp(Bots, 1, 7); ++b)
 	{
-		return;
+		FGenSkirmishSlot& Bot = Slots.AddDefaulted_GetRef();
+		Bot.Faction = BotSides[(b - 1) % 3];
+		Bot.StartPosition = 1 + b;
 	}
+	BeginGame(MapName, Slots, 10000, false);
+}
+
+void AGenGameMode::ParseTestSwitches()
+{
+	FParse::Value(FCommandLine::Get(), TEXT("GenShot="), ShotPath);
+	FParse::Value(FCommandLine::Get(), TEXT("GenShotDelay="), ShotDelay);
+	FParse::Value(FCommandLine::Get(), TEXT("GenPauseFrame="), ShotFrame);
+	if (!ShotPath.IsEmpty())
+	{
+		// (An unattended run: the real mouse must not scroll the camera or click anything.)
+		if (AGenPlayerController* GenPC = Cast<AGenPlayerController>(GetWorld()->GetFirstPlayerController()))
+		{
+			GenPC->SetGenInputEnabled(false);
+		}
+	}
+	// -GenRecordAudio=file.wav records what the mixer puts out.
+	if (FParse::Value(FCommandLine::Get(), TEXT("GenRecordAudio="), RecordAudioPath))
+	{
+		if (Audio::FMixerDevice* Mixer = FAudioDeviceManager::GetAudioMixerDeviceFromWorldContext(this))
+		{
+			// A silent submix stops being mixed (and recorded): the recording must keep its silences.
+			if (IConsoleVariable* NeverDisable = IConsoleManager::Get().FindConsoleVariable(TEXT("au.NeverDisableSubmixes")))
+			{
+				NeverDisable->Set(1);
+			}
+			Mixer->StartRecording(nullptr, 0.f);
+			RecordStartSeconds = GetWorld()->GetRealTimeSeconds();
+			UE_LOG(LogGenerals, Log, TEXT("Audio recording started (%d Hz)"), int32(Mixer->GetSampleRate()));
+		}
+		else
+		{
+			UE_LOG(LogGenerals, Warning, TEXT("Audio recording: no audio mixer device"));
+			RecordAudioPath.Reset();
+		}
+	}
+}
+
+bool AGenGameMode::BeginMatch(const FGenMatchSettings& Settings, bool bFromMenu, int32 InLocalPlayer)
+{
+	bStartedFromMenu = bFromMenu;
+	if (!MapActor->LoadMapByName(Settings.Map))
+	{
+		UE_LOG(LogGenerals, Error, TEXT("Failed to load map '%s'"), *Settings.Map);
+		ShellError = FString::Printf(TEXT("The map '%s' can't be loaded"), *Settings.Map);
+		return false;
+	}
+	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	if (!Logic || !Logic->StartSkirmish(MapActor, Settings, InLocalPlayer))
+	{
+		ShellError = TEXT("The game can't be started on this map");
+		return false;
+	}
+	Phase = EGenGamePhase::Playing;
+	bQuitMenuOpen = false;
+	bWatching = false;
+	DecidedSeconds = 0.f;
 
 	// Camera start: local player's start waypoint.
 	APlayerController* PC = GetWorld()->GetFirstPlayerController();
 	AGenCameraPawn* Cam = PC ? Cast<AGenCameraPawn>(PC->GetPawn()) : nullptr;
 	if (!Cam)
 	{
-		return;
+		return true;
 	}
+	const int32 LocalStart = Logic->GetPlayers().IsValidIndex(Logic->GetLocalPlayer()) ? Logic->GetPlayers()[Logic->GetLocalPlayer()].StartPosition : 0;
 	FVector Start;
-	if (!MapActor->GetWaypointLocation(TEXT("Player_1_Start"), Start))
+	if (!MapActor->GetWaypointLocation(FString::Printf(TEXT("Player_%d_Start"), LocalStart + 1), Start))
 	{
 		Start = MapActor->GetPlayableBoundsUE().GetCenter();
 	}
@@ -112,6 +304,26 @@ void AGenGameMode::StartPlay()
 		}
 	}
 	Cam->SetTarget(Start);
+	return true;
+}
+
+bool AGenGameMode::BeginGame(const FString& MapName, const TArray<FGenSkirmishSlot>& Slots, int32 StartingCash, bool bFromMenu)
+{
+	FGenMatchSettings Settings = FGenMatchSettings::FromCommandLine();
+	Settings.Map = MapName;
+	Settings.Slots = Slots;
+	Settings.StartingCash = StartingCash;
+	if (!BeginMatch(Settings, bFromMenu))
+	{
+		return false;
+	}
+	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	APlayerController* PC = GetWorld()->GetFirstPlayerController();
+	AGenCameraPawn* Cam = PC ? Cast<AGenCameraPawn>(PC->GetPawn()) : nullptr;
+	if (!Cam)
+	{
+		return true;
+	}
 
 	// -GenObject=Template1,Template2,... spawns local player units in a row in front of the camera.
 	FString ObjectList;
@@ -127,11 +339,41 @@ void AGenGameMode::StartPlay()
 		}
 		for (int32 i = 0; i < Names.Num(); ++i)
 		{
-			if (const FGenThingTemplate* T = FGenGameData::Get().FindTemplate(Names[i]))
+			// "Template*N": a block of N of them (a crowd to measure with), twelve to a row.
+			// "Template@x:y" or "Template@x:y:angle" (after the count, if any): that one stands there rather than in the row.
+			FString Entry = Names[i], PlaceText, PlaceX, PlaceY, PlaceAngle;
+			const bool bPlaced = Names[i].Split(TEXT("@"), &Entry, &PlaceText) && PlaceText.Split(TEXT(":"), &PlaceX, &PlaceY);
+			float SingleAngle = -90.f;
+			if (bPlaced && PlaceY.Split(TEXT(":"), &PlaceY, &PlaceAngle))
 			{
-				const float X = float(Gen.X) + (float(i) - (Names.Num() - 1) * 0.5f) * 40.f;
-				const float Y = float(Gen.Y);
-				Logic->CreateObject(T, Logic->GetLocalPlayer(), FVector3f(X, Y, Logic->GetGroundHeight(X, Y)), FMath::DegreesToRadians(-90.f));
+				SingleAngle = FCString::Atof(*PlaceAngle);
+			}
+			FString Name = Entry, CountText;
+			int32 Count = 1;
+			if (Entry.Split(TEXT("*"), &Name, &CountText))
+			{
+				Count = FMath::Clamp(FCString::Atoi(*CountText), 1, 2000);
+			}
+			// "neutral:Template": nobody's (a civilian building to occupy).
+			// -GenObjectAngle=deg / -GenObjectSpacing=d: how the objects of a block face and how far apart they stand (a fence in a row).
+			float BlockAngle = -90.f, BlockSpacing = 0.f;
+			FParse::Value(FCommandLine::Get(), TEXT("GenObjectAngle="), BlockAngle);
+			FParse::Value(FCommandLine::Get(), TEXT("GenObjectSpacing="), BlockSpacing);
+			const int32 Whose = Name.RemoveFromStart(TEXT("neutral:")) ? 0 : Logic->GetLocalPlayer();
+			if (const FGenThingTemplate* T = FGenGameData::Get().FindTemplate(Name))
+			{
+				const float X = bPlaced ? FCString::Atof(*PlaceX) : float(Gen.X) + (float(i) - (Names.Num() - 1) * 0.5f) * 40.f;
+				const float Y = bPlaced ? FCString::Atof(*PlaceY) : float(Gen.Y);
+				if (Count == 1)
+				{
+					Logic->CreateObject(T, Whose, FVector3f(X, Y, Logic->GetGroundHeight(X, Y)), FMath::DegreesToRadians(SingleAngle));
+				}
+				const float Spacing = BlockSpacing > 0.f ? BlockSpacing : FMath::Max(14.f, T->GetBoundingCircleRadius() * 2.5f);
+				for (int32 n = 0; n < Count && Count > 1; ++n)
+				{
+					const float BX = X + (float(n % 12) - 5.5f) * Spacing, BY = Y + (float(n / 12) - float((Count - 1) / 12) * 0.5f) * Spacing;
+					Logic->CreateObject(T, Whose, FVector3f(BX, BY, Logic->GetGroundHeight(BX, BY)), FMath::DegreesToRadians(BlockAngle));
+				}
 			}
 			else
 			{
@@ -187,7 +429,9 @@ void AGenGameMode::StartPlay()
 	const bool bScriptedRun = !ObjectList.IsEmpty() || !EnemyList.IsEmpty()
 		|| FParse::Value(FCommandLine::Get(), TEXT("GenShot="), Scripted) || FParse::Value(FCommandLine::Get(), TEXT("GenTestFX="), Scripted)
 		|| FParse::Value(FCommandLine::Get(), TEXT("GenModel="), Scripted) || FParse::Param(FCommandLine::Get(), TEXT("GenNoTestUnits"));
-	if (!bScriptedRun || FParse::Param(FCommandLine::Get(), TEXT("GenTestUnits")))
+	// (A game set up in the menu has its own switch for them.)
+	const UGenSkirmishSetup* Setup = UGenSkirmishSetup::Get(this);
+	if (bFromMenu ? (Setup && Setup->bTestUnits) : (!bScriptedRun || FParse::Param(FCommandLine::Get(), TEXT("GenTestUnits"))))
 	{
 		SpawnTestUnits(Logic);
 	}
@@ -218,16 +462,436 @@ void AGenGameMode::StartPlay()
 		}
 	}
 
-	FParse::Value(FCommandLine::Get(), TEXT("GenShot="), ShotPath);
-	FParse::Value(FCommandLine::Get(), TEXT("GenShotDelay="), ShotDelay);
-	FParse::Value(FCommandLine::Get(), TEXT("GenPauseFrame="), ShotFrame);
-	if (!ShotPath.IsEmpty())
+	// Audio tests: -GenAudioSelfTest decodes every sound the game data names; -GenDumpWav=a,b writes sounds
+	// out decoded (to Saved/AudioTest).
+	if (UGenAudioManager* Audio = UGenAudioManager::Get(this))
 	{
-		if (AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC))
+		if (FParse::Param(FCommandLine::Get(), TEXT("GenAudioSelfTest")))
 		{
-			GenPC->SetGenInputEnabled(false);
+			int32 Failed = 0;
+			double Seconds = 0.0;
+			Audio->SelfTest(Failed, Seconds);
+		}
+		FString DumpList;
+		if (FParse::Value(FCommandLine::Get(), TEXT("GenDumpWav="), DumpList, false))
+		{
+			TArray<FString> Names;
+			DumpList.ParseIntoArray(Names, TEXT(","));
+			for (const FString& Name : Names)
+			{
+				const FString Out = FPaths::ProjectSavedDir() / TEXT("AudioTest") / (FPaths::GetBaseFilename(Name) + TEXT(".wav"));
+				UE_LOG(LogGenerals, Log, TEXT("Audio dump: %s -> %s: %s"), *Name, *Out, Audio->DumpDecoded(Name, Out) ? TEXT("ok") : TEXT("FAILED"));
+			}
 		}
 	}
+	return true;
+}
+
+// ---- replays --------------------------------------------------------------------------------------
+
+bool AGenGameMode::StartReplay(const FString& InPath)
+{
+	FString Path = InPath;
+	if (FPaths::IsRelative(Path) && !FPaths::FileExists(Path))
+	{
+		Path = FGenReplay::GetDefaultFolder() / Path;
+	}
+	TUniquePtr<FGenReplay> Replay = MakeUnique<FGenReplay>();
+	FString Why;
+	if (!Replay->Load(Path, &Why))
+	{
+		UE_LOG(LogGenerals, Error, TEXT("Replay '%s': %s"), *Path, *Why);
+		ShellError = FString::Printf(TEXT("The replay can't be played: %s"), *Why);
+		return false;
+	}
+	UE_LOG(LogGenerals, Log, TEXT("Replay %s: recorded %s by player %d; %d orders, %d frames%s"), *Path, *Replay->Date, Replay->RecordedBy,
+		Replay->Commands.Num(), Replay->Checksums.Num(), Replay->SetupObjects.Num() > 0 ? *FString::Printf(TEXT(", %d objects at the start"), Replay->SetupObjects.Num()) : TEXT(""));
+	if (Replay->BuildId != GenBuild::GetBuildId())
+	{
+		UE_LOG(LogGenerals, Warning, TEXT("Replay: made by another build of the game (%s; this one is %s) - it may come out differently"), *Replay->BuildId, *GenBuild::GetBuildId());
+	}
+	if (Replay->DataHash != GenBuild::GetDataHash())
+	{
+		UE_LOG(LogGenerals, Warning, TEXT("Replay: made with other game data (%08x; this is %08x) - it may come out differently"), Replay->DataHash, GenBuild::GetDataHash());
+	}
+	const FGenMatchSettings Settings = Replay->Settings;
+	const TArray<FGenSetupObject> SetupObjects = Replay->SetupObjects;
+	int32 Viewer = Replay->RecordedBy;
+	FParse::Value(FCommandLine::Get(), TEXT("GenReplayViewer="), Viewer);
+	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	if (!Logic)
+	{
+		return false;
+	}
+	Logic->SetPlayback(MoveTemp(Replay));
+	if (!BeginMatch(Settings, false, Viewer))
+	{
+		return false;
+	}
+	Logic->PlaceSetupObjects(SetupObjects);
+	return true;
+}
+
+void AGenGameMode::SaveReplay()
+{
+	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	if (!Logic || !Logic->IsRunning() || !Logic->GetRecording())
+	{
+		return;
+	}
+	FString Path;
+	const bool bAsked = FParse::Value(FCommandLine::Get(), TEXT("GenRecord="), Path);
+	if (Logic->IsPlayingBack() && !bAsked)
+	{
+		return; // (the replay is its own recording: LastReplay stays the last game played)
+	}
+	Logic->WaitForStep();
+	Logic->SaveRecording(Path);
+	FString ChecksumLog;
+	if (FParse::Value(FCommandLine::Get(), TEXT("GenChecksumLog="), ChecksumLog))
+	{
+		Logic->GetRecording()->SaveChecksumLog(ChecksumLog);
+	}
+}
+
+void AGenGameMode::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	SaveReplay();
+	Super::EndPlay(EndPlayReason);
+}
+
+// ---- network games --------------------------------------------------------------------------------
+
+void AGenGameMode::TickNetwork(float DeltaSeconds)
+{
+	UGenNetSubsystem* Net = UGenNetSubsystem::Get(this);
+	if (Phase == EGenGamePhase::Server)
+	{
+		static bool bExitAsked = false;
+		if (!bExitAsked && Net && Net->GetServer() && Net->GetServer()->IsDone())
+		{
+			bExitAsked = true;
+			FPlatformMisc::RequestExit(false, TEXT("GenServer done"));
+		}
+		return;
+	}
+	FGenNetClient* Client = Net ? Net->GetClient() : nullptr;
+	if (!Client)
+	{
+		return;
+	}
+	Client->Update();
+	const double Now = GetWorld()->GetRealTimeSeconds();
+	for (const FString& Line : Client->TakeNotices())
+	{
+		UE_LOG(LogGenerals, Log, TEXT("Net: %s"), *Line);
+		NetNotices.Emplace(Now, Line);
+	}
+	while (NetNotices.Num() > 8 || (NetNotices.Num() > 0 && Phase == EGenGamePhase::Playing && Now - NetNotices[0].Key > 15.0))
+	{
+		NetNotices.RemoveAt(0);
+	}
+	// The games have come apart: this one's recording (with the checksum of every frame) is kept at once, to
+	// find out where and why. (Every game also writes its whole state at one frame: the server's "dump" order.)
+	if (Client->GetMismatchFrame() != 0 && !bMismatchKept)
+	{
+		bMismatchKept = true;
+		if (UGenGameLogic* Kept = UGenGameLogic::Get(this); Kept && Kept->IsRunning())
+		{
+			Kept->WaitForStep();
+			Kept->SaveRecording(FGenReplay::GetDefaultFolder() / FString::Printf(TEXT("Mismatch_f%u_%s.genrep"), Client->GetMismatchFrame(),
+				*FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"))));
+		}
+	}
+
+	// The host has started the match (or this game comes back to one): it begins here, its orders from the host.
+	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	FGenMatchSettings Settings;
+	int32 Player = INDEX_NONE;
+	bool bRejoin = false;
+	if (Phase == EGenGamePhase::NetLobby && Logic && !Logic->IsRunning() && Client->TakeMatchStart(Settings, Player, bRejoin))
+	{
+		UE_LOG(LogGenerals, Log, TEXT("Net: %s the match as player %d"), bRejoin ? TEXT("back in") : TEXT("starting"), Player);
+		Logic->SetOrderSource(Client);
+		if (BeginMatch(Settings, true, Player))
+		{
+			Client->SendLoaded();
+			Net->RememberSeat();
+		}
+		else
+		{
+			Logic->SetOrderSource(nullptr);
+			NetNotices.Emplace(Now, ShellError);
+		}
+	}
+
+	// -GenNetStart=N (tests): once N players have joined, the host sets the lobby up from the command line -
+	// -GenMap=, -GenNetAI=Hard,Easy (computer players in the next open places), -GenNetTeams=1,1,2 (by place) -
+	// and starts the match.
+	// -GenNetTeam=N, -GenNetSide=FactionAmerica (tests): this player's team and army, chosen as soon as it is in the lobby.
+	int32 OwnTeam = 0;
+	FString OwnSide;
+	const bool bTeamSwitch = FParse::Value(FCommandLine::Get(), TEXT("GenNetTeam="), OwnTeam);
+	const bool bSideSwitch = FParse::Value(FCommandLine::Get(), TEXT("GenNetSide="), OwnSide);
+	if (Phase == EGenGamePhase::NetLobby && !bNetTeamSent && Client->HasLobby() && Client->GetLocalSlot() != INDEX_NONE && (bTeamSwitch || bSideSwitch))
+	{
+		FGenSetupData Wanted = Client->GetLobby();
+		if (bTeamSwitch)
+		{
+			Wanted.Slots[Client->GetLocalSlot()].Team = OwnTeam - 1;
+		}
+		if (bSideSwitch)
+		{
+			Wanted.Slots[Client->GetLocalSlot()].Side = FGenShellData::Get().FindSide(OwnSide);
+		}
+		Client->SendLobbyEdit(Wanted);
+		bNetTeamSent = true;
+	}
+	int32 WantPlayers = 0;
+	if (Phase == EGenGamePhase::NetLobby && NetAutoStage < 2 && Client->IsHost() && Client->HasLobby()
+		&& FParse::Value(FCommandLine::Get(), TEXT("GenNetStart="), WantPlayers))
+	{
+		int32 Humans = 0;
+		for (int32 s = 0; s < FGenSetupData::MaxSlots; ++s)
+		{
+			Humans += Client->IsSlotHuman(s) ? 1 : 0;
+		}
+		if (NetAutoStage == 0 && Humans >= WantPlayers)
+		{
+			FGenSetupData Wanted = Client->GetLobby();
+			FString MapName;
+			if (FParse::Value(FCommandLine::Get(), TEXT("GenMap="), MapName))
+			{
+				Wanted.Map = MapName;
+			}
+			FString AISpec, TeamSpec;
+			TArray<FString> Parts;
+			if (FParse::Value(FCommandLine::Get(), TEXT("GenNetAI="), AISpec))
+			{
+				AISpec.ParseIntoArray(Parts, TEXT(","));
+				int32 Next = 0;
+				for (const FString& Level : Parts)
+				{
+					while (Next < FGenSetupData::MaxSlots && Wanted.Slots[Next].State == EGenSlotState::Player) { ++Next; }
+					if (Next < FGenSetupData::MaxSlots)
+					{
+						Wanted.Slots[Next++].State = Level.Equals(TEXT("Easy"), ESearchCase::IgnoreCase) ? EGenSlotState::EasyAI
+							: (Level.Equals(TEXT("Hard"), ESearchCase::IgnoreCase) ? EGenSlotState::HardAI : EGenSlotState::MediumAI);
+					}
+				}
+			}
+			if (FParse::Value(FCommandLine::Get(), TEXT("GenNetTeams="), TeamSpec))
+			{
+				TeamSpec.ParseIntoArray(Parts, TEXT(","));
+				for (int32 s = 0; s < Parts.Num() && s < FGenSetupData::MaxSlots; ++s)
+				{
+					Wanted.Slots[s].Team = FCString::Atoi(*Parts[s]) - 1;
+				}
+			}
+			Client->SendLobbyEdit(Wanted);
+			NetAutoStage = 1;
+			NetAutoSeconds = 0.f;
+			UE_LOG(LogGenerals, Log, TEXT("Test net: %d players are in - setting the game up"), Humans);
+		}
+		else if (NetAutoStage == 1 && (NetAutoSeconds += DeltaSeconds) > 1.5f)
+		{
+			// (The teams of the players' own places are theirs to choose: everybody sends its own.)
+			Client->RequestStart();
+			NetAutoStage = 2;
+			UE_LOG(LogGenerals, Log, TEXT("Test net: start"));
+		}
+	}
+}
+
+void AGenGameMode::NetLobbyEdit(const FGenSetupData& Wanted)
+{
+	UGenNetSubsystem* Net = UGenNetSubsystem::Get(this);
+	if (FGenNetClient* Client = Net ? Net->GetClient() : nullptr)
+	{
+		Client->SendLobbyEdit(Wanted);
+	}
+}
+
+void AGenGameMode::HostNetworkGame()
+{
+	UGenNetSubsystem* Net = UGenNetSubsystem::Get(this);
+	const UGenSkirmishSetup* Setup = UGenSkirmishSetup::Get(this);
+	FString Why;
+	if (!Net || !Net->Host(Setup ? Setup->PlayerName : FString(TEXT("Player")), GenNet::DefaultPort, &Why))
+	{
+		ShellError = Why;
+		return;
+	}
+	NetNotices.Reset();
+	NetAutoStage = 0;
+	Phase = EGenGamePhase::NetLobby;
+}
+
+void AGenGameMode::JoinNetworkGame(const FString& Address)
+{
+	UGenNetSubsystem* Net = UGenNetSubsystem::Get(this);
+	const UGenSkirmishSetup* Setup = UGenSkirmishSetup::Get(this);
+	if (!Net || Address.TrimStartAndEnd().IsEmpty())
+	{
+		return;
+	}
+	Net->Join(Address.TrimStartAndEnd(), Setup ? Setup->PlayerName : FString(TEXT("Player")));
+	NetNotices.Reset();
+	NetAutoStage = 0;
+	Phase = EGenGamePhase::NetLobby;
+}
+
+void AGenGameMode::RejoinNetworkGame()
+{
+	UGenNetSubsystem* Net = UGenNetSubsystem::Get(this);
+	FString Address, Name;
+	uint64 Seat = 0;
+	if (Net && Net->RecallSeat(Address, Name, Seat))
+	{
+		Net->Join(Address, Name, Seat);
+		NetNotices.Reset();
+		Phase = EGenGamePhase::NetLobby;
+	}
+}
+
+void AGenGameMode::LeaveNetworkGame()
+{
+	if (UGenNetSubsystem* Net = UGenNetSubsystem::Get(this))
+	{
+		Net->Leave();
+	}
+	NetNotices.Reset();
+	NetAutoStage = 0;
+	bNetTeamSent = false;
+	Phase = EGenGamePhase::Menu;
+}
+
+// ---- the shell: menu, in-game menu, score screen -------------------------------------------------
+
+void AGenGameMode::RequestStart()
+{
+	UGenSkirmishSetup* Setup = UGenSkirmishSetup::Get(this);
+	if (Phase != EGenGamePhase::Menu || !Setup)
+	{
+		return;
+	}
+	FRandomStream Random = MakeSetupRandom();
+	ShellError = Setup->Resolve(Random, PendingSlots);
+	if (!ShellError.IsEmpty())
+	{
+		return;
+	}
+	Setup->Save();
+	Phase = EGenGamePhase::Loading;
+	LoadingTicks = 0;
+}
+
+void AGenGameMode::ToggleQuitMenu()
+{
+	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	if (Phase != EGenGamePhase::Playing || !Logic || !Logic->IsRunning())
+	{
+		return;
+	}
+	bQuitMenuOpen = !bQuitMenuOpen;
+	Logic->SetPaused(bQuitMenuOpen);
+	if (bQuitMenuOpen && GEngine)
+	{
+		// The game stands still behind the menu: the moment for the engine to collect its garbage, which
+		// takes a frame of fifteen or twenty milliseconds (during play it is left alone for an hour: see
+		// gc.TimeBetweenPurgingPendingKillObjects in DefaultEngine.ini).
+		GEngine->ForceGarbageCollection(false);
+	}
+}
+
+void AGenGameMode::ReloadLevel()
+{
+	// A fresh world: nothing of the old game is left to clean up.
+	const FString Level = UWorld::RemovePIEPrefix(GetWorld()->GetOutermost()->GetName());
+	UGameplayStatics::OpenLevel(this, FName(*Level), true, OptionsString);
+}
+
+void AGenGameMode::RestartGame()
+{
+	const UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	if (Logic && Logic->IsNetworkGame())
+	{
+		return; // (a network game isn't one player's to start over)
+	}
+	if (UGenSkirmishSetup* Setup = UGenSkirmishSetup::Get(this))
+	{
+		Setup->bStartAtOnce = bStartedFromMenu;
+	}
+	ReloadLevel();
+}
+
+void AGenGameMode::EndGame()
+{
+	if (Phase == EGenGamePhase::Playing)
+	{
+		bQuitMenuOpen = false;
+		Phase = EGenGamePhase::Score; // (the game stays as it stands, behind the score)
+		if (GEngine)
+		{
+			GEngine->ForceGarbageCollection(false); // (nobody minds a long frame now)
+		}
+		UE_LOG(LogGenerals, Log, TEXT("Shell: the score screen (game ended from the menu)"));
+		LogScores();
+	}
+}
+
+void AGenGameMode::LogScores() const
+{
+	const UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	if (!Logic)
+	{
+		return;
+	}
+	for (const FGenPlayer& P : Logic->GetPlayers())
+	{
+		if (!P.bNeutral && P.Template)
+		{
+			UE_LOG(LogGenerals, Log, TEXT("  [score] p%d %s (%s): units %d built, %d lost, %d destroyed; buildings %d built, %d lost, %d destroyed; supplies %d; spent %d; score %d"),
+				P.Index, *P.Name, *P.Template->Side, P.Score.UnitsBuilt, P.Score.UnitsLost, P.Score.GetUnitsDestroyed(), P.Score.BuildingsBuilt, P.Score.BuildingsLost,
+				P.Score.GetBuildingsDestroyed(), P.Score.MoneyEarned, P.Score.MoneySpent, P.Score.Calculate(P.Index));
+		}
+	}
+}
+
+void AGenGameMode::ExitToMenu()
+{
+	if (UGenSkirmishSetup* Setup = UGenSkirmishSetup::Get(this))
+	{
+		Setup->bStartAtOnce = false;
+	}
+	// Out of a network game for good: the connection goes, and the seat isn't come back to.
+	if (UGenNetSubsystem* Net = UGenNetSubsystem::Get(this); Net && Net->IsInNetworkGame())
+	{
+		SaveReplay();
+		Net->ForgetSeat();
+		Net->Leave();
+	}
+	UE_LOG(LogGenerals, Log, TEXT("Shell: back to the menu"));
+	ReloadLevel();
+}
+
+bool AGenGameMode::CanKeepWatching() const
+{
+	const UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	return Phase == EGenGamePhase::Score && Logic && Logic->IsRunning() && !Logic->IsGameOver();
+}
+
+void AGenGameMode::KeepWatching()
+{
+	if (!CanKeepWatching())
+	{
+		return;
+	}
+	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	bWatching = true;
+	DecidedSeconds = 0.f;
+	Phase = EGenGamePhase::Playing;
+	Logic->SetPaused(false);
 }
 
 void AGenGameMode::SpawnTestUnits(UGenGameLogic* Logic)
@@ -313,6 +977,75 @@ void AGenGameMode::SpawnTestUnits(UGenGameLogic* Logic)
 void AGenGameMode::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
+	TickNetwork(DeltaSeconds);
+	if (Phase == EGenGamePhase::Server)
+	{
+		return;
+	}
+	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	// The recording is written every two minutes as well as at the end: a crash loses no more than that.
+	if (Phase == EGenGamePhase::Playing && Logic && Logic->IsRunning())
+	{
+		ReplaySaveSeconds += DeltaSeconds;
+		if (ReplaySaveSeconds >= 120.f)
+		{
+			ReplaySaveSeconds = 0.f;
+			SaveReplay();
+		}
+	}
+	if (Phase == EGenGamePhase::Loading)
+	{
+		// ("Loading" has been on the screen for a frame or two: now the map is read, which takes a moment.)
+		if (++LoadingTicks >= 3)
+		{
+			const UGenSkirmishSetup* Setup = UGenSkirmishSetup::Get(this);
+			if (!Setup || !BeginGame(Setup->Map, PendingSlots, Setup->StartingCash, true))
+			{
+				Phase = EGenGamePhase::Menu;
+			}
+		}
+	}
+	else if (Phase == EGenGamePhase::Playing && Logic && Logic->IsRunning() && bStartedFromMenu)
+	{
+		// The game is decided for the local player: "victory" or "defeat" stands for a moment, then the score.
+		const bool bLost = Logic->IsPlayerDefeated(Logic->GetLocalPlayer());
+		if (Logic->IsGameOver() || (bLost && !bWatching))
+		{
+			DecidedSeconds += DeltaSeconds;
+			if (DecidedSeconds >= ScoreScreenDelay)
+			{
+				bQuitMenuOpen = false;
+				Logic->SetPaused(false);
+				Phase = EGenGamePhase::Score;
+				if (GEngine)
+				{
+					GEngine->ForceGarbageCollection(false); // (nobody minds a long frame now)
+				}
+				UE_LOG(LogGenerals, Log, TEXT("Shell: the score screen (%s)"), Logic->HasLocalPlayerWon() ? TEXT("victory") : TEXT("defeat"));
+				LogScores();
+				SaveReplay();
+				// PlayerTemplate's ScoreScreenMusic for the local side.
+				const TArray<FGenPlayer>& Players = Logic->GetPlayers();
+				const FGenPlayerTemplate* Side = Players.IsValidIndex(Logic->GetLocalPlayer()) ? Players[Logic->GetLocalPlayer()].Template : nullptr;
+				if (UGenAudioManager* Audio = UGenAudioManager::Get(this); Audio && Side && !Side->ScoreScreenMusic.IsEmpty())
+				{
+					Audio->PlayTrackOnly(Side->ScoreScreenMusic);
+				}
+			}
+		}
+		else
+		{
+			DecidedSeconds = 0.f;
+		}
+	}
+	if (Phase == EGenGamePhase::Menu || Phase == EGenGamePhase::Loading || Phase == EGenGamePhase::NetLobby)
+	{
+		// (During a game the simulation keeps the sound going; before one, nothing else does.)
+		if (UGenAudioManager* Audio = UGenAudioManager::Get(this))
+		{
+			Audio->Update(DeltaSeconds);
+		}
+	}
 	RunTestAutomation(DeltaSeconds);
 }
 
@@ -320,6 +1053,49 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 {
 	Elapsed += DeltaSeconds;
 	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+
+	// -GenTestMenu="seconds,click,Id;...": clicks on the interface, by the clock that runs from the start
+	// of the program (the level is loaded anew between a game and the menu; the script carries on).
+	if (UGenSkirmishSetup* Setup = UGenSkirmishSetup::Get(this))
+	{
+		static TArray<TPair<double, FString>> MenuSteps;
+		static bool bMenuStepsParsed = false;
+		if (!bMenuStepsParsed)
+		{
+			bMenuStepsParsed = true;
+			FString Spec;
+			if (FParse::Value(FCommandLine::Get(), TEXT("GenTestMenu="), Spec, false))
+			{
+				TArray<FString> Steps;
+				Spec.ParseIntoArray(Steps, TEXT(";"));
+				for (const FString& Step : Steps)
+				{
+					TArray<FString> Parts;
+					Step.ParseIntoArray(Parts, TEXT(","));
+					if (Parts.Num() >= 3 && Parts[1].Equals(TEXT("click"), ESearchCase::IgnoreCase))
+					{
+						// (An id may itself contain commas: everything after "click,".)
+						FString Id = Parts[2];
+						for (int32 i = 3; i < Parts.Num(); ++i) { Id += TEXT(",") + Parts[i]; }
+						MenuSteps.Emplace(FCString::Atod(*Parts[0]), Id);
+					}
+				}
+			}
+		}
+		Setup->TestSeconds += double(DeltaSeconds);
+		APlayerController* MenuPC = GetWorld()->GetFirstPlayerController();
+		AGenHUD* HUD = MenuPC ? Cast<AGenHUD>(MenuPC->GetHUD()) : nullptr;
+		if (HUD && MenuSteps.IsValidIndex(Setup->TestStepsDone) && Setup->TestSeconds >= MenuSteps[Setup->TestStepsDone].Key && !HUD->HasShellTestClick())
+		{
+			UE_LOG(LogGenerals, Log, TEXT("Test menu %.1fs: click '%s'"), Setup->TestSeconds, *MenuSteps[Setup->TestStepsDone].Value);
+			HUD->ShellTestClick(MenuSteps[Setup->TestStepsDone].Value);
+			++Setup->TestStepsDone;
+		}
+	}
+	if (Logic && !Logic->IsRunning())
+	{
+		Logic = nullptr; // no game yet (the menu is up): of what follows only the screenshot applies
+	}
 
 	if (bTestMovePending && Elapsed > 1.f && Logic)
 	{
@@ -538,6 +1314,9 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 
 	//   -GenTestPowers=Frame,what[,args];...   upgrades, promotions and special powers of the local player, in turn:
 	//        upgrade,Name       queued at the first building of ours that can research it
+	//        grant,Name         that upgrade is ours at once, as if it had been researched
+	//        combatdrop,x,y[,Type]  our transport helicopters drop their soldiers there (into the object of that type nearest the spot)
+	//        kill,Type[,Player] every object of that type of ours (or of that player's) dies as if shot down
 	//        skill,Points       experience towards the next rank (as if that much had been destroyed)
 	//        aiskill,Points     the same for every computer player
 	//        science,Name       bought with general's points, like a click in the promotions panel
@@ -557,6 +1336,10 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 	//        enter,Unit,Type    our units of that type get into the container of that type nearest the camera target
 	//                           (anybody's: a civilian building can be garrisoned); Unit "*" = everything of ours that can
 	//        evacuate,Type      everybody out of the container of that type nearest the camera target
+	//        allymove,x,y       (network games) what of an absent ally's we may command goes there
+	//        desync             (network games) $1 for us outside the orders: this game comes apart from the others
+	//   (The ones that change the game by hand - grant, kill, skill, aiskill, hunt, damage, vet, destroy, money - are
+	//   orders too, UGenGameLogic::ExecCheat: a replay of the test has them.)
 	FString PowerSpec;
 	if (Logic && FParse::Value(FCommandLine::Get(), TEXT("GenTestPowers="), PowerSpec, false))
 	{
@@ -571,12 +1354,22 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 				break;
 			}
 			++TestPowerOrdersDone;
+			Logic->WaitForStep(); // (some of these look at the simulation in ways a step under way mustn't change)
 			const int32 Local = Logic->GetLocalPlayer();
 			APlayerController* PC = GetWorld()->GetFirstPlayerController();
 			const AGenCameraPawn* Cam = PC ? Cast<AGenCameraPawn>(PC->GetPawn()) : nullptr;
 			const FVector CamGen = Cam ? GenCoords::FromUE(Cam->GetTarget()) : FVector::ZeroVector;
 			const FString& What = Parts[1];
 			const FString Arg = Parts.Num() >= 3 ? Parts[2] : FString();
+			// The steps that change the game by hand are orders like the others (UGenGameLogic::ExecCheat), so that
+			// a replay of the test has them at the same frame.
+			static const TCHAR* const CheatSteps[] = { TEXT("grant"), TEXT("kill"), TEXT("skill"), TEXT("aiskill"), TEXT("hunt"), TEXT("damage"),
+				TEXT("vet"), TEXT("destroy"), TEXT("money") };
+			if (Algo::FindByPredicate(CheatSteps, [&What](const TCHAR* S) { return What.Equals(S, ESearchCase::IgnoreCase); }))
+			{
+				Logic->IssueCheat(FString::Join(TArrayView<const FString>(Parts).RightChop(1), TEXT(",")));
+				continue;
+			}
 			if (What.Equals(TEXT("upgrade"), ESearchCase::IgnoreCase))
 			{
 				const FGenUpgradeTemplate* Upgrade = FGenUpgradeData::Get().FindUpgrade(Arg);
@@ -600,23 +1393,37 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 				}
 				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: upgrade %s %s"), Logic->GetFrame(), *Arg, bQueued ? TEXT("queued") : *Why);
 			}
-			else if (What.Equals(TEXT("skill"), ESearchCase::IgnoreCase))
+			else if (What.Equals(TEXT("combatdrop"), ESearchCase::IgnoreCase) && Parts.Num() >= 4)
 			{
-				Logic->AddSkillPoints(Local, FCString::Atoi(*Arg));
-				const FGenPlayer& P = Logic->GetPlayers()[Local];
-				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: +%s skill points -> rank %d, %d skill points, %d general's points"), Logic->GetFrame(), *Arg,
-					P.RankLevel, P.SkillPoints, P.SciencePurchasePoints);
-			}
-			else if (What.Equals(TEXT("aiskill"), ESearchCase::IgnoreCase))
-			{
-				// The same for every computer player (they then spend the points on their skill set).
-				for (const FGenPlayer& P : Logic->GetPlayers())
+				const FVector2f Near(FCString::Atof(*Parts[2]), FCString::Atof(*Parts[3]));
+				TArray<FGenObjectID> Helicopters;
+				const FGenObject* Into = nullptr;
+				float BestDistSq = FLT_MAX;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
 				{
-					if (Logic->GetAI(P.Index))
+					const FGenObject* O = Logic->FindObject(Id);
+					if (!O || O->IsDead())
 					{
-						Logic->AddSkillPoints(P.Index, FCString::Atoi(*Arg));
+						continue;
+					}
+					if (O->GetOwner() == Local && O->GetTemplate()->bChinookAI)
+					{
+						Helicopters.Add(Id);
+					}
+					const float DistSq = FVector2f::DistSquared(FVector2f(O->GetPosition().X, O->GetPosition().Y), Near);
+					if (Parts.Num() >= 5 && O->GetTemplate()->Canonical()->Name.Equals(Parts[4], ESearchCase::IgnoreCase) && DistSq < BestDistSq)
+					{
+						BestDistSq = DistSq;
+						Into = O;
 					}
 				}
+				const bool bOk = !Into || Logic->CanCombatDropInto(*Into);
+				if (bOk)
+				{
+					Logic->IssueCombatDrop(Helicopters, Into ? Into->GetID() : GenInvalidObjectID, FVector3f(Near.X, Near.Y, Logic->GetGroundHeight(Near.X, Near.Y)));
+				}
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: combat drop by %d helicopter(s) at (%.0f, %.0f)%s%s%s"), Logic->GetFrame(), Helicopters.Num(), Near.X, Near.Y,
+					Into ? TEXT(" into ") : TEXT(""), Into ? *Into->GetTemplate()->Name : TEXT(""), bOk ? TEXT("") : TEXT(": not allowed"));
 			}
 			else if (What.Equals(TEXT("science"), ESearchCase::IgnoreCase))
 			{
@@ -652,15 +1459,164 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 				}
 				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: power %s at (%.0f, %.0f) %s"), Logic->GetFrame(), *Arg, At.X, At.Y, bReady ? TEXT("fired") : *Why);
 			}
-			else if (What.Equals(TEXT("rally"), ESearchCase::IgnoreCase) || What.Equals(TEXT("damage"), ESearchCase::IgnoreCase)
-				|| What.Equals(TEXT("repair"), ESearchCase::IgnoreCase) || What.Equals(TEXT("fix"), ESearchCase::IgnoreCase))
+			else if (What.Equals(TEXT("cost"), ESearchCase::IgnoreCase))
+			{
+				// "frame,cost,Template": what it costs us right now
+				const FGenThingTemplate* Thing = FGenGameData::Get().FindTemplate(Arg);
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: cost of %s: $%d (list price $%d)"), Logic->GetFrame(), *Arg,
+					Thing ? Logic->CalcCostToBuild(Local, *Thing) : -1, Thing ? int32(Thing->BuildCost) : -1);
+			}
+			else if (What.Equals(TEXT("hack"), ESearchCase::IgnoreCase))
+			{
+				// "frame,hack": our hackers sit down and hack the internet
+				TArray<FGenObjectID> Units;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (O && O->GetOwner() == Local && !O->IsDead() && O->GetTemplate()->HackInternet.bValid) { Units.Add(Id); }
+				}
+				Logic->IssueHackInternet(Units);
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: %d hackers told to hack the internet"), Logic->GetFrame(), Units.Num());
+			}
+			else if (What.Equals(TEXT("ability"), ESearchCase::IgnoreCase) || What.Equals(TEXT("weapon"), ESearchCase::IgnoreCase))
+			{
+				// "frame,ability,CommandButton[,x,y]": every unit of ours with that button uses its ability on
+				// whatever it can be used on nearest that spot (no spot: on nothing - "detonate").
+				// "frame,weapon,CommandButton,x,y": the same for a FIRE_WEAPON button.
+				const FGenCommandButton* Btn = FGenCommandData::Get().FindButton(Arg);
+				const FGenSpecialPowerTemplate* Power = Btn ? FGenUpgradeData::Get().FindPower(Btn->SpecialPower) : nullptr;
+				const bool bWeapon = What.Equals(TEXT("weapon"), ESearchCase::IgnoreCase);
+				const bool bHasSpot = Parts.Num() >= 5;
+				const FVector2f At = bHasSpot ? FVector2f(FCString::Atof(*Parts[3]), FCString::Atof(*Parts[4])) : FVector2f::ZeroVector;
+				TArray<FGenObjectID> Units;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (!O || O->GetOwner() != Local || O->IsDead() || !Btn)
+					{
+						continue;
+					}
+					const FGenCommandSet* Set = FGenCommandData::Get().FindSet(O->GetCommandSet());
+					for (int32 s = 0; Set && s < FGenCommandSet::NumSlots; ++s)
+					{
+						if (Set->Slots[s].Equals(Btn->Name, ESearchCase::IgnoreCase)) { Units.Add(Id); break; }
+					}
+				}
+				FGenObjectID Target = GenInvalidObjectID;
+				float BestDistSq = FLT_MAX;
+				const FGenObject* First = Units.Num() > 0 ? Logic->FindObject(Units[0]) : nullptr;
+				const int32 Module = (First && Power) ? Logic->FindPowerModule(*First, Power->Name) : INDEX_NONE;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (!bHasSpot || !First || !O || O->IsDead() || O->IsProjectile() || Units.Contains(Id))
+					{
+						continue;
+					}
+					if (bWeapon ? (Logic->GetRelationship(Local, O->GetOwner()) != EGenRelationship::Enemies || !O->IsAttackable())
+					: !Logic->CanUseAbilityOn(*First, Module, O, false))
+					{
+						continue;
+					}
+					const float DistSq = FVector2f::DistSquared(FVector2f(O->GetPosition().X, O->GetPosition().Y), At);
+					if (DistSq < BestDistSq)
+					{
+						BestDistSq = DistSq;
+						Target = Id;
+					}
+				}
+				const FGenObject* Victim = Logic->FindObject(Target);
+				int32 Ready = 0;
+				for (FGenObjectID Id : Units)
+				{
+					const FGenObject* U = Logic->FindObject(Id);
+					if (bWeapon)
+					{
+						++Ready;
+					}
+					else if (Power)
+					{
+						const int32 M = Logic->FindPowerModule(*U, Power->Name);
+						FString Why;
+						const bool bCan = Logic->CanUseAbilityOn(*U, M, Victim, true);
+						Ready += bCan ? 1 : 0;
+						if (!bCan && M != INDEX_NONE) { Logic->IsPowerReady(*U, M, nullptr, &Why); }
+						UE_CLOG(!bCan, LogGenerals, Log, TEXT("Test powers f%u: #%u %s can't: %s"), Logic->GetFrame(), Id, *U->GetTemplate()->Name,
+							Why.IsEmpty() ? TEXT("not on that") : *Why);
+						Logic->IssueSpecialPower(Id, Power->Name, Victim ? Victim->GetPosition() : U->GetPosition(), Target);
+					}
+				}
+				if (bWeapon && Btn && Victim)
+				{
+					Logic->IssueFireWeapon(Units, Target, Btn->WeaponSlot);
+				}
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: %s %s on %s at (%.0f, %.0f): %d of %d units can"), Logic->GetFrame(), *What, *Arg,
+					Victim ? *Victim->GetTemplate()->Name : (bHasSpot ? TEXT("(nothing there)") : TEXT("(no target)")), Victim ? Victim->GetPosition().X : At.X,
+					Victim ? Victim->GetPosition().Y : At.Y, Ready, Units.Num());
+			}
+			else if (What.Equals(TEXT("status"), ESearchCase::IgnoreCase))
+			{
+				// "frame,status,Type": anybody's objects of that type - whose, health, hacked / disabled, trapped; and our money
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (O && !O->IsDestroyed() && O->GetTemplate()->Canonical()->Name.Equals(Arg, ESearchCase::IgnoreCase))
+					{
+						UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: status #%u %s p%d at (%.0f, %.0f) hp=%.0f/%.0f%s%s%s%s%s [%s]"), Logic->GetFrame(), Id, *O->GetTemplate()->Name,
+							O->GetOwner(), O->GetPosition().X, O->GetPosition().Y, O->GetHealth(), O->GetMaxHealth(), O->IsDead() ? TEXT(" DEAD") : TEXT(""),
+							O->IsHacked() ? TEXT(" HACKED") : TEXT(""), O->IsDisabled() ? TEXT(" DISABLED") : TEXT(""), O->IsBoobyTrapped() ? TEXT(" TRAPPED") : TEXT(""),
+							O->IsHackingInternet() ? TEXT(" HACKING") : TEXT(""), *O->DescribeBusy());
+						UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: status #%u drawn: %s"), Logic->GetFrame(), Id, *Logic->DescribeObjectModel(Id));
+					}
+				}
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: status money p%d=$%d"), Logic->GetFrame(), Local, Logic->GetPlayers()[Local].Money);
+			}
+			else if (What.Equals(TEXT("capture"), ESearchCase::IgnoreCase))
+			{
+				// "frame,capture,x,y": all our units that can are sent to capture the building nearest that spot
+				// (anybody's but ours).
+				const FVector2f At = Parts.Num() >= 4 ? FVector2f(FCString::Atof(*Parts[2]), FCString::Atof(*Parts[3])) : FVector2f(float(CamGen.X), float(CamGen.Y));
+				FGenObjectID Target = GenInvalidObjectID;
+				float BestDistSq = FLT_MAX;
+				TArray<FGenObjectID> Units;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (!O || O->IsDead())
+					{
+						continue;
+					}
+					if (O->GetOwner() == Local)
+					{
+						if (O->GetTemplate()->Abilities.Num() > 0) { Units.Add(Id); }
+						continue;
+					}
+					const float DistSq = FVector2f::DistSquared(FVector2f(O->GetPosition().X, O->GetPosition().Y), At);
+					if (O->IsKindOf(TEXT("STRUCTURE")) && (O->IsKindOf(TEXT("CAPTURABLE")) || Logic->GetRelationship(Local, O->GetOwner()) == EGenRelationship::Enemies) && DistSq < BestDistSq)
+					{
+						BestDistSq = DistSq;
+						Target = Id;
+					}
+				}
+				const FGenObject* Victim = Logic->FindObject(Target);
+				int32 Able = 0;
+				for (FGenObjectID Id : Units)
+				{
+					Able += Victim && Logic->CanCaptureBuilding(*Logic->FindObject(Id), *Victim) ? 1 : 0;
+				}
+				Logic->IssueCapture(Units, Target);
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: capture %s at (%.0f, %.0f): %d of %d units can"), Logic->GetFrame(),
+					Victim ? *Victim->GetTemplate()->Name : TEXT("(nothing there)"), Victim ? Victim->GetPosition().X : At.X, Victim ? Victim->GetPosition().Y : At.Y, Able, Units.Num());
+			}
+			else if (What.Equals(TEXT("rally"), ESearchCase::IgnoreCase) || What.Equals(TEXT("repair"), ESearchCase::IgnoreCase)
+				|| What.Equals(TEXT("fix"), ESearchCase::IgnoreCase))
 			{
 				// These act on our first living object of the named type.
-				FGenObject* Subject = nullptr;
+				const FGenObject* Subject = nullptr;
 				TArray<FGenObjectID> Dozers, Vehicles;
 				for (FGenObjectID Id : Logic->GetObjectIDs())
 				{
-					FGenObject* O = Logic->FindObject(Id);
+					const FGenObject* O = Logic->FindObject(Id);
 					if (!O || O->GetOwner() != Local || O->IsDead())
 					{
 						continue;
@@ -679,13 +1635,6 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 					Logic->IssueSetRallyPoint({ Subject->GetID() }, FVector3f(At.X, At.Y, 0.f));
 					UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: rally point of #%u %s -> (%.0f, %.0f)"), Logic->GetFrame(), Subject->GetID(), *Arg, At.X, At.Y);
 				}
-				else if (What.Equals(TEXT("damage"), ESearchCase::IgnoreCase) && Parts.Num() >= 4)
-				{
-					const float Keep = Subject->GetMaxHealth() * FCString::Atof(*Parts[3]) / 100.f;
-					Subject->AttemptDamage(FMath::Max(0.f, Subject->GetHealth() - Keep), TEXT("UNRESISTABLE"), TEXT("NORMAL"), GenInvalidObjectID);
-					UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: #%u %s damaged to %.0f / %.0f"), Logic->GetFrame(), Subject->GetID(), *Arg,
-						Subject->GetHealth(), Subject->GetMaxHealth());
-				}
 				else if (What.Equals(TEXT("repair"), ESearchCase::IgnoreCase))
 				{
 					Logic->IssueRepair(Dozers, Subject->GetID());
@@ -698,9 +1647,12 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 					UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: %d damaged unit(s) sent to #%u %s for repairs"), Logic->GetFrame(), Vehicles.Num(), Subject->GetID(), *Arg);
 				}
 			}
-			else if (What.Equals(TEXT("enter"), ESearchCase::IgnoreCase) || What.Equals(TEXT("evacuate"), ESearchCase::IgnoreCase))
+			else if (What.Equals(TEXT("enter"), ESearchCase::IgnoreCase) || What.Equals(TEXT("evacuate"), ESearchCase::IgnoreCase)
+				|| What.Equals(TEXT("enemyenter"), ESearchCase::IgnoreCase))
 			{
-				const bool bEnter = What.Equals(TEXT("enter"), ESearchCase::IgnoreCase);
+				// ("enemyenter": the same for the other players' units - to put somebody into a building we mean to clear.)
+				const bool bEnemyUnits = What.Equals(TEXT("enemyenter"), ESearchCase::IgnoreCase);
+				const bool bEnter = bEnemyUnits || What.Equals(TEXT("enter"), ESearchCase::IgnoreCase);
 				const FString ContainerType = bEnter ? (Parts.Num() >= 4 ? Parts[3] : FString()) : Arg;
 				// (Nearest the camera target, or nearest the spot given after the type: "enter,Unit,Type,x,y", "evacuate,Type,x,y".)
 				const int32 XY = bEnter ? 4 : 3;
@@ -711,7 +1663,8 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 				{
 					const FGenObject* O = Logic->FindObject(Id);
 					const float DistSq = O ? FVector2f::DistSquared(FVector2f(O->GetPosition().X, O->GetPosition().Y), Near) : 0.f;
-					if (O && !O->IsDead() && O->GetContain() && O->GetTemplate()->Canonical()->Name.Equals(ContainerType, ESearchCase::IgnoreCase) && DistSq < BestDistSq)
+					// (Something without room inside can be "entered" too: a pilot climbs into a tank.)
+					if (O && !O->IsDead() && (bEnter || O->GetContain()) && O->GetTemplate()->Canonical()->Name.Equals(ContainerType, ESearchCase::IgnoreCase) && DistSq < BestDistSq)
 					{
 						BestDistSq = DistSq;
 						Container = O;
@@ -727,7 +1680,8 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 					for (FGenObjectID Id : Logic->GetObjectIDs())
 					{
 						const FGenObject* O = Logic->FindObject(Id);
-						if (O && O->GetOwner() == Local && (Arg == TEXT("*") || O->GetTemplate()->Canonical()->Name.Equals(Arg, ESearchCase::IgnoreCase))
+						if (O && (bEnemyUnits ? (O->GetOwner() != Local && O->GetOwner() != 0) : O->GetOwner() == Local)
+							&& (Arg == TEXT("*") || O->GetTemplate()->Canonical()->Name.Equals(Arg, ESearchCase::IgnoreCase))
 							&& Logic->CanEnterObject(*O, *Container, false))
 						{
 							Units.Add(Id);
@@ -759,44 +1713,288 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 				else { Logic->IssueAttackMove(Units, At); }
 				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: %d unit(s) told to %s (%.0f, %.0f)"), Logic->GetFrame(), Units.Num(), *What, At.X, At.Y);
 			}
-			else if (What.Equals(TEXT("destroy"), ESearchCase::IgnoreCase) && Parts.Num() >= 5)
+			else if (What.Equals(TEXT("attack"), ESearchCase::IgnoreCase) && Parts.Num() >= 5)
 			{
+				// "frame,attack,Type,x,y": everything of ours that moves and fights attacks the object of that type
+				// nearest the spot (a player's attack order on it).
 				const FVector2f Near(FCString::Atof(*Parts[3]), FCString::Atof(*Parts[4]));
-				FGenObject* Victim = nullptr;
+				const FGenObject* Victim = nullptr;
 				float BestDistSq = FLT_MAX;
+				TArray<FGenObjectID> Units;
 				for (FGenObjectID Id : Logic->GetObjectIDs())
 				{
-					FGenObject* O = Logic->FindObject(Id);
-					const float DistSq = O ? FVector2f::DistSquared(FVector2f(O->GetPosition().X, O->GetPosition().Y), Near) : 0.f;
-					if (O && !O->IsDead() && O->GetTemplate()->Canonical()->Name.Equals(Arg, ESearchCase::IgnoreCase) && DistSq < BestDistSq)
+					const FGenObject* O = Logic->FindObject(Id);
+					if (!O || O->IsDead())
+					{
+						continue;
+					}
+					const float DistSq = FVector2f::DistSquared(FVector2f(O->GetPosition().X, O->GetPosition().Y), Near);
+					if (O->GetTemplate()->Canonical()->Name.Equals(Arg, ESearchCase::IgnoreCase) && DistSq < BestDistSq)
 					{
 						BestDistSq = DistSq;
 						Victim = O;
 					}
-				}
-				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: destroy %s: %s"), Logic->GetFrame(), *Arg, Victim ? TEXT("done") : TEXT("none found"));
-				if (Victim)
-				{
-					Victim->Kill();
-				}
-			}
-			else if (What.Equals(TEXT("vet"), ESearchCase::IgnoreCase) && Parts.Num() >= 4)
-			{
-				int32 Count = 0;
-				for (FGenObjectID Id : Logic->GetObjectIDs())
-				{
-					FGenObject* O = Logic->FindObject(Id);
-					if (O && O->GetOwner() == Local && !O->IsDead() && O->GetTemplate()->Canonical()->Name.Equals(Arg, ESearchCase::IgnoreCase))
+					if (O->GetOwner() == Local && O->CanMove() && O->HasWeapons())
 					{
-						O->SetVeterancyLevel(FCString::Atoi(*Parts[3]));
-						++Count;
+						Units.Add(Id);
 					}
 				}
-				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: %d %s set to veterancy level %s"), Logic->GetFrame(), Count, *Arg, *Parts[3]);
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: %d unit(s) attack %s #%u"), Logic->GetFrame(), Units.Num(), *Arg, Victim ? Victim->GetID() : 0u);
+				if (Victim)
+				{
+					Logic->IssueAttack(Units, Victim->GetID());
+				}
 			}
-			else if (What.Equals(TEXT("money"), ESearchCase::IgnoreCase))
+			else if (What.Equals(TEXT("build"), ESearchCase::IgnoreCase) && Parts.Num() >= 5)
 			{
-				Logic->AddMoney(Local, FCString::Atoi(*Arg));
+				// "frame,build,Building,x,y": a dozer of ours with nothing to do puts it up there
+				const FGenThingTemplate* T = FGenGameData::Get().FindTemplate(Arg);
+				const FVector3f Pos(FCString::Atof(*Parts[3]), FCString::Atof(*Parts[4]), Logic->GetGroundHeight(FCString::Atof(*Parts[3]), FCString::Atof(*Parts[4])));
+				FGenObjectID Dozer = GenInvalidObjectID;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (O && O->GetOwner() == Local && O->GetTemplate()->bIsDozer && !O->IsDead() && !O->HasDozerTask())
+					{
+						Dozer = Id;
+						break;
+					}
+				}
+				const bool bLegal = T && Logic->IsLocationLegalToBuild(*T, Pos, T->PlacementViewAngle);
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: build %s at (%.0f, %.0f, %.1f) by #%u, legal=%d, can make=%d"), Logic->GetFrame(), *Arg, Pos.X, Pos.Y, Pos.Z, Dozer,
+					bLegal ? 1 : 0, T && Logic->CanMake(Local, *T) ? 1 : 0);
+				if (T && Dozer != GenInvalidObjectID)
+				{
+					Logic->IssueConstruct(Dozer, Arg, Pos, T->PlacementViewAngle);
+				}
+			}
+			else if (What.Equals(TEXT("queue"), ESearchCase::IgnoreCase))
+			{
+				// "frame,queue,Unit": at the first building of ours whose command set builds it
+				bool bQueued = false;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					const FGenThingTemplate* T = FGenGameData::Get().FindTemplate(Arg);
+					if (T && O && O->GetOwner() == Local && !O->IsDead() && !O->IsUnderConstruction() && Logic->CanFactoryMake(*O, *T))
+					{
+						Logic->IssueQueueUnit(Id, Arg);
+						bQueued = true;
+						break;
+					}
+				}
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: queue %s: %s"), Logic->GetFrame(), *Arg, bQueued ? TEXT("queued") : TEXT("nothing of ours can make it"));
+			}
+			else if (What.Equals(TEXT("sell"), ESearchCase::IgnoreCase))
+			{
+				// "frame,sell,Building": the first of ours of that type
+				bool bSold = false;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (O && O->GetOwner() == Local && !O->IsDead() && !O->IsBeingSold() && O->GetTemplate()->Canonical()->Name.Equals(Arg, ESearchCase::IgnoreCase))
+					{
+						Logic->IssueSell(Id);
+						bSold = true;
+						break;
+					}
+				}
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: sell %s: %s"), Logic->GetFrame(), *Arg, bSold ? TEXT("being sold") : TEXT("none of ours"));
+			}
+			else if (What.Equals(TEXT("sound"), ESearchCase::IgnoreCase))
+			{
+				// An audio event by name: at x,y if given, otherwise as an interface sound of ours.
+				UGenAudioManager* Audio = Logic->GetAudio();
+				uint32 Handle = 0;
+				if (Audio && Parts.Num() >= 5)
+				{
+					const FVector2f At(FCString::Atof(*Parts[3]), FCString::Atof(*Parts[4]));
+					Handle = Audio->PlayAt(Arg, FVector3f(At.X, At.Y, Logic->GetGroundHeight(At.X, At.Y)), Local);
+				}
+				else if (Audio)
+				{
+					Handle = Audio->PlayUI(Arg, Local);
+				}
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: sound %s %s"), Logic->GetFrame(), *Arg, Handle ? TEXT("playing") : TEXT("NOT PLAYED"));
+			}
+			else if (What.Equals(TEXT("voice"), ESearchCase::IgnoreCase) && Parts.Num() >= 4)
+			{
+				// One of our objects of that type says one of its lines ("voice,VoiceMove,AmericaTankCrusader").
+				const FGenThingTemplate* Type = FGenGameData::Get().FindTemplate(Parts[3]);
+				bool bSaid = false;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (Type && O && O->GetOwner() == Local && !O->IsDead() && O->GetTemplate()->Canonical() == Type->Canonical())
+					{
+						Logic->PlayObjectSound(*O, { *Arg });
+						bSaid = true;
+						break;
+					}
+				}
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: voice %s of %s %s"), Logic->GetFrame(), *Arg, *Parts[3], bSaid ? TEXT("asked for") : TEXT("NO SUCH OBJECT"));
+			}
+			else if (What.Equals(TEXT("eva"), ESearchCase::IgnoreCase))
+			{
+				Logic->EvaEvent(*Arg, Local);
+			}
+			else if (What.Equals(TEXT("music"), ESearchCase::IgnoreCase))
+			{
+				if (UGenAudioManager* Audio = Logic->GetAudio()) { Audio->PlayMusic(Arg); }
+			}
+			else if (What.Equals(TEXT("exec"), ESearchCase::IgnoreCase))
+			{
+				// "frame,exec,console command": e.g. "stat dumpave -num=300 -ms=0.1" (the engine's own timers, to the log)
+				if (GEngine)
+				{
+					GEngine->Exec(GetWorld(), *Arg);
+				}
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: exec '%s'"), Logic->GetFrame(), *Arg);
+			}
+			else if (What.Equals(TEXT("speed"), ESearchCase::IgnoreCase))
+			{
+				// "frame,speed,N": the game runs at N times its speed from here on
+				Logic->SetTimeScale(FCString::Atof(*Arg));
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: speed x%s"), Logic->GetFrame(), *Arg);
+			}
+			else if (What.Equals(TEXT("busy"), ESearchCase::IgnoreCase))
+			{
+				// "frame,busy": the camera goes to where most units are (the thick of it)
+				TMap<FIntPoint, int32> Cells;
+				FIntPoint Best(0, 0);
+				int32 BestNum = 0;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (!O || O->IsDead() || !O->CanMove() || O->IsProjectile())
+					{
+						continue;
+					}
+					const FIntPoint Cell(FMath::FloorToInt32(O->GetPosition().X / 150.f), FMath::FloorToInt32(O->GetPosition().Y / 150.f));
+					const int32 Num = ++Cells.FindOrAdd(Cell);
+					if (Num > BestNum)
+					{
+						BestNum = Num;
+						Best = Cell;
+					}
+				}
+				const FVector3f At((float(Best.X) + 0.5f) * 150.f, (float(Best.Y) + 0.5f) * 150.f, 0.f);
+				if (AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC))
+				{
+					GenPC->LookAt(At);
+				}
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: camera to (%.0f, %.0f), %d units there"), Logic->GetFrame(), At.X, At.Y, BestNum);
+			}
+			else if (What.Equals(TEXT("formation"), ESearchCase::IgnoreCase))
+			{
+				// "frame,formation[,Kind or Type]": Ctrl+F for everything of ours that moves (of that kind or type).
+				TArray<FGenObjectID> Units;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (O && O->GetOwner() == Local && O->CanMove() && !O->IsDead()
+						&& (Parts.Num() < 3 || O->IsKindOf(*Parts[2]) || O->GetTemplate()->Name.Equals(Parts[2], ESearchCase::IgnoreCase)))
+					{
+						Units.Add(Id);
+					}
+				}
+				Logic->IssueCreateFormation(Units);
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: formation of %d units"), Logic->GetFrame(), Units.Num());
+			}
+			else if (What.Equals(TEXT("move"), ESearchCase::IgnoreCase) && Parts.Num() >= 4)
+			{
+				// Everything of ours that moves goes there ("frame,move,x,y[,Kind or Type]": only that kind or type).
+				const FVector2f At(FCString::Atof(*Parts[2]), FCString::Atof(*Parts[3]));
+				TArray<FGenObjectID> Units;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (O && O->GetOwner() == Local && O->CanMove() && !O->IsDead()
+						&& (Parts.Num() < 5 || O->IsKindOf(*Parts[4]) || O->GetTemplate()->Name.Equals(Parts[4], ESearchCase::IgnoreCase)))
+					{
+						Units.Add(Id);
+					}
+				}
+				Logic->IssueMove(Units, FVector3f(At.X, At.Y, Logic->GetGroundHeight(At.X, At.Y)));
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: move %d units to (%.0f, %.0f)"), Logic->GetFrame(), Units.Num(), At.X, At.Y);
+			}
+			else if (What.Equals(TEXT("desync"), ESearchCase::IgnoreCase))
+			{
+				// "frame,desync": a dollar for us here only, not as an order - this game comes apart from the others
+				// (a test of the network game's mismatch check).
+				Logic->AddMoney(Local, 1);
+				UE_LOG(LogGenerals, Warning, TEXT("Test powers f%u: desync - $1 added outside the orders"), Logic->GetFrame());
+			}
+			else if (What.Equals(TEXT("allymove"), ESearchCase::IgnoreCase) && Parts.Num() >= 4)
+			{
+				// "frame,allymove,x,y": what of a dropped-out ally's we may command (a network game) goes there.
+				const FVector2f At(FCString::Atof(*Parts[2]), FCString::Atof(*Parts[3]));
+				TArray<FGenObjectID> Units;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (O && O->GetOwner() != Local && Logic->CanPlayerCommand(Local, *O) && O->CanMove() && !O->IsDead())
+					{
+						Units.Add(Id);
+					}
+				}
+				Logic->IssueMove(Units, FVector3f(At.X, At.Y, Logic->GetGroundHeight(At.X, At.Y)));
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: allymove %d units of an absent ally to (%.0f, %.0f)"), Logic->GetFrame(), Units.Num(), At.X, At.Y);
+			}
+			else if (What.Equals(TEXT("fog"), ESearchCase::IgnoreCase))
+			{
+				// What the local player sees of everything of that type (anybody's), or of everything that isn't ours ("*").
+				static const TCHAR* StatusNames[] = { TEXT("clear"), TEXT("partly clear"), TEXT("fogged (remembered)"), TEXT("shrouded") };
+				static const TCHAR* CellNames[] = { TEXT("clear"), TEXT("fogged"), TEXT("shrouded") };
+				const FGenThingTemplate* Type = FGenGameData::Get().FindTemplate(Arg);
+				int32 Shown = 0, Hidden = 0;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (!O || O->IsDestroyed() || (Type ? O->GetTemplate()->Canonical() != Type->Canonical() : (O->GetOwner() == Local || O->GetOwner() == 0)))
+					{
+						continue;
+					}
+					const bool bVisible = Logic->IsVisibleToLocalPlayer(*O);
+					(bVisible ? Shown : Hidden)++;
+					if (Type || Shown + Hidden <= 40)
+					{
+						UE_LOG(LogGenerals, Log, TEXT("  [fog f%u] #%u p%d %s at (%.0f, %.0f): %s, %s, cell %s, on radar %d%s%s"), Logic->GetFrame(), Id, O->GetOwner(),
+							*O->GetTemplate()->Name, O->GetPosition().X, O->GetPosition().Y, StatusNames[int32(O->GetLocalShroud())], bVisible ? TEXT("drawn") : TEXT("hidden"),
+							CellNames[int32(Logic->GetShroud().GetStatusAt(Local, O->GetPosition().X, O->GetPosition().Y))], Logic->IsOnRadar(*O) ? 1 : 0,
+							O->IsStealthed() ? TEXT(", STEALTHED") : TEXT(""), O->IsDetected() ? TEXT(", DETECTED") : TEXT(""));
+					}
+				}
+				UE_LOG(LogGenerals, Log, TEXT("  [fog f%u] %s: %d drawn, %d hidden; radar %s"), Logic->GetFrame(), Type ? *Arg : TEXT("other players' objects"), Shown, Hidden,
+					Logic->HasRadar(Local) ? TEXT("online") : TEXT("offline"));
+			}
+			else if (What.Equals(TEXT("radar"), ESearchCase::IgnoreCase) && Parts.Num() >= 4)
+			{
+				// A left click on the radar at the spot that shows this world position (the HUD's own click path).
+				AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC);
+				const FVector2f At(FCString::Atof(*Parts[2]), FCString::Atof(*Parts[3]));
+				bool bDone = false;
+				if (GenPC && GenPC->GetControlBar().Radar.bIsValid)
+				{
+					const FGenControlBar& Bar = GenPC->GetControlBar();
+					const FBox2D Rect = GenRadar::FindDrawRect(Bar.Radar, Bar.RadarMapSize);
+					const FVector2D Pixel = GenRadar::RadarToPixel(FVector2D(At.X / Bar.RadarMapSize.X * GenRadar::CellWidth, At.Y / Bar.RadarMapSize.Y * GenRadar::CellHeight), Rect);
+					bDone = GenPC->RadarClick(Pixel, false) && GenPC->RadarClick(Pixel, true);
+				}
+				const AGenCameraPawn* NowCam = PC ? Cast<AGenCameraPawn>(PC->GetPawn()) : nullptr;
+				const FVector NowGen = NowCam ? GenCoords::FromUE(NowCam->GetTarget()) : FVector::ZeroVector;
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: radar click at (%.0f, %.0f) %s; the view is now at (%.0f, %.0f)"), Logic->GetFrame(), At.X, At.Y,
+					bDone ? TEXT("done") : TEXT("NOT POSSIBLE (no radar, or off the map)"), NowGen.X, NowGen.Y);
+			}
+			else if (What.Equals(TEXT("event"), ESearchCase::IgnoreCase))
+			{
+				// Space: the view jumps to the last thing the radar reported.
+				AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC);
+				FVector3f EventPos;
+				const bool bHas = Logic->GetLastRadarEventPos(EventPos);
+				if (bHas && GenPC) { GenPC->LookAt(EventPos); }
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: last radar event %s (%.0f, %.0f), %d events so far"), Logic->GetFrame(),
+					bHas ? TEXT("at") : TEXT("NONE"), EventPos.X, EventPos.Y, Logic->GetRadarEvents().Num());
 			}
 			else if (What.Equals(TEXT("generals"), ESearchCase::IgnoreCase))
 			{
@@ -815,8 +2013,122 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 			{
 				AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC);
 				const FVector2f At(FCString::Atof(*Parts[2]), FCString::Atof(*Parts[3]));
-				const bool bFired = GenPC && GenPC->TestFireAt(FVector3f(At.X, At.Y, Logic->GetGroundHeight(At.X, At.Y)));
+				// ("frame,target,x,y[,degrees]": a building being placed is turned that way first - the drag that rotates it.)
+				const float* Angle = nullptr;
+				float Degrees = 0.f;
+				if (Parts.Num() >= 5)
+				{
+					Degrees = FCString::Atof(*Parts[4]);
+					Angle = &Degrees;
+				}
+				const bool bFired = GenPC && GenPC->TestFireAt(FVector3f(At.X, At.Y, Logic->GetGroundHeight(At.X, At.Y)), Angle);
 				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: target (%.0f, %.0f) %s"), Logic->GetFrame(), At.X, At.Y, bFired ? TEXT("fired") : TEXT("NOTHING BEING AIMED"));
+			}
+			else if (What.Equals(TEXT("pick"), ESearchCase::IgnoreCase) && Parts.Num() >= 4)
+			{
+				// "frame,pick,x,y[,select|hover]": what the cursor would be on with that spot of the ground under it (the pick
+				// itself, by way of the screen); "select" selects it, "hover" leaves the cursor on it.
+				AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC);
+				const FVector2f At(FCString::Atof(*Parts[2]), FCString::Atof(*Parts[3]));
+				FVector2D Screen(0.0, 0.0);
+				const FGenObjectID Hit = GenPC ? GenPC->TestPickAt(FVector3f(At.X, At.Y, Logic->GetGroundHeight(At.X, At.Y)), &Screen) : GenInvalidObjectID;
+				const FGenObject* O = Logic->FindObject(Hit);
+				const FString Mode = Parts.Num() >= 5 ? Parts[4] : FString();
+				if (GenPC && Mode.Equals(TEXT("select"), ESearchCase::IgnoreCase))
+				{
+					TArray<FGenObjectID> Sel;
+					if (O) { Sel.Add(Hit); }
+					GenPC->SetSelection(Sel);
+					Logic->FlashSelected(Hit); // (as the click does: Drawable::onSelected)
+				}
+				FString Cursor;
+				if (GenPC && Mode.Equals(TEXT("hover"), ESearchCase::IgnoreCase))
+				{
+					GenPC->TestHoverAt(FVector3f(At.X, At.Y, Logic->GetGroundHeight(At.X, At.Y)));
+					Cursor = TEXT(", cursor ") + GenPC->GetCursorName();
+				}
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: pick at (%.0f, %.0f), pixel (%.0f, %.0f): %s%s%s"), Logic->GetFrame(), At.X, At.Y, Screen.X, Screen.Y,
+					O ? *FString::Printf(TEXT("#%u %s"), Hit, *O->GetTemplate()->Name) : TEXT("nothing"), Mode.IsEmpty() ? TEXT("") : *(TEXT(" (") + Mode + TEXT(")")), *Cursor);
+			}
+			else if ((What.Equals(TEXT("forceclick"), ESearchCase::IgnoreCase) || What.Equals(TEXT("leftclick"), ESearchCase::IgnoreCase)
+				|| What.Equals(TEXT("waypointclick"), ESearchCase::IgnoreCase)) && Parts.Num() >= 4)
+			{
+				// "frame,forceclick,x,y" / "frame,waypointclick,x,y" / "frame,leftclick,x,y": a left click with that spot of
+				// the ground under the cursor, with Ctrl held (force attack), Alt (a waypoint; Alt stays held from then
+				// on, so the routes are drawn) or neither, for whatever is selected
+				AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC);
+				const FVector2f At(FCString::Atof(*Parts[2]), FCString::Atof(*Parts[3]));
+				const bool bForce = What.Equals(TEXT("forceclick"), ESearchCase::IgnoreCase);
+				const bool bWaypoint = What.Equals(TEXT("waypointclick"), ESearchCase::IgnoreCase);
+				const FString Done = GenPC ? GenPC->TestClickAt(FVector3f(At.X, At.Y, Logic->GetGroundHeight(At.X, At.Y)), bForce, bWaypoint) : FString(TEXT("no controller"));
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: %s at (%.0f, %.0f) %s"), Logic->GetFrame(), *What, At.X, At.Y, *Done);
+			}
+			else if (What.Equals(TEXT("steer"), ESearchCase::IgnoreCase) && Parts.Num() >= 4)
+			{
+				// "frame,steer,x,y": our gunships on their run are told to fire there
+				const FVector2f At(FCString::Atof(*Parts[2]), FCString::Atof(*Parts[3]));
+				TArray<FGenObjectID> Ships;
+				for (FGenObjectID Id : Logic->GetGunships())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (O && O->GetOwner() == Local && O->IsGunshipSteerable()) { Ships.Add(Id); }
+				}
+				Logic->IssueSteerGunship(Ships, FVector3f(At.X, At.Y, 0.f));
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: steer %d gunship(s) to (%.0f, %.0f)"), Logic->GetFrame(), Ships.Num(), At.X, At.Y);
+			}
+			else if (What.Equals(TEXT("selkey"), ESearchCase::IgnoreCase))
+			{
+				// "frame,selkey,what[,n]": a selection key - create / select / add / view with a group's number
+				// (Ctrl + n, n, Shift + n, Alt + n), match (E), matchmap, all (Q), aircraft (W), double (a double click)
+				AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC);
+				const int32 Group = Parts.Num() >= 4 ? FCString::Atoi(*Parts[3]) : 1;
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: selkey %s %d: %s"), Logic->GetFrame(), *Arg, Group, GenPC ? *GenPC->TestSelectionKey(Arg, Group) : TEXT("no controller"));
+			}
+			else if (What.Equals(TEXT("pickscan"), ESearchCase::IgnoreCase))
+			{
+				// "frame,pickscan,Type": the object of that type nearest the camera target, picked at along two lines through
+				// it - across the screen and up it - from two of its radii on one side to two on the other, a quarter
+				// of a radius a step: '#' where the cursor would be on it, 'o' on something else, '.' on nothing.
+				AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC);
+				const FGenObject* Best = nullptr;
+				float BestDistSq = FLT_MAX;
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					const float DistSq = O ? FVector2f::DistSquared(FVector2f(O->GetPosition().X, O->GetPosition().Y), FVector2f(float(CamGen.X), float(CamGen.Y))) : 0.f;
+					if (O && !O->IsDestroyed() && O->GetTemplate()->Canonical()->Name.Equals(Arg, ESearchCase::IgnoreCase) && DistSq < BestDistSq)
+					{
+						BestDistSq = DistSq;
+						Best = O;
+					}
+				}
+				if (Best && GenPC)
+				{
+					const float R = FMath::Max(Best->GetTemplate()->GetBoundingCircleRadius(), 2.f);
+					const FVector3f P = Best->GetPosition();
+					FString Across, Up;
+					int32 OnIt = 0;
+					for (int32 i = -8; i <= 8; ++i)
+					{
+						const float Off = float(i) * R * 0.25f;
+						const FGenObjectID A = GenPC->TestPickAt(FVector3f(P.X + Off, P.Y, P.Z));
+						const FGenObjectID U = GenPC->TestPickAt(FVector3f(P.X, P.Y + Off, P.Z));
+						Across += A == Best->GetID() ? TEXT("#") : (A != GenInvalidObjectID ? TEXT("o") : TEXT("."));
+						Up += U == Best->GetID() ? TEXT("#") : (U != GenInvalidObjectID ? TEXT("o") : TEXT("."));
+						OnIt += A == Best->GetID() ? 1 : 0;
+					}
+					const double Began = FPlatformTime::Seconds();
+					for (int32 i = 0; i < 20; ++i)
+					{
+						GenPC->TestPickAt(FVector3f(P.X + float(i - 10) * R * 0.1f, P.Y, P.Z));
+					}
+					UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: pickscan #%u %s (radius %.1f, the middle nine are within it): across [%s] up [%s]; a pick takes %.0f microseconds among %d objects"),
+						Logic->GetFrame(), Best->GetID(), *Best->GetTemplate()->Name, R, *Across, *Up, (FPlatformTime::Seconds() - Began) * 1.e6 / 20.0, Logic->GetObjectIDs().Num());
+				}
+				else
+				{
+					UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: pickscan %s: NONE THERE"), Logic->GetFrame(), *Arg);
+				}
 			}
 		}
 	}
@@ -879,8 +2191,16 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 			FString Inside;
 			if (O->GetVeterancyLevel() > 0 || O->GetExperience() > 0) { Inside = FString::Printf(TEXT(" vet=%d xp=%d"), O->GetVeterancyLevel(), O->GetExperience()); }
 			if (O->GetAIMode() != EGenAIMode::None) { Inside += FString::Printf(TEXT(" mode=%d"), int32(O->GetAIMode())); }
+			if (O->IsStealthed()) { Inside += O->IsDetected() ? TEXT(" stealthed+detected") : TEXT(" stealthed"); }
 			if (O->IsContained()) { Inside += FString::Printf(TEXT(" in=#%u"), O->GetContainedBy()); }
 			else if (O->GetContain()) { Inside += FString::Printf(TEXT(" riders=%d"), Logic->GetRiders(*O).Num()); }
+			if (O->HasChassis())
+			{
+				const FGenObject::FChassisPose& C = O->GetDrawChassis();
+				const FGenObject::FWheelInfo& W = O->GetDrawWheels();
+				Inside += FString::Printf(TEXT(" body=%.1f/%.1f/%.1f wheels=%.1f %.1f/%.1f/%.1f/%.1f"), FMath::RadiansToDegrees(C.Pitch), FMath::RadiansToDegrees(C.Roll), C.Z,
+					FMath::RadiansToDegrees(W.Angle), W.FrontLeft, W.FrontRight, W.RearLeft, W.RearRight);
+			}
 			const FString Jet = O->GetTemplate()->bJetAI ? FString::Printf(TEXT(" jet=%d%s ammo=%d speed=%.0f"), int32(O->GetJetState()),
 				O->IsParked() ? TEXT(" parked") : TEXT(""), O->GetWeapon(0).AmmoInClip,
 				FVector2f(O->GetVelocity().X, O->GetVelocity().Y).Size() * float(GenLogic::GetLogicFPS())) : FString();
@@ -943,6 +2263,44 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 	else if (ShotState == 1 && Elapsed >= 1.5f)
 	{
 		ShotState = 2;
+		SaveAudioRecording();
+		SaveReplay();
 		FPlatformMisc::RequestExit(false, TEXT("GenShot complete"));
 	}
+}
+
+void AGenGameMode::SaveAudioRecording()
+{
+	if (RecordAudioPath.IsEmpty())
+	{
+		return;
+	}
+	Audio::FMixerDevice* Mixer = FAudioDeviceManager::GetAudioMixerDeviceFromWorldContext(this);
+	if (!Mixer)
+	{
+		return;
+	}
+	float NumChannels = 2.f, SampleRate = 48000.f;
+	const Audio::FAlignedFloatBuffer& Buffer = Mixer->StopRecording(nullptr, NumChannels, SampleRate);
+	// 16-bit PCM WAVE
+	TArray<uint8> Out;
+	auto U32 = [&Out](uint32 V) { Out.Append(reinterpret_cast<const uint8*>(&V), 4); };
+	auto U16 = [&Out](uint16 V) { Out.Append(reinterpret_cast<const uint8*>(&V), 2); };
+	const int32 Channels = FMath::Max(1, int32(NumChannels));
+	const uint32 DataBytes = uint32(Buffer.Num()) * 2;
+	Out.Reserve(44 + int32(DataBytes));
+	Out.Append(reinterpret_cast<const uint8*>("RIFF"), 4); U32(36 + DataBytes);
+	Out.Append(reinterpret_cast<const uint8*>("WAVEfmt "), 8); U32(16); U16(1); U16(uint16(Channels));
+	U32(uint32(SampleRate)); U32(uint32(SampleRate) * uint32(Channels) * 2); U16(uint16(Channels * 2)); U16(16);
+	Out.Append(reinterpret_cast<const uint8*>("data"), 4); U32(DataBytes);
+	float Peak = 0.f;
+	for (float Sample : Buffer)
+	{
+		Peak = FMath::Max(Peak, FMath::Abs(Sample));
+		U16(uint16(int16(FMath::Clamp(FMath::RoundToInt32(Sample * 32767.f), -32768, 32767))));
+	}
+	const bool bSaved = FFileHelper::SaveArrayToFile(Out, *RecordAudioPath);
+	UE_LOG(LogGenerals, Log, TEXT("Audio recording: %.1f s (of %.1f s of game time), %d channels, %d Hz, peak %.3f -> %s (%s)"), float(Buffer.Num()) / FMath::Max(1.f, float(Channels) * SampleRate),
+		GetWorld()->GetRealTimeSeconds() - RecordStartSeconds, Channels, int32(SampleRate), Peak, *RecordAudioPath, bSaved ? TEXT("saved") : TEXT("NOT SAVED"));
+	RecordAudioPath.Reset();
 }

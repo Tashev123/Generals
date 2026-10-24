@@ -3,6 +3,7 @@
 // VeterancyGainCreate.cpp and VictoryConditions.cpp (with Player::killPlayer).
 
 #include "Logic/GenGameLogic.h"
+#include "Core/GenPerf.h"
 #include "Logic/GenGameData.h"
 #include "Logic/GenObject.h"
 #include "Logic/GenSkirmishAI.h"
@@ -26,11 +27,12 @@ void FGenObject::InitVeterancy()
 	if (Template->VeterancyStartLevel > 0
 		&& (Template->VeterancyStartScience.IsEmpty() || Logic->HasScience(Owner, Template->VeterancyStartScience)))
 	{
-		SetVeterancyLevel(Template->VeterancyStartLevel);
+		// (Born at that level, it isn't "promoted": no sound, no notice - the user asked for none.)
+		SetVeterancyLevel(Template->VeterancyStartLevel, false);
 	}
 }
 
-void FGenObject::SetVeterancyLevel(int32 NewLevel)
+void FGenObject::SetVeterancyLevel(int32 NewLevel, bool bProvideFeedback)
 {
 	// ExperienceTracker::setVeterancyLevel: at that level, with the least experience it takes.
 	NewLevel = FMath::Clamp(NewLevel, 0, 3);
@@ -39,7 +41,7 @@ void FGenObject::SetVeterancyLevel(int32 NewLevel)
 		const int32 Old = VeterancyLevel;
 		VeterancyLevel = NewLevel;
 		Experience = Template->ExperienceRequired[NewLevel];
-		OnVeterancyLevelChanged(Old, NewLevel);
+		OnVeterancyLevelChanged(Old, NewLevel, bProvideFeedback);
 	}
 }
 
@@ -64,7 +66,7 @@ void FGenObject::AddExperience(int32 Points)
 	}
 }
 
-void FGenObject::OnVeterancyLevelChanged(int32 OldLevel, int32 NewLevel)
+void FGenObject::OnVeterancyLevelChanged(int32 OldLevel, int32 NewLevel, bool bProvideFeedback)
 {
 	// Object::onVeterancyLevelChanged: the level's weapon set and weapon bonuses replace the old level's.
 	for (int32 i = 1; i < 4; ++i)
@@ -98,7 +100,7 @@ void FGenObject::OnVeterancyLevelChanged(int32 OldLevel, int32 NewLevel)
 
 	UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [vet f%u] #%u %s is now %s (experience %d, health %.0f / %.0f)"), Logic->GetFrame(), ID, *Template->Name,
 		VeterancyNames[NewLevel], Experience, Health, MaxHealth);
-	if (NewLevel > OldLevel && Logic->GetFrame() > 1)
+	if (NewLevel > OldLevel && Logic->GetFrame() > 1 && bProvideFeedback)
 	{
 		Logic->AnnounceVeterancy(*this, VeterancyNames[NewLevel]);
 	}
@@ -111,6 +113,10 @@ void UGenGameLogic::AnnounceVeterancy(const FGenObject& Obj, const TCHAR* LevelN
 	{
 		return;
 	}
+	// Object::onVeterancyLevelChanged: the unit's own promotion sound, and the notification.
+	static const TCHAR* PromotedKeys[4] = { TEXT(""), TEXT("SoundPromotedVeteran"), TEXT("SoundPromotedElite"), TEXT("SoundPromotedHero") };
+	PlayObjectSound(Obj, { PromotedKeys[FMath::Clamp(Obj.GetVeterancyLevel(), 1, 3)] });
+	PlayMiscSound(TEXT("UnitPromoted"), Obj.GetOwner());
 	FGenFloatingText& Text = FloatingTexts.AddDefaulted_GetRef();
 	Text.Text = LevelName;
 	Text.Pos = Obj.GetPosition();
@@ -137,6 +143,7 @@ bool UGenGameLogic::HasPlayerBeenDefeated(int32 Player) const
 
 void UGenGameLogic::UpdateVictory()
 {
+	GEN_PERF_SCOPE("Victory");
 	if (Frame < 2 || Frame % 15 != 0)
 	{
 		return;
@@ -150,6 +157,11 @@ void UGenGameLogic::UpdateVictory()
 			continue;
 		}
 		P.bDefeated = true;
+		if (Frame > 1 && Shroud.IsValid())
+		{
+			// VictoryConditions::update: whoever is out of the game gets to watch all of it.
+			Shroud.RevealMapForPlayerPermanently(P.Index);
+		}
 		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [victory f%u] p%d (%s) has been defeated"), Frame, P.Index, *P.Name);
 		FGenFloatingText& Text = FloatingTexts.AddDefaulted_GetRef();
 		Text.Text = P.Index == LocalPlayer ? FString(TEXT("You have been defeated")) : FString::Printf(TEXT("%s has been defeated"), *P.Name);

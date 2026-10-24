@@ -275,16 +275,32 @@ namespace
 				else if (Is(TEXT("StrafeLength"))) { P.StrafeLength = E.AsFloat(); }
 				else if (Is(TEXT("StrafeWeaponFX"))) { P.StrafeWeaponFX = E.Value(); }
 				else if (Is(TEXT("DeliveryDecalRadius"))) { P.DeliveryDecalRadius = E.AsFloat(); }
+				else if (Is(TEXT("DeliveryDecal")) && E.Block.IsValid()) { P.DeliveryDecal = FGenRadiusDecalTemplate::Parse(E.Block.Get()); }
 			}
 			return;
 		}
-		const bool bDebris = Keyword.Equals(TEXT("CreateDebris"), ESearchCase::IgnoreCase);
-		if (!bDebris && !Keyword.Equals(TEXT("CreateObject"), ESearchCase::IgnoreCase))
+		if (Keyword.Equals(TEXT("FireWeapon"), ESearchCase::IgnoreCase))
 		{
-			return; // FireWeapon, Attack, ApplyRandomForce: not ported yet
+			List.FireWeapons.Add(B.GetString(TEXT("Weapon")));
+			return;
+		}
+		if (Keyword.Equals(TEXT("Attack"), ESearchCase::IgnoreCase))
+		{
+			FGenOCL::FAttack& A = List.Attacks.AddDefaulted_GetRef();
+			A.NumShots = FMath::Max(1, B.GetInt(TEXT("NumberOfShots"), 1));
+			const FString Slot = B.GetString(TEXT("WeaponSlot"), TEXT("PRIMARY"));
+			A.Slot = Slot.Equals(TEXT("SECONDARY"), ESearchCase::IgnoreCase) ? 1 : Slot.Equals(TEXT("TERTIARY"), ESearchCase::IgnoreCase) ? 2 : 0;
+			return;
+		}
+		const bool bDebris = Keyword.Equals(TEXT("CreateDebris"), ESearchCase::IgnoreCase);
+		const bool bForce = Keyword.Equals(TEXT("ApplyRandomForce"), ESearchCase::IgnoreCase);
+		if (!bDebris && !bForce && !Keyword.Equals(TEXT("CreateObject"), ESearchCase::IgnoreCase))
+		{
+			return;
 		}
 		FGenOCLNugget& N = List.Nuggets.AddDefaulted_GetRef();
 		N.bDebris = bDebris;
+		N.bApplyRandomForce = bForce;
 		for (const FGenIniEntry& E : B.Entries)
 		{
 			auto Is = [&](const TCHAR* Key) { return E.Key.Equals(Key, ESearchCase::IgnoreCase); };
@@ -317,16 +333,23 @@ namespace
 			else if (Is(TEXT("MinLifetime"))) { N.MinFrames = GenLogic::MsecToFrames(E.AsFloat()); }
 			else if (Is(TEXT("MaxLifetime"))) { N.MaxFrames = GenLogic::MsecToFrames(E.AsFloat()); }
 			else if (Is(TEXT("ExtraBounciness"))) { N.ExtraBounciness = E.AsFloat(); }
+			else if (Is(TEXT("BounceSound"))) { N.BounceSound = E.Value(); }
 			else if (Is(TEXT("ExtraFriction"))) { N.ExtraFriction = GenLogic::FrictionPerFrame(E.AsFloat()); }
 			else if (Is(TEXT("MinHealth"))) { N.MinHealth = Percent(E.Value()); }
 			else if (Is(TEXT("MaxHealth"))) { N.MaxHealth = Percent(E.Value()); }
 			else if (Is(TEXT("ParticleSystem"))) { N.ParticleSystem = E.Value(); }
 			else if (Is(TEXT("FXFinal"))) { N.FXFinal = E.Value(); }
+			else if (Is(TEXT("AnimationSet")) && E.Values.Num() >= 3) { N.AnimSets.Add(E.Values[0]); N.AnimSets.Add(E.Values[1]); N.AnimSets.Add(E.Values[2]); }
 			else if (Is(TEXT("OkToChangeModelColor"))) { N.bOkToChangeModelColor = E.AsBool(); }
 			else if (Is(TEXT("OrientInForceDirection"))) { N.bOrientInForceDirection = E.AsBool(); }
 			else if (Is(TEXT("SkipIfSignificantlyAirborne"))) { N.bSkipIfSignificantlyAirborne = E.AsBool(); }
 			else if (Is(TEXT("SpreadFormation"))) { N.bSpreadFormation = E.AsBool(); }
 			else if (Is(TEXT("MinDistanceAFormation"))) { N.MinDistanceFormation = E.AsFloat(); }
+			else if (Is(TEXT("PutInContainer"))) { N.PutInContainer = E.Value(); }
+			else if (Is(TEXT("InheritsVeterancy"))) { N.bInheritsVeterancy = E.AsBool(); }
+			else if (Is(TEXT("InvulnerableTime"))) { N.InvulnerableFrames = GenLogic::MsecToFrames(E.AsFloat()); }
+			else if (Is(TEXT("RequiresLivePlayer"))) { N.bRequiresLivePlayer = E.AsBool(); }
+			else if (Is(TEXT("ContainInsideSourceObject"))) { N.bContainInsideSourceObject = E.AsBool(); }
 		}
 	}
 

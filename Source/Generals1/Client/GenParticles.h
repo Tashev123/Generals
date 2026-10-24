@@ -53,14 +53,28 @@ public:
 	void AttachToObject(FGenObjectID Object) { AttachedObject = Object; }
 	FGenObjectID GetAttachedObject() const { return AttachedObject; }
 	void SetInitialDelay(uint32 Frames) { DelayLeft = Frames; }
+	/** ParticleSystem::setSystemLifetime: "lifetime of the system, not the particles". */
+	void SetSystemLifetime(uint32 Frames) { bForever = Frames == 0; SystemLifetimeLeft = Frames; }
 	/** UseCallersRadius: sphere / cylinder emission radius override. */
 	void SetEmissionRadius(float Radius);
 	void Stop() { bStopped = true; }
+	void Start() { bStopped = false; }
+	/** ParticleSystem::setVelocityMultiplier / setBurstCountMultiplier / setSizeMultiplier: a vehicle's dust and
+	 *  dirt fly faster, thicker and bigger the faster it goes. */
+	void SetVelocityMultiplier(const FVector3f& M) { VelocityMultiplier = M; }
+	void SetBurstCountMultiplier(float M) { BurstCountMultiplier = M; }
+	void SetSizeMultiplier(float M) { SizeMultiplier = M; }
+	/** "Force a burst of particles to be emitted immediately." */
+	void Trigger() { BurstDelayLeft = 0; DelayLeft = 0; }
 	/** Stops emitting; the system is removed once its particles have died. */
 	void Destroy() { bDestroyed = true; }
 
 	/** Renderer cache: index of the draw batch for this system's texture and shader. */
 	mutable int32 BatchIndex = INDEX_NONE;
+	/** A sphere round every particle as it is and as it was a client frame ago (the screen blends between
+	 *  the two), their sizes included: what the renderer asks the camera about. Worked out by each Step. */
+	FVector3f BoundsCenter = FVector3f::ZeroVector;
+	float BoundsRadius = 0.f;
 
 private:
 	friend class FGenParticleManager;
@@ -94,6 +108,9 @@ private:
 
 	bool bStopped = false;
 	bool bDestroyed = false;
+	FVector3f VelocityMultiplier = FVector3f::OneVector;
+	float BurstCountMultiplier = 1.f;
+	float SizeMultiplier = 1.f;
 	bool bForever = true;
 	uint32 SystemLifetimeLeft = 0;
 	uint32 DelayLeft = 0;
@@ -133,6 +150,8 @@ public:
 	/** World queries supplied by the game (object transform in Generals space, ground height). */
 	TFunction<bool(FGenObjectID, FTransform3f&)> ObjectTransform;
 	TFunction<float(float, float)> GroundHeight;
+	/** The object is hidden from the local player by the fog of war. */
+	TFunction<bool(FGenObjectID)> ObjectShrouded;
 
 private:
 	friend class FGenParticleSystem;

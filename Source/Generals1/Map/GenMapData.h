@@ -86,6 +86,7 @@ struct GENERALS1_API FGenPolygonTrigger
 	int32 ID = 0;
 	bool bWater = false;
 	bool bRiver = false;
+	int32 RiverStart = 0;        // the point after which the river's far end lies (PolygonTrigger::getRiverStart)
 	TArray<FIntVector> Points;   // world units
 
 	bool Contains(float X, float Y) const;
@@ -130,9 +131,14 @@ public:
 
 	/** Raw height sample in world units at a height map vertex (clamped). */
 	float GetHeightAt(int32 X, int32 Y) const;
+	/** TerrainVisual::setRawMapHeight: a height map vertex (array indices, border included) is lowered to that raw
+	 *  height if it stands higher - never raised. True if it was. */
+	bool LowerRawHeight(int32 X, int32 Y, int32 RawHeight);
 
 	/** Ground height at a Generals world position (bilinear over the height map). */
 	float GetGroundHeight(float WorldX, float WorldY) const;
+	/** The ground's (smoothed) up direction there, as getHeightMapHeight gives it. */
+	FVector3f GetGroundNormal(float WorldX, float WorldY) const;
 
 	/** Playable area in world units (inside the border). */
 	FBox2f GetPlayableBounds() const;

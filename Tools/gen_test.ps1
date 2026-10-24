@@ -25,10 +25,17 @@ param(
     [int]$TestGather = 0,
     [string]$TestJets = "",
     [string]$TestPowers = "",
+    [string]$Menu = "",
     [double]$Speed = 0,
     [string]$Enemy = "",
     [string]$Difficulty = "",
     [switch]$NoAI,
+    [switch]$Fog,
+    [switch]$Window,
+    [switch]$Music,
+    [string]$Record = "",
+    [switch]$AudioSelfTest,
+    [string]$DumpWav = "",
     [switch]$Trace,
     [int]$Seed = 0,
     [int]$PauseFrame = 0,
@@ -49,7 +56,9 @@ if ($Build) {
 }
 
 $args = @("`"$proj`"", "/Game/Generals/Maps/Skirmish", "-game", "-windowed", "-ResX=$ResX", "-ResY=$ResY",
-          "-RenderOffscreen", "-GenMap=`"$Map`"", "-log=GenTest.log", "-unattended", "-nosplash")
+          "-GenMap=`"$Map`"", "-log=GenTest.log", "-unattended", "-nosplash")
+# -Window: in a real window on the desktop instead of offscreen (what needs the platform itself: the mouse cursors).
+if (-not $Window) { $args += "-RenderOffscreen" }
 if ($Cam) { $args += "-GenCam=$Cam" }
 if ($Objects) { $args += "-GenObject=$Objects" }
 if ($Model) { $args += "-GenModel=$Model" }
@@ -66,10 +75,30 @@ if ($TestSelect) { $args += "-GenTestSelect=$TestSelect" }
 if ($TestGather) { $args += "-GenTestGather=$TestGather" }
 if ($TestJets) { $args += "-GenTestJets=`"$TestJets`"" }
 if ($TestPowers) { $args += "-GenTestPowers=`"$TestPowers`"" }
+# -Menu "sec,click,Id;...": the skirmish menu is shown and worked (ids: Source/Generals1/Game/GenShell.cpp)
+if ($Menu) { $args += "-GenTestMenu=`"$Menu`"" }
 if ($Speed) { $args += "-GenSpeed=$Speed" }
 if ($Enemy) { $args += "-GenEnemy=$Enemy" }
 if ($Difficulty) { $args += "-GenDifficulty=$Difficulty" }
 if ($NoAI) { $args += "-GenNoAI" }
+# Test runs see the whole map (most of them look at the enemy); -Fog plays with the fog of war, as the game does.
+if (-not $Fog) { $args += "-GenNoShroud" }
+# Sound: rendered by the engine's non-realtime audio device, so a test run is silent on the speakers but
+# everything is mixed (and can be recorded with -Record file.wav). No music unless -Music.
+$args += "-DeterministicAudio"
+# (An unfocused Unreal window mutes its sound sources; nothing reaches the speakers here anyway.)
+$args += "-ini:Engine:[Audio]:UnfocusedVolumeMultiplier=1.0"
+if (-not $Music) { $args += "-GenNoMusic" }
+if ($Record) {
+    # The non-realtime device renders 1/30 s of sound per tick whatever the frame rate: a fixed 30 Hz step
+    # makes game time agree with it (the run then goes as fast as the machine allows).
+    $args += "-UseFixedTimeStep"
+    $args += "-FPS=30"
+    if (-not [IO.Path]::IsPathRooted($Record)) { $Record = Join-Path (Split-Path $proj) $Record }
+    $args += "-GenRecordAudio=`"$([IO.Path]::GetFullPath($Record).Replace("\", "/"))`""
+}
+if ($AudioSelfTest) { $args += "-GenAudioSelfTest" }
+if ($DumpWav) { $args += "-GenDumpWav=$DumpWav" }
 if ($Trace) { $args += "-GenTrace" }
 if ($Seed) { $args += "-GenSeed=$Seed" }
 if ($PauseFrame) { $args += "-GenPauseFrame=$PauseFrame" }

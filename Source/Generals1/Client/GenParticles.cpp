@@ -180,7 +180,7 @@ FGenParticle FGenParticleSystem::GenerateParticle(int32 Num, int32 Count, FGenPa
 
 	// Position first: OUTWARD velocity depends on where the particle is in the volume.
 	P.Pos = ComputePosition(R);
-	P.Vel = ComputeVelocity(P.Pos, R);
+	P.Vel = ComputeVelocity(P.Pos, R) * VelocityMultiplier;
 	if (!bIdentity)
 	{
 		if (bFirstPos)
@@ -200,8 +200,8 @@ FGenParticle FGenParticleSystem::GenerateParticle(int32 Num, int32 Count, FGenPa
 	P.AngleZ = T.AngleZ.Get(R);
 	P.AngularRateZ = T.AngularRateZ.Get(R);
 	P.LifetimeLeft = uint32(FMath::Max(0.f, T.Lifetime.Get(R)));
-	P.Size = T.StartSize.Get(R);
-	P.SizeRate = T.SizeRate.Get(R);
+	P.Size = T.StartSize.Get(R) * SizeMultiplier;
+	P.SizeRate = T.SizeRate.Get(R) * SizeMultiplier;
 	P.SizeRateDamping = T.SizeRateDamping.Get(R);
 
 	// Each successive particle starts a bit bigger (or smaller).
@@ -404,11 +404,13 @@ bool FGenParticleSystem::Update(FGenParticleManager& Mgr)
 
 	// Follow the object we are attached to: particles are emitted relative to its position and orientation.
 	bool bTransformSet = false;
+	bool bShrouded = false;
 	if (AttachedObject != GenInvalidObjectID)
 	{
 		FTransform3f Parent;
 		if (Mgr.ObjectTransform && Mgr.ObjectTransform(AttachedObject, Parent))
 		{
+			bShrouded = Mgr.ObjectShrouded && Mgr.ObjectShrouded(AttachedObject);
 			LastPos = Pos;
 			Pos = Parent.GetTranslation();
 			Transform = bLocalIdentity ? Parent : LocalTransform * Parent;
@@ -436,11 +438,11 @@ bool FGenParticleSystem::Update(FGenParticleManager& Mgr)
 	}
 
 	// Emit (slave systems only emit when their master tells them to).
-	if (!bDestroyed && (bForever || SystemLifetimeLeft > 0) && !bStopped && MasterID == 0)
+	if (!bDestroyed && (bForever || SystemLifetimeLeft > 0) && !bStopped && !bShrouded && MasterID == 0)
 	{
 		if (BurstDelayLeft == 0)
 		{
-			const int32 Count = int32(T.BurstCount.Get(R));
+			const int32 Count = int32(float(int32(T.BurstCount.Get(R))) * BurstCountMultiplier); // ("count *= m_countCoeff")
 			FGenParticleSystem* Slave = SlaveID != 0 ? Mgr.Find(SlaveID) : nullptr;
 			for (int32 i = 0; i < Count; ++i)
 			{
@@ -556,9 +558,13 @@ FGenParticleSystem* FGenParticleManager::Create(const FString& TemplateName)
 
 FGenParticleSystem* FGenParticleManager::Create(const FGenParticleSystemTemplate* Template, bool bCreateSlaves)
 {
-	// Drawable particles (one template in the whole game) and smudges are not supported.
+	// Drawable particles (one template in the whole game) and smudges are not supported. (W3DParticleSystemManager:
+	// "if texture name starts with "SMUD" ... we can assume it's a smudge type" - the heat haze over a
+	// microwave tank's dish, drawn by distorting the picture behind it, and not at all without the
+	// hardware for it or with heat effects off; drawn as particles it is a cloud of white squares.)
 	if (!Template || Template->Shader == EGenParticleShader::None
-		|| (Template->Type != EGenParticleType::Particle && Template->Type != EGenParticleType::Streak && Template->Type != EGenParticleType::VolumeParticle))
+		|| (Template->Type != EGenParticleType::Particle && Template->Type != EGenParticleType::Streak && Template->Type != EGenParticleType::VolumeParticle)
+		|| Template->ParticleName.StartsWith(TEXT("SMUD"), ESearchCase::IgnoreCase))
 	{
 		return nullptr;
 	}
@@ -622,6 +628,19 @@ void FGenParticleManager::Step()
 		FGenParticleSystem* S = Systems[i].Get();
 		if (S->Update(*this))
 		{
+			if (S->Particles.Num() > 0)
+			{
+				FVector3f Min(MAX_flt), Max(-MAX_flt);
+				float Size = 0.f;
+				for (const FGenParticle& P : S->Particles)
+				{
+					Min = FVector3f::Min(Min, FVector3f::Min(P.Pos, P.LastPos));
+					Max = FVector3f::Max(Max, FVector3f::Max(P.Pos, P.LastPos));
+					Size = FMath::Max3(Size, P.Size, P.LastSize);
+				}
+				S->BoundsCenter = (Min + Max) * 0.5f;
+				S->BoundsRadius = (Max - Min).Size() * 0.5f + Size;
+			}
 			continue;
 		}
 		// Going away: release our slave / master links, drop the remaining particles.

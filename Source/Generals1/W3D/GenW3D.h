@@ -28,6 +28,7 @@ namespace GenW3D
 		MappingUV = 0x00,
 		MappingEnvironment = 0x01,          // camera-space reflection vector
 		MappingCheapEnvironment = 0x02,     // camera-space normal
+		MappingLinearOffset = 0x04,         // LinearOffsetTextureMapperClass: the texture slides along
 		MappingWSClassicEnv = 0x0C,
 		MappingWSEnvironment = 0x0D,
 		MappingGridClassicEnv = 0x0E,

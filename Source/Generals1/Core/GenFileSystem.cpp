@@ -3,6 +3,7 @@
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
 #include "Misc/CommandLine.h"
+#include "Misc/FileHelper.h"
 #include "Misc/Parse.h"
 #include "Misc/Paths.h"
 
@@ -67,13 +68,39 @@ bool FGenFileSystem::Initialize()
 		return true;
 	}
 
+	// GamePaths.txt beside the game, for installs the registry doesn't name (a Steam or EA app copy):
+	// "ZeroHour=<folder>" and "Generals=<folder>", a line each.
+	FString PathsText;
+	if (FFileHelper::LoadFileToString(PathsText, *(FPaths::RootDir() / TEXT("GamePaths.txt"))))
+	{
+		TArray<FString> Lines;
+		PathsText.ParseIntoArrayLines(Lines);
+		for (const FString& Line : Lines)
+		{
+			FString Key, Value;
+			if (Line.Split(TEXT("="), &Key, &Value) && !Value.TrimStartAndEnd().IsEmpty() && !Line.StartsWith(TEXT("#")))
+			{
+				Value = Value.TrimStartAndEnd().TrimQuotes();
+				if (Key.TrimStartAndEnd().Equals(TEXT("ZeroHour"), ESearchCase::IgnoreCase)) { ZeroHourDir = Value; }
+				else if (Key.TrimStartAndEnd().Equals(TEXT("Generals"), ESearchCase::IgnoreCase)) { GeneralsDir = Value; }
+			}
+		}
+	}
 	// Command line overrides: -GenZHDir="..." -GenDir="..."
-	if (!FParse::Value(FCommandLine::Get(), TEXT("GenZHDir="), ZeroHourDir))
+	if (FParse::Value(FCommandLine::Get(), TEXT("GenZHDir="), ZeroHourDir) || !ZeroHourDir.IsEmpty())
+	{
+		FPaths::NormalizeDirectoryName(ZeroHourDir);
+	}
+	else
 	{
 		ZeroHourDir = FindInstallDir(TEXT("Command and Conquer Generals Zero Hour"),
 			TEXT("D:/Games/EA Games/Command & Conquer Generals Zero Hour"));
 	}
-	if (!FParse::Value(FCommandLine::Get(), TEXT("GenDir="), GeneralsDir))
+	if (FParse::Value(FCommandLine::Get(), TEXT("GenDir="), GeneralsDir) || !GeneralsDir.IsEmpty())
+	{
+		FPaths::NormalizeDirectoryName(GeneralsDir);
+	}
+	else
 	{
 		GeneralsDir = FindInstallDir(TEXT("Generals"), TEXT("D:/Games/EA Games/Command and Conquer Generals"));
 	}

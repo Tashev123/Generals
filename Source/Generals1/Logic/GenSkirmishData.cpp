@@ -335,6 +335,10 @@ void FGenAIData::Initialize()
 		MaxRecruitRadius = B->GetFloat(TEXT("MaxRecruitRadius"), MaxRecruitRadius);
 		SkirmishBaseDefenseExtraDistance = B->GetFloat(TEXT("SkirmishBaseDefenseExtraDistance"), SkirmishBaseDefenseExtraDistance);
 		SupplyCenterSafeRadius = B->GetFloat(TEXT("SupplyCenterSafeRadius"), SupplyCenterSafeRadius);
+		MinInfantryForGroup = B->GetInt(TEXT("MinInfantryForGroup"), MinInfantryForGroup);
+		MinVehiclesForGroup = B->GetInt(TEXT("MinVehiclesForGroup"), MinVehiclesForGroup);
+		MinDistanceForGroup = B->GetFloat(TEXT("MinDistanceForGroup"), MinDistanceForGroup);
+		DistanceRequiresGroup = B->GetFloat(TEXT("DistanceRequiresGroup"), DistanceRequiresGroup);
 		RebuildDelaySeconds = B->GetInt(TEXT("RebuildDelayTimeSeconds"), RebuildDelaySeconds);
 		bRotateSkirmishBases = B->GetBool(TEXT("RotateSkirmishBases"), bRotateSkirmishBases);
 

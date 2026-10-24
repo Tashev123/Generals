@@ -25,6 +25,17 @@ bool FGenObject::IsAirborneTarget() const
 	return Position.Z - Logic->GetGroundHeight(Position.X, Position.Y) > Threshold;
 }
 
+bool FGenObject::AreEnginesOn() const
+{
+	// JetAIUpdate::update: "we just started moving, therefore turn on the engines".
+	if (!bJetAI || IsKindOf(TEXT("PRODUCED_AT_HELIPAD")))
+	{
+		return true;
+	}
+	return bJetTakeoffInProgress || bJetLandingInProgress || bMoving
+		|| Position.Z - Logic->GetGroundHeight(Position.X, Position.Y) > AirborneThreshold;
+}
+
 bool FGenObject::IsUsingAirLoco() const
 {
 	return Locomotor && Locomotor->IsAirOnly();
@@ -83,14 +94,25 @@ void FGenObject::MoveOther(const FVector3f& GoalPos, float OnPathDistToGoal, flo
 void FGenObject::HandleBehaviorZ(uint32 Frame)
 {
 	// Locomotor::handleBehaviorZ for Z_SURFACE_RELATIVE_HEIGHT / Z_ABSOLUTE_HEIGHT: lift holds the
-	// preferred height (calcLiftToUseAtPt solves x = x0 + v t + a t^2 / 2 for the acceleration).
+	// preferred height.
 	if (!Locomotor->UsesLift())
 	{
 		return;
 	}
+	const float LiftToUse = CalcLiftToUse();
+	if (LiftToUse != 0.f)
+	{
+		ApplyMotiveForce(FVector3f(0.f, 0.f, LiftToUse * Mass), Frame);
+	}
+}
+
+float FGenObject::CalcLiftToUse() const
+{
+	// (calcLiftToUseAtPt solves x = x0 + v t + a t^2 / 2 for the acceleration.)
 	const float Gravity = FGenGameData::Get().Gravity;
 	const bool bSurfaceRelative = Locomotor->ZAxisBehavior.Equals(TEXT("SURFACE_RELATIVE_HEIGHT"), ESearchCase::IgnoreCase);
-	float Preferred = Locomotor->PreferredHeight + (bSurfaceRelative ? Logic->GetGroundHeight(Position.X, Position.Y) : 0.f);
+	float Preferred = Locomotor->PreferredHeight + (bSurfaceRelative ? Logic->GetFlightSurfaceHeight(Position.X, Position.Y)
+		: (Locomotor->IsLayerRelative() ? GetSurfaceHeight() : 0.f));
 	Preferred = Position.Z + (Preferred - Position.Z) * Locomotor->PreferredHeightDamping;
 
 	if (bLocoPreciseZ)
@@ -122,12 +144,8 @@ void FGenObject::HandleBehaviorZ(uint32 Frame)
 			DesiredAccel = 2.f * (DeltaZ - VelZ);
 		}
 	}
-	const float LiftToUse = bLocoUltraAccurate ? FMath::Clamp(DesiredAccel - Gravity, -MaxGrossLift, 3.f * MaxGrossLift)
+	return bLocoUltraAccurate ? FMath::Clamp(DesiredAccel - Gravity, -MaxGrossLift, 3.f * MaxGrossLift)
 		: FMath::Clamp(DesiredAccel - Gravity, 0.f, MaxGrossLift);
-	if (LiftToUse != 0.f)
-	{
-		ApplyMotiveForce(FVector3f(0.f, 0.f, LiftToUse * Mass), Frame);
-	}
 }
 
 void FGenObject::MaintainPositionWings(uint32 Frame)

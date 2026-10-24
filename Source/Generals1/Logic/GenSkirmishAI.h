@@ -204,6 +204,11 @@ public:
 	float MaxRecruitRadius = 500.f;
 	float SkirmishBaseDefenseExtraDistance = 150.f;
 	float SupplyCenterSafeRadius = 300.f;
+	// Group movement (AIGroup): how many of a kind it takes, and how far the move has to be.
+	int32 MinInfantryForGroup = 3;
+	int32 MinVehiclesForGroup = 4;
+	float MinDistanceForGroup = 100.f;
+	float DistanceRequiresGroup = 0.f;
 	int32 RebuildDelaySeconds = 30;
 	bool bRotateSkirmishBases = false;
 
@@ -305,6 +310,8 @@ public:
 	void OnStructureProduced(FGenObject& Building);
 
 	int32 GetPlayer() const { return Player; }
+	/** Player::getAiBaseCenter */
+	bool GetBaseCenter(FVector3f& Out) const { Out = BaseCenter; return bBaseCenterSet; }
 	/** The player this one is currently after (AISkirmishPlayer::getAiEnemy), or INDEX_NONE. */
 	int32 GetEnemy();
 	/** One line for traces: money, buildings, teams, counters. */
@@ -453,6 +460,7 @@ private:
 	TMap<FString, TArray<FString>> ObjectTypeLists;
 	TArray<FGenSequentialScript> SequentialScripts;
 	FGenTeam* CallingTeam = nullptr;            // <This Team> for actions
+	const FGenScript* RunningScript = nullptr;  // the script whose actions are being carried out
 	FGenTeam* ConditionTeam = nullptr;          // <This Team> for conditions
 	int32 SubroutineDepth = 0;
 	// Caches

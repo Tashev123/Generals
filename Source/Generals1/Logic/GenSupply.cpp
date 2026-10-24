@@ -5,6 +5,7 @@
 // (vehicles mended at a war factory).
 
 #include "Logic/GenGameLogic.h"
+#include "Core/GenPerf.h"
 #include "Logic/GenCommandData.h"
 #include "Logic/GenGameData.h"
 #include "Logic/GenObject.h"
@@ -353,7 +354,24 @@ bool FGenObject::IsAIIdle() const
 	// (JetAIUpdate::isIdle: an aircraft busy with its airfield routine, or with an order waiting, is not idle.)
 	return !bMoving && DockTarget == GenInvalidObjectID && BuildTarget == GenInvalidObjectID && RepairTarget == GenInvalidObjectID
 		&& TargetID == GenInvalidObjectID && AIMode == EGenAIMode::None && JetState == EGenJetState::None && !bJetPendingCommand
-		&& !bHasExitRally;
+		&& !bHasExitRally && HackState == EHackState::None;
+}
+
+FString FGenObject::DescribeBusy() const
+{
+	// (For the test harness: which of IsAIIdle's conditions keeps it from being idle.)
+	TArray<FString> Why;
+	if (bMoving) { Why.Add(TEXT("moving")); }
+	if (DockTarget != GenInvalidObjectID) { Why.Add(TEXT("docking")); }
+	if (BuildTarget != GenInvalidObjectID) { Why.Add(TEXT("building")); }
+	if (RepairTarget != GenInvalidObjectID) { Why.Add(TEXT("repairing")); }
+	if (TargetID != GenInvalidObjectID) { Why.Add(FString::Printf(TEXT("target #%u"), TargetID)); }
+	if (AIMode != EGenAIMode::None) { Why.Add(FString::Printf(TEXT("ai mode %d"), int32(AIMode))); }
+	if (JetState != EGenJetState::None || bJetPendingCommand) { Why.Add(TEXT("jet")); }
+	if (bHasExitRally) { Why.Add(TEXT("exit rally")); }
+	if (HackState != EHackState::None) { Why.Add(TEXT("hacking")); }
+	if (SupplyState != EGenSupplyState::Idle) { Why.Add(FString::Printf(TEXT("supply %d"), int32(SupplyState))); }
+	return Why.Num() > 0 ? FString::Join(Why, TEXT(", ")) : FString(TEXT("idle"));
 }
 
 void FGenObject::SetBoxes(int32 NewBoxes)
@@ -567,8 +585,15 @@ void FGenObject::OnPlayerCommand(bool bDockOrder)
 		StopDocking();
 	}
 	AIMode = EGenAIMode::None;
+	if (CombatDrop && !CombatDrop->bDropping)
+	{
+		EndCombatDrop(); // ... and the flight to a combat drop (once the ropes are out, orders wait)
+	}
 	bHasExitRally = false; // an order replaces the trip to the rally point
 	StopEntering();        // ... and the walk to a transport or a building
+	ExitAbility(false);    // ... and a capture under way
+	HuntButton.Reset();
+	bHackInterrupt = HackState != EHackState::None; // ... and a hacker's work at the internet (once it has packed up)
 	if (Template->bIsSupplyTruck)
 	{
 		// SupplyTruckStateMachine: anything the player orders takes the truck off autopilot; it goes back
@@ -607,6 +632,7 @@ bool FGenObject::StartRegroup()
 
 void FGenObject::UpdateSupplyTruck(uint32 Frame)
 {
+	GEN_PERF_SCOPE("Obj.Supply");
 	// SupplyTruckStateMachine
 	const bool bDocking = DockTarget != GenInvalidObjectID;
 	const bool bIdle = IsAIIdle();
@@ -810,7 +836,8 @@ void UGenGameLogic::DepositSupplies(int32 Player, int32 Value, const FGenObject&
 	{
 		return;
 	}
-	Players[Player].Money += Value;
+	Deposit(Player, Value);
+	ScoreMoneyEarned(Player, Value);
 	UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [supply f%u] #%u %s delivers $%d -> player %d has $%d"), Frame, Docker.GetID(), *Docker.GetTemplate()->Name,
 		Value, Player, Players[Player].Money);
 
@@ -844,25 +871,30 @@ void UGenGameLogic::SpawnBuildingUnits(const FGenObject& Building)
 
 void UGenGameLogic::IssueDock(const TArray<FGenObjectID>& Units, FGenObjectID DockId)
 {
-	PendingCommands.Add([this, Units, DockId]()
+	FGenCommand C(EGenCommandType::Dock);
+	C.Units = Units;
+	C.Target = DockId;
+	SubmitCommand(MoveTemp(C));
+}
+
+void UGenGameLogic::ExecDock(const FGenCommand& C)
+{
+	FGenObject* D = FindObject(C.Target);
+	if (!D || !D->GetDock())
 	{
-		FGenObject* D = FindObject(DockId);
-		if (!D || !D->GetDock())
+		return;
+	}
+	for (FGenObjectID Id : C.Units)
+	{
+		FGenObject* U = FindObject(Id);
+		if (!U || !CanTransferSuppliesAt(*U, *D))
 		{
-			return;
+			continue;
 		}
-		for (FGenObjectID Id : Units)
-		{
-			FGenObject* U = FindObject(Id);
-			if (!U || !CanTransferSuppliesAt(*U, *D))
-			{
-				continue;
-			}
-			// SupplyTruckAIUpdate::privateDock: a dock picked by the player is remembered and preferred
-			// over the nearest one from then on.
-			U->OnPlayerCommand(true);
-			U->PreferredDock = DockId;
-			U->StartDock(*D);
-		}
-	});
+		// SupplyTruckAIUpdate::privateDock: a dock picked by the player is remembered and preferred
+		// over the nearest one from then on.
+		U->OnPlayerCommand(true);
+		U->PreferredDock = C.Target;
+		U->StartDock(*D);
+	}
 }

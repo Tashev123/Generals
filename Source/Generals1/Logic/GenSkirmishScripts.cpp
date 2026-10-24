@@ -4,6 +4,7 @@
 // faction's scripts and its own flags, counters and timers.
 
 #include "Logic/GenSkirmishAI.h"
+#include "Core/GenPerf.h"
 #include "Logic/GenCommandData.h"
 #include "Logic/GenGameData.h"
 #include "Logic/GenGameLogic.h"
@@ -148,8 +149,60 @@ FGenScriptGroup* FGenSkirmishAI::FindGroup(const FString& Name)
 
 // ---- evaluation ---------------------------------------------------------------------------------
 
+namespace
+{
+	// -GenPerf: what the conditions cost, by kind (all computer players together).
+	double GConditionSeconds[256];
+	int32 GConditionCalls[256];
+	uint32 GConditionReportFrame = 0;
+	int32 GScriptsEvaluated = 0, GScriptsSkipped = 0;
+
+	const TCHAR* ConditionName(int32 Type)
+	{
+		static const TCHAR* Names[] = {
+			TEXT("Unknown"),
+#define GEN_X(Name) TEXT(#Name),
+			GEN_SCRIPT_CONDITIONS(GEN_X)
+#undef GEN_X
+		};
+		return Type >= 0 && Type < UE_ARRAY_COUNT(Names) ? Names[Type] : TEXT("?");
+	}
+
+	void ReportConditions(uint32 Frame)
+	{
+		if (Frame < GConditionReportFrame + 900)
+		{
+			return;
+		}
+		const double Steps = double(FMath::Max<uint32>(1, Frame - GConditionReportFrame));
+		GConditionReportFrame = Frame;
+		TArray<int32> Order;
+		for (int32 i = 0; i < 256; ++i)
+		{
+			if (GConditionCalls[i] > 0) { Order.Add(i); }
+		}
+		Order.Sort([](int32 A, int32 B) { return GConditionSeconds[A] > GConditionSeconds[B]; });
+		FString Line;
+		for (int32 i = 0; i < FMath::Min(Order.Num(), 14); ++i)
+		{
+			const int32 T = Order[i];
+			Line += FString::Printf(TEXT(" %s=%.3f(x%.0f)"), ConditionName(T), GConditionSeconds[T] * 1000.0 / Steps, double(GConditionCalls[T]) / Steps);
+		}
+		UE_LOG(LogGenerals, Log, TEXT("  [perf f%u] script conditions, ms per step (all players): scripts evaluated x%.0f, waiting x%.0f;%s"),
+			Frame, double(GScriptsEvaluated) / Steps, double(GScriptsSkipped) / Steps, *Line);
+		FMemory::Memzero(GConditionSeconds);
+		FMemory::Memzero(GConditionCalls);
+		GScriptsEvaluated = GScriptsSkipped = 0;
+	}
+}
+
 void FGenSkirmishAI::UpdateScripts()
 {
+	GEN_PERF_SCOPE("AI.Scripts");
+	if (GenPerf::bEnabled)
+	{
+		ReportConditions(Frame);
+	}
 	// ScriptEngine::update: timers count down (to -1), every active script that isn't a subroutine is
 	// evaluated, then teams get their state scripts and sequential scripts advance.
 	for (TPair<FString, FCounter>& It : Counters)
@@ -177,7 +230,9 @@ void FGenSkirmishAI::ExecuteScripts(TArray<FGenScript>& InScripts)
 	{
 		if (!S.bSubroutine)
 		{
+			Logic->SetStretchDetail(S.Name);
 			ExecuteScript(S);
+			Logic->SimYield(TEXT("a computer player's script"));
 		}
 	}
 }
@@ -195,8 +250,11 @@ void FGenSkirmishAI::ExecuteScript(FGenScript& Script)
 	}
 	if (Frame < Script.FrameToEvaluate)
 	{
+		++GScriptsSkipped;
 		return;
 	}
+	++GScriptsEvaluated;
+	TGuardValue<const FGenScript*> Running(RunningScript, &Script);
 	if (Script.DelaySeconds > 0)
 	{
 		Script.FrameToEvaluate = Frame + uint32(Script.DelaySeconds * GenLogic::GetLogicFPS());
@@ -276,7 +334,19 @@ bool FGenSkirmishAI::EvaluateConditions(const FGenScript& Script, FGenTeam* This
 		bool bAll = true;
 		for (const FGenScriptCondition& C : And)
 		{
-			if (!EvaluateCondition(C))
+			bool bTrue;
+			if (GenPerf::bEnabled)
+			{
+				const double Start = FPlatformTime::Seconds();
+				bTrue = EvaluateCondition(C);
+				GConditionSeconds[uint8(C.Type)] += FPlatformTime::Seconds() - Start;
+				++GConditionCalls[uint8(C.Type)];
+			}
+			else
+			{
+				bTrue = EvaluateCondition(C);
+			}
+			if (!bTrue)
 			{
 				bAll = false;
 				break;
@@ -471,10 +541,9 @@ int32 FGenSkirmishAI::CountObjects(int32 PlayerIndex, const FString& TypeOrList,
 	if (Area)
 	{
 		int32 Count = 0;
-		for (FGenObjectID Id : Logic->GetObjectIDs())
+		for (const FGenObject* O : Logic->GetObjectsOf(PlayerIndex))
 		{
-			const FGenObject* O = Logic->FindObject(Id);
-			if (IsLiving(O) && O->GetOwner() == PlayerIndex && Types.Contains(O->GetTemplate()) && Area->Contains(O->GetPosition().X, O->GetPosition().Y))
+			if (IsLiving(O) && Types.Contains(O->GetTemplate()) && Area->Contains(O->GetPosition().X, O->GetPosition().Y))
 			{
 				++Count;
 			}
@@ -487,10 +556,9 @@ int32 FGenSkirmishAI::CountObjects(int32 PlayerIndex, const FString& TypeOrList,
 	{
 		Cache.Frame = Frame;
 		Cache.Counts.Reset();
-		for (FGenObjectID Id : Logic->GetObjectIDs())
+		for (const FGenObject* O : Logic->GetObjectsOf(PlayerIndex))
 		{
-			const FGenObject* O = Logic->FindObject(Id);
-			if (IsLiving(O) && O->GetOwner() == PlayerIndex && !O->IsUnderConstruction() && !O->IsProjectile())
+			if (IsLiving(O) && !O->IsUnderConstruction() && !O->IsProjectile())
 			{
 				++Cache.Counts.FindOrAdd(O->GetTemplate()->Canonical());
 			}
@@ -561,10 +629,9 @@ bool FGenSkirmishAI::EvaluateCondition(const FGenScriptCondition& C)
 		{
 			return true;
 		}
-		for (FGenObjectID Id : Logic->GetObjectIDs())
+		for (const FGenObject* O : Logic->GetObjectsOf(Who))
 		{
-			const FGenObject* O = Logic->FindObject(Id);
-			if (IsLiving(O) && O->GetOwner() == Who && !O->IsProjectile() && O->IsTargetable())
+			if (IsLiving(O) && !O->IsProjectile() && O->IsTargetable())
 			{
 				return false;
 			}
@@ -606,11 +673,9 @@ bool FGenSkirmishAI::EvaluateCondition(const FGenScriptCondition& C)
 			return false;
 		}
 		int32 Total = 0;
-		for (FGenObjectID Id : Logic->GetObjectIDs())
+		for (const FGenObject* O : Logic->GetObjectsOf(Who))
 		{
-			const FGenObject* O = Logic->FindObject(Id);
-			if (IsLiving(O) && O->GetOwner() == Who && !O->IsProjectile() && !O->IsKindOf(TEXT("INERT"))
-				&& Area->Contains(O->GetPosition().X, O->GetPosition().Y))
+			if (IsLiving(O) && !O->IsProjectile() && Area->Contains(O->GetPosition().X, O->GetPosition().Y) && !O->IsKindOf(TEXT("INERT")))
 			{
 				Total += int32(O->GetTemplate()->BuildCost);
 			}
@@ -725,10 +790,48 @@ bool FGenSkirmishAI::EvaluateCondition(const FGenScriptCondition& C)
 		return Who != INDEX_NONE && Logic->ConsumeScriptEvent(Who, Str(P, 1), true);
 	}
 
-	// Not there yet: named map objects, music, tech buildings.
+	case EGenScriptCondition::C_SKIRMISH_TECH_BUILDING_WITHIN_DISTANCE:
+	{
+		// ScriptConditions::evaluateSkirmishPlayerTechBuildingWithinDistancePerimeter: a tech building that
+		// isn't ours or an ally's within that distance of the area. (Worked out once: "if we have a cached
+		// value, return it".)
+		if (C.CustomData != 0)
+		{
+			return C.CustomData == 1;
+		}
+		const int32 Who = GetPlayerNamed(Str(P, 0));
+		const FGenPolygonTrigger* Area = GetTriggerNamed(Str(P, 2));
+		if (Who == INDEX_NONE || !Area || Area->Points.Num() == 0)
+		{
+			return false;
+		}
+		// PolygonTrigger::getCenterPoint / getRadius: the middle of its bounds, and half their diagonal.
+		FBox2f Bounds(ForceInit);
+		for (const FIntVector& Pt : Area->Points)
+		{
+			Bounds += FVector2f(float(Pt.X), float(Pt.Y));
+		}
+		const FVector2f Center = Bounds.GetCenter();
+		const float Radius = Bounds.GetExtent().Size() + Real(P, 1);
+		bool bFound = false;
+		for (FGenObjectID Id : Logic->GetObjectIDs())
+		{
+			const FGenObject* O = Logic->FindObject(Id);
+			if (IsLiving(O) && O->IsKindOf(TEXT("TECH_BUILDING")) && O->GetOwner() != Who
+				&& Logic->GetRelationship(Who, O->GetOwner()) != EGenRelationship::Allies
+				&& FVector2f::DistSquared(FVector2f(O->GetPosition().X, O->GetPosition().Y), Center) <= Radius * Radius)
+			{
+				bFound = true;
+				break;
+			}
+		}
+		C.CustomData = bFound ? 1 : -1;
+		return bFound;
+	}
+
+	// Not there yet: named map objects, music.
 	case EGenScriptCondition::C_NAMED_NOT_DESTROYED:
 	case EGenScriptCondition::C_MUSIC_TRACK_HAS_COMPLETED:
-	case EGenScriptCondition::C_SKIRMISH_TECH_BUILDING_WITHIN_DISTANCE:
 	case EGenScriptCondition::C_PLAYER_LOST_OBJECT_TYPE:
 	case EGenScriptCondition::C_UNIT_HEALTH:
 	case EGenScriptCondition::C_PLAYER_TRIGGERED_SPECIAL_POWER:
@@ -871,6 +974,15 @@ void FGenSkirmishAI::ExecuteAction(const FGenScriptAction& A)
 	// --- the player ---
 	case EGenScriptAction::A_PLAYER_GIVE_MONEY:
 	{
+		// Not the original's: "<Side> Give AI money to cover bug" hands every computer player $2200 as the game
+		// begins; at the user's word (2026-10-23) they start with the cash chosen in the menu, like everybody else.
+		// (The later bonuses of a hard army stay.)
+		if (RunningScript && RunningScript->Name.Contains(TEXT("Give AI money to cover bug")))
+		{
+			UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [ai f%u] p%d: '%s' gives no money (the menu's starting cash stands)"), Frame, Player,
+				*RunningScript->Name);
+			break;
+		}
 		const int32 Who = GetPlayerNamed(Str(P, 0));
 		if (Who != INDEX_NONE) { Logic->AddMoney(Who, Int(P, 1)); }
 		break;
@@ -889,7 +1001,10 @@ void FGenSkirmishAI::ExecuteAction(const FGenScriptAction& A)
 				const FGenObject* O = Logic->FindObject(Id);
 				if (IsLiving(O) && O->GetOwner() == Player && O->IsKindOf(TEXT("STRUCTURE")) && !O->IsBeingSold())
 				{
-					Logic->IssueSell(Id);
+					FGenCommand Sell(EGenCommandType::Sell);
+					Sell.Player = Player;
+					Sell.Units = { Id };
+					Logic->QueueSimCommand(MoveTemp(Sell));
 				}
 			}
 		}
@@ -935,12 +1050,33 @@ void FGenSkirmishAI::ExecuteAction(const FGenScriptAction& A)
 		break;
 	}
 	case EGenScriptAction::A_TEAM_HUNT:
-	case EGenScriptAction::A_TEAM_HUNT_WITH_COMMAND_BUTTON: // (the special ability itself isn't there yet)
 		if (FGenTeam* Team = GetTeamNamed(Str(P, 0)))
 		{
 			ForEachMember(*Team, [](FGenObject& O)
 			{
 				if (O.CanMove() && O.HasWeapons()) { O.CommandHunt(); }
+			});
+		}
+		break;
+	case EGenScriptAction::A_TEAM_HUNT_WITH_COMMAND_BUTTON:
+		// ScriptActions::doTeamHuntWithCommandButton: each member uses that button's ability on whatever is
+		// nearest, again and again (a unit's own ability; with any other kind of button the team simply hunts).
+		if (FGenTeam* Team = GetTeamNamed(Str(P, 0)))
+		{
+			const FString Button = Str(P, 1);
+			const FGenCommandButton* Btn = FGenCommandData::Get().FindButton(Button);
+			const FGenSpecialPowerTemplate* Power = Btn ? FGenUpgradeData::Get().FindPower(Btn->SpecialPower) : nullptr;
+			const bool bAbility = Btn && Btn->Command == EGenCommand::SpecialPower && Power && Power->bPorted && Power->AbilityKind != EGenAbilityKind::Other;
+			ForEachMember(*Team, [&](FGenObject& O)
+			{
+				if (bAbility && O.GetTemplate()->bButtonHunt && O.FindAbility(Power->Name) != INDEX_NONE)
+				{
+					O.SetHuntButton(Button);
+				}
+				else if (O.CanMove() && O.HasWeapons())
+				{
+					O.CommandHunt();
+				}
 			});
 		}
 		break;
@@ -1189,6 +1325,7 @@ void FGenSkirmishAI::RemoveSequentialScripts(int32 TeamId)
 
 void FGenSkirmishAI::UpdateSequentialScripts()
 {
+	GEN_PERF_SCOPE("AI.SeqScripts");
 	// ScriptEngine::evaluateAndProgressAllSequentialScripts: whenever its team stands idle, a sequential
 	// script performs its next action; several in one frame if they finish at once.
 	for (int32 i = 0; i < SequentialScripts.Num();)

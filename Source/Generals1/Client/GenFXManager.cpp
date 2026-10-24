@@ -1,4 +1,7 @@
 #include "Client/GenFXManager.h"
+#include "Client/GenQuadBatchComponent.h"
+#include "Core/GenPerf.h"
+#include "Audio/GenAudioManager.h"
 #include "Core/GenCoords.h"
 #include "Game/GenCameraPawn.h"
 #include "Logic/GenGameData.h"
@@ -11,6 +14,7 @@
 #include "Camera/PlayerCameraManager.h"
 #include "Components/PointLightComponent.h"
 #include "Engine/Engine.h"
+#include "Engine/Texture2D.h"
 #include "Engine/GameViewportClient.h"
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
@@ -28,24 +32,25 @@ namespace
 
 	FORCEINLINE FVector ToUE(const FVector3f& G) { return GenCoords::ToUE(G.X, G.Y, G.Z); }
 
-	void AddQuad(TArray<FVector>& V, TArray<FVector2D>& UV, TArray<FLinearColor>& C,
+	// The vertices as the renderer takes them: positions relative to the map, colours as bytes (linear,
+	// clamped - not gamma encoded: the material works on them as they are).
+	void AddQuad(TArray<FVector3f>& V, TArray<FVector2f>& UV, TArray<FColor>& C,
 		const FVector& P0, const FVector& P1, const FVector& P2, const FVector& P3, const FLinearColor& C01, const FLinearColor& C23)
 	{
-		V.Add(P0); V.Add(P1); V.Add(P2); V.Add(P3);
-		UV.Add(FVector2D(0, 0)); UV.Add(FVector2D(0, 1)); UV.Add(FVector2D(1, 1)); UV.Add(FVector2D(1, 0));
-		C.Add(C01); C.Add(C01); C.Add(C23); C.Add(C23);
+		V.Add(FVector3f(P0)); V.Add(FVector3f(P1)); V.Add(FVector3f(P2)); V.Add(FVector3f(P3));
+		UV.Add(FVector2f(0.f, 0.f)); UV.Add(FVector2f(0.f, 1.f)); UV.Add(FVector2f(1.f, 1.f)); UV.Add(FVector2f(1.f, 0.f));
+		const FColor K01 = C01.ToFColor(false), K23 = C23.ToFColor(false);
+		C.Add(K01); C.Add(K01); C.Add(K23); C.Add(K23);
 	}
 
-	void QuadIndices(int32 NumQuads, TArray<int32>& Out)
+	/** A quad with its own texture coordinates: U across (0..1), V along from V0 to V1. */
+	void AddQuadUV(TArray<FVector3f>& V, TArray<FVector2f>& UV, TArray<FColor>& C,
+		const FVector& P0, const FVector& P1, const FVector& P2, const FVector& P3, double V0, double V1, const FLinearColor& Color)
 	{
-		Out.SetNumUninitialized(NumQuads * 6);
-		for (int32 q = 0; q < NumQuads; ++q)
-		{
-			const int32 v = q * 4;
-			int32* I = &Out[q * 6];
-			I[0] = v; I[1] = v + 1; I[2] = v + 2;
-			I[3] = v; I[4] = v + 2; I[5] = v + 3;
-		}
+		V.Add(FVector3f(P0)); V.Add(FVector3f(P1)); V.Add(FVector3f(P2)); V.Add(FVector3f(P3));
+		UV.Add(FVector2f(0.f, float(V0))); UV.Add(FVector2f(1.f, float(V0))); UV.Add(FVector2f(1.f, float(V1))); UV.Add(FVector2f(0.f, float(V1)));
+		const FColor K = Color.ToFColor(false);
+		C.Add(K); C.Add(K); C.Add(K); C.Add(K);
 	}
 }
 
@@ -66,6 +71,7 @@ void UGenFXManager::Deinitialize()
 	Particles.Reset();
 	Particles.ObjectTransform = nullptr;
 	Particles.GroundHeight = nullptr;
+	Particles.ObjectShrouded = nullptr;
 	Batches.Reset();
 	BatchLookup.Reset();
 	Tracers.Reset();
@@ -88,10 +94,16 @@ void UGenFXManager::Start(AGenMapActor* InMapActor, UGenGameLogic* InLogic)
 		{
 			return false;
 		}
-		Out = O->GetTransform();
+		Out = Logic->GetRenderTransform(*O); // (where it is on the screen, not where the step has got it to)
 		return true;
 	};
 	Particles.GroundHeight = [this](float X, float Y) { return Logic ? Logic->GetGroundHeight(X, Y) : 0.f; };
+	// ParticleSystem::update: a system on an object the fog hides doesn't emit.
+	Particles.ObjectShrouded = [this](FGenObjectID Id)
+	{
+		const FGenObject* O = Logic && Logic->IsShroudOn() ? Logic->FindObject(Id) : nullptr;
+		return O && O->GetLocalShroud() >= EGenObjectShroud::Fogged;
+	};
 }
 
 // ---- FX lists -----------------------------------------------------------------------------------
@@ -177,8 +189,15 @@ void UGenFXManager::DoNuggetPos(const FGenFXNugget& N, const FVector3f& Primary,
 	case EGenFXNugget::TerrainScorch:
 		AddScorch(Primary, N.EffectRadius, N.Variant < 0 ? R.RandRange(0, 3) : N.Variant);
 		break;
+	case EGenFXNugget::Sound:
+		// SoundFXNugget::doFXPos
+		if (UGenAudioManager* Audio = Logic ? Logic->GetAudio() : nullptr)
+		{
+			Audio->PlayAt(N.Name, Primary);
+		}
+		break;
 	default:
-		break; // Sound (audio milestone), RayEffect, FXListAtBonePos (object form only)
+		break; // RayEffect, FXListAtBonePos (object form only)
 	}
 }
 
@@ -186,6 +205,11 @@ void UGenFXManager::DoFXPos(const FGenFXList* FX, const FVector3f& Primary, cons
 	const FVector3f* Secondary, float OverrideRadius)
 {
 	if (!FX || !MapActor)
+	{
+		return;
+	}
+	// FXList::doFXPos: nothing plays where the local player isn't looking.
+	if (Logic && !Logic->IsPositionClear(Primary))
 	{
 		return;
 	}
@@ -198,6 +222,11 @@ void UGenFXManager::DoFXPos(const FGenFXList* FX, const FVector3f& Primary, cons
 void UGenFXManager::DoFXObj(const FGenFXList* FX, const FGenObject* Primary, const FGenObject* Secondary)
 {
 	if (!FX || !Primary || !MapActor)
+	{
+		return;
+	}
+	// FXList::doFXObj: "the primary object is fogged or shrouded so don't bother with the effect".
+	if (Logic && Logic->GetLocalShroudNow(*Primary) > EGenObjectShroud::PartialClear)
 	{
 		return;
 	}
@@ -217,6 +246,14 @@ void UGenFXManager::DoFXObj(const FGenFXList* FX, const FGenObject* Primary, con
 			else
 			{
 				DoParticleNugget(N, Pos, &Xf, Primary, 0.f);
+			}
+		}
+		else if (N.Type == EGenFXNugget::Sound)
+		{
+			// SoundFXNugget::doFXObj: the sound is the object's, and stays with it.
+			if (UGenAudioManager* Audio = Logic ? Logic->GetAudio() : nullptr)
+			{
+				Audio->PlayForObject(N.Name, *Primary);
 			}
 		}
 		else if (N.Type == EGenFXNugget::LightPulse)
@@ -259,6 +296,14 @@ FGenParticleSystem* UGenFXManager::CreateAttachedSystem(const FString& TemplateN
 	return Sys;
 }
 
+void UGenFXManager::CreateSystemAt(const FString& TemplateName, const FVector3f& Pos)
+{
+	if (FGenParticleSystem* Sys = MapActor ? Particles.Create(TemplateName) : nullptr)
+	{
+		Sys->SetPosition(Pos);
+	}
+}
+
 void UGenFXManager::OnObjectDestroyed(FGenObjectID Object)
 {
 	Particles.DestroyAttachedTo(Object);
@@ -269,6 +314,19 @@ void UGenFXManager::DestroySystem(uint32 SystemID)
 	if (FGenParticleSystem* Sys = Particles.Find(SystemID))
 	{
 		Sys->Destroy();
+	}
+}
+
+FGenParticleSystem* UGenFXManager::FindSystem(uint32 SystemID)
+{
+	return SystemID != 0 ? Particles.Find(SystemID) : nullptr;
+}
+
+void UGenFXManager::SetSystemStopped(uint32 SystemID, bool bStopped)
+{
+	if (FGenParticleSystem* Sys = Particles.Find(SystemID))
+	{
+		if (bStopped) { Sys->Stop(); } else { Sys->Start(); }
 	}
 }
 
@@ -294,6 +352,11 @@ void UGenFXManager::AddLightPulse(const FVector3f& Pos, const FLinearColor& Colo
 void UGenFXManager::Shake(const FVector3f& Epicenter, int32 Type)
 {
 	// W3DView::shake: intensity falls off with distance from the point the camera looks at.
+	if (!IsInGameThread())
+	{
+		PendingShakes.Add({ Epicenter, Type }); // (the simulation's thread doesn't look at the camera: Update does)
+		return;
+	}
 	const FGenFXData& Data = FGenFXData::Get();
 	APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr;
 	const AGenCameraPawn* Cam = PC ? Cast<AGenCameraPawn>(PC->GetPawn()) : nullptr;
@@ -334,6 +397,7 @@ void UGenFXManager::AddScorch(const FVector3f& Pos, float Radius, int32 Type)
 
 void UGenFXManager::StepClientFrame()
 {
+	GEN_PERF_SCOPE("R.FX.Step");
 	Particles.Step();
 
 	// W3DTracerDraw: fly forward, fading out towards the expiration frame.
@@ -367,6 +431,7 @@ void UGenFXManager::StepClientFrame()
 
 void UGenFXManager::Update(double LogicFrameTime)
 {
+	GEN_PERF_SCOPE("R.FX");
 	if (!MapActor)
 	{
 		return;
@@ -386,6 +451,15 @@ void UGenFXManager::Update(double LogicFrameTime)
 	}
 	FrameAlpha = float(ClientTime - double(Target));
 
+	if (PendingShakes.Num() > 0)
+	{
+		const TArray<TPair<FVector3f, int32>> Shakes = MoveTemp(PendingShakes);
+		PendingShakes.Reset();
+		for (const TPair<FVector3f, int32>& S : Shakes)
+		{
+			Shake(S.Key, S.Value);
+		}
+	}
 	RenderParticles();
 	FlushBatches();
 	UpdateLights();
@@ -431,18 +505,23 @@ int32 UGenFXManager::GetBatch(const FString& Texture, EGenParticleShader Shader,
 	{
 		return *Found;
 	}
-	UProceduralMeshComponent* C = NewObject<UProceduralMeshComponent>(MapActor, NAME_None, RF_Transient);
-	C->SetupAttachment(MapActor->GetRootComponent());
-	C->SetUsingAbsoluteLocation(true);
-	C->SetUsingAbsoluteRotation(true);
-	C->SetUsingAbsoluteScale(true);
-	C->SetCastShadow(false);
-	C->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-	C->bReceivesDecals = false;
-	// Darkening first, then smoke, then glows on top.
-	C->SetTranslucentSortPriority(Shader == EGenParticleShader::Multiply ? -1 : (Shader == EGenParticleShader::Additive ? 1 : 0));
-	C->RegisterComponent();
-	C->SetVisibility(false);
+	// Darkening first, then smoke, then glows on top - and all of them after the water and the glass of
+	// the models (which have no priority of their own), as the original drew its particles last.
+	const int32 Layer = Shader == EGenParticleShader::Multiply ? LayerMultiply : Shader == EGenParticleShader::Additive ? LayerAdditive
+		: Shader == EGenParticleShader::AlphaTest ? LayerMasked : LayerAlpha;
+	static_assert(UE_ARRAY_COUNT(LayerComponents) == NumLayers, "a component per layer");
+	UGenQuadBatchComponent* C = LayerComponents[Layer];
+	if (!C)
+	{
+		C = NewObject<UGenQuadBatchComponent>(MapActor, NAME_None, RF_Transient);
+		C->SetupAttachment(MapActor->GetRootComponent());
+		C->SetUsingAbsoluteLocation(true);
+		C->SetUsingAbsoluteRotation(true);
+		C->SetUsingAbsoluteScale(true);
+		C->SetTranslucentSortPriority(Layer);
+		C->RegisterComponent();
+		LayerComponents[Layer] = C;
+	}
 
 	UMaterialInstanceDynamic* MID = nullptr;
 	if (UMaterialInterface* Base = GetParticleMaterial(Shader))
@@ -466,18 +545,20 @@ int32 UGenFXManager::GetBatch(const FString& Texture, EGenParticleShader Shader,
 		MID->SetScalarParameterValue(TEXT("SoftFade"), bFlat ? 0.f : 1.f);
 		// Ribbons and tracers run their texture edge to edge; only stand-alone sprites get their borders faded.
 		MID->SetScalarParameterValue(TEXT("EdgeFade"), bSprite ? 1.f : 0.f);
-		C->SetMaterial(0, MID);
+		C->AddMaterial(MID);
+		BatchMaterials.Add(MID);
 	}
 
 	const int32 Index = Batches.AddDefaulted();
-	BatchComponents.Add(C);
-	BatchMaterials.Add(MID);
+	Batches[Index].Material = MID;
+	Batches[Index].Layer = Layer;
 	BatchLookup.Add(Key, Index);
 	return Index;
 }
 
 void UGenFXManager::RenderParticles()
 {
+	GEN_PERF_SCOPE("R.FX.Build");
 	for (FBatch& B : Batches)
 	{
 		B.Vertices.Reset();
@@ -496,11 +577,36 @@ void UGenFXManager::RenderParticles()
 	const float A = FrameAlpha;
 	const double Cm = GenCoords::UnitsToCm;
 
+	// What the camera takes in (and a little more): a system all of whose particles are outside it is
+	// passed over. On a big map most of the smoke and fire is somewhere else.
+	const FVector Forward = CamRot.GetUnitAxis(EAxis::X);
+	FVector2D CullViewSize(16.0, 9.0);
+	if (GEngine && GEngine->GameViewport)
+	{
+		GEngine->GameViewport->GetViewportSize(CullViewSize);
+	}
+	const double TanX = FMath::Tan(FMath::DegreesToRadians(double(PC->PlayerCameraManager->GetFOVAngle())) * 0.5) * 1.08;
+	const double TanY = TanX * FMath::Max(1.0, CullViewSize.Y) / FMath::Max(1.0, CullViewSize.X);
+	auto InView = [&](const FVector3f& Center, float Radius)
+	{
+		const FVector D = ToUE(Center) - CamPos;
+		const double R = double(Radius) * Cm + 100.0;
+		const double Depth = FVector::DotProduct(D, Forward);
+		return Depth > -R && FMath::Abs(FVector::DotProduct(D, Right)) <= FMath::Max(Depth, 0.0) * TanX + R * 1.5
+			&& FMath::Abs(FVector::DotProduct(D, Up)) <= FMath::Max(Depth, 0.0) * TanY + R * 1.5;
+	};
+	int32 NumCulled = 0;
+
 	for (const TUniquePtr<FGenParticleSystem>& Sys : Particles.GetSystems())
 	{
 		const TArray<FGenParticle>& Ps = Sys->GetParticles();
 		if (Ps.Num() == 0)
 		{
+			continue;
+		}
+		if (!InView(Sys->BoundsCenter, Sys->BoundsRadius))
+		{
+			++NumCulled;
 			continue;
 		}
 		const FGenParticleSystemTemplate& T = Sys->GetTemplate();
@@ -564,6 +670,8 @@ void UGenFXManager::RenderParticles()
 		}
 	}
 
+	GEN_PERF_COUNT("R.FX.SystemsOutOfView#", NumCulled);
+
 	if (Tracers.Num() > 0)
 	{
 		// A tracer is a thin solid line; keep it at least ~1.5 pixels wide so it doesn't shimmer when zoomed out.
@@ -584,56 +692,164 @@ void UGenFXManager::RenderParticles()
 			AddQuad(B.Vertices, B.UVs, B.Colors, Tail - Side, Tail + Side, Head + Side, Head - Side, Col, Col);
 		}
 	}
+
+	// W3DRopeDraw: the ropes of a combat drop. Each is a chain of straight pieces whose joints sway a
+	// little, every one along its own axis; a solid line with a softer, wider one over it.
+	TArray<FGenRopeDraw> Ropes;
+	if (Logic)
+	{
+		Logic->GetVisibleRopes(Ropes);
+	}
+	if (Ropes.Num() > 0)
+	{
+		FVector2D ViewSize(1920.0, 1080.0);
+		if (GEngine && GEngine->GameViewport)
+		{
+			GEngine->GameViewport->GetViewportSize(ViewSize);
+		}
+		const double PixelAngle = 2.0 * FMath::Tan(FMath::DegreesToRadians(double(PC->PlayerCameraManager->GetFOVAngle())) * 0.5) / FMath::Max(1.0, ViewSize.X);
+		FBatch& B = Batches[GetBatch(FString(), EGenParticleShader::Alpha, false, false)];
+		for (const FGenRopeDraw& Rope : Ropes)
+		{
+			const int32 NumSegs = FMath::Clamp(FMath::CeilToInt32(Rope.LenMax / FMath::Max(1.f, FMath::Min(Rope.LenMax, Rope.WobbleLen))), 1, 64);
+			const float EachLen = Rope.Len / float(NumSegs);
+			const float Deflection = FMath::Sin(Rope.Phase) * Rope.WobbleAmp;
+			FVector3f Start = Rope.Top;
+			for (int32 Seg = 0; Seg < NumSegs; ++Seg)
+			{
+				// (The original draws a random axis per piece when the rope is made; any fixed one does.)
+				const float Axis = float((Seg * 7919 + 13) % 628) * 0.01f;
+				const FVector3f End(Rope.Top.X + Deflection * FMath::Cos(Axis), Rope.Top.Y + Deflection * FMath::Sin(Axis), Start.Z - EachLen);
+				const FVector Tail = ToUE(Start), Head = ToUE(End);
+				const FVector SideDir = FVector::CrossProduct(Head - Tail, CamPos - Tail).GetSafeNormal();
+				const double MinWidth = 1.2 * PixelAngle * FVector::Dist(CamPos, Tail);
+				const FVector Hard = SideDir * (FMath::Max(double(Rope.Width) * 0.5 * Cm, MinWidth) * 0.5);
+				const FVector Soft = SideDir * (FMath::Max(double(Rope.Width) * Cm, MinWidth * 2.0) * 0.5);
+				AddQuad(B.Vertices, B.UVs, B.Colors, Tail - Soft, Tail + Soft, Head + Soft, Head - Soft, FLinearColor(0.f, 0.f, 0.f, 0.5f), FLinearColor(0.f, 0.f, 0.f, 0.5f));
+				AddQuad(B.Vertices, B.UVs, B.Colors, Tail - Hard, Tail + Hard, Head + Hard, Head - Hard, FLinearColor(0.f, 0.f, 0.f, 1.f), FLinearColor(0.f, 0.f, 0.f, 1.f));
+				Start = End;
+			}
+		}
+	}
+
+	// W3DLaserDraw: the beams units hold on their targets - a laser pointer, a hacker's stream of numbers.
+	// Each is a few additive lines of growing width (the beam's glow), cut into segments when it arcs.
+	TArray<UGenGameLogic::FBeam> Beams;
+	if (Logic)
+	{
+		Logic->GetVisibleBeams(Beams);
+	}
+	if (Beams.Num() > 0)
+	{
+		FVector2D ViewSize(1920.0, 1080.0);
+		if (GEngine && GEngine->GameViewport)
+		{
+			GEngine->GameViewport->GetViewportSize(ViewSize);
+		}
+		const double PixelAngle = 2.0 * FMath::Tan(FMath::DegreesToRadians(double(PC->PlayerCameraManager->GetFOVAngle())) * 0.5) / FMath::Max(1.0, ViewSize.X);
+		for (const UGenGameLogic::FBeam& Beam : Beams)
+		{
+			if (Beam.WidthScale <= 0.f)
+			{
+				continue;
+			}
+			const FGenLaserDraw& L = *Beam.Draw;
+			UTexture2D* Tex = L.Texture.IsEmpty() ? nullptr : UGenAssetSubsystem::Get()->GetTexture(L.Texture);
+			const double Aspect = (Tex && Tex->GetSizeY() > 0) ? double(Tex->GetSizeX()) / double(Tex->GetSizeY()) : 1.0;
+			FBatch& B = Batches[GetBatch(Tex ? L.Texture : FString(), EGenParticleShader::Additive, false, false)];
+			const FVector3f Line = Beam.End - Beam.Start;
+			const float HalfLength = FMath::Max(0.01f, Line.Size() * 0.5f);
+			const FVector3f Middle = (Beam.Start + Beam.End) * 0.5f;
+			const bool bArc = L.ArcHeight > 0.f && L.Segments > 1;
+			const int32 Segments = bArc ? L.Segments : 1;
+			// ("amount to scroll texture on each draw": per client frame here)
+			const double Scroll = FMath::Fmod(double(L.ScrollRate) * (double(ClientFrame) + double(FrameAlpha)), 1.0);
+			for (int32 Seg = 0; Seg < Segments; ++Seg)
+			{
+				FVector3f P0 = Beam.Start, P1 = Beam.End;
+				if (bArc)
+				{
+					float R0 = float(Seg) / float(Segments), R1 = float(Seg + 1) / float(Segments);
+					if (Seg > 0) { R0 -= L.SegmentOverlapRatio; }
+					if (Seg < Segments - 1) { R1 += L.SegmentOverlapRatio; }
+					P0 = Beam.Start + Line * R0;
+					P1 = Beam.Start + Line * R1;
+					// Highest over the middle, down to nothing at both ends; never under the ground.
+					P0.Z += FMath::Cos((Middle - P0).Size() / HalfLength * PI * 0.5f) * L.ArcHeight;
+					P1.Z += FMath::Cos((Middle - P1).Size() / HalfLength * PI * 0.5f) * L.ArcHeight;
+					P0.Z = FMath::Max(P0.Z, 2.f + Logic->GetGroundHeight(P0.X, P0.Y));
+					P1.Z = FMath::Max(P1.Z, 2.f + Logic->GetGroundHeight(P1.X, P1.Y));
+				}
+				const FVector Tail = ToUE(P0), Head = ToUE(P1);
+				const FVector SideDir = FVector::CrossProduct(Head - Tail, CamPos - Tail).GetSafeNormal();
+				const double MinWidth = 1.5 * PixelAngle * FVector::Dist(CamPos, Tail);
+				const float SegLength = (P1 - P0).Size();
+				for (int32 i = L.NumBeams - 1; i >= 0; --i)
+				{
+					float Width = L.InnerBeamWidth * Beam.WidthScale;
+					FLinearColor Col(L.InnerColor.R * L.InnerColor.A, L.InnerColor.G * L.InnerColor.A, L.InnerColor.B * L.InnerColor.A, 1.f);
+					if (L.NumBeams > 1)
+					{
+						const float S = float(i) / float(L.NumBeams - 1);
+						Width = (L.InnerBeamWidth + S * (L.OuterBeamWidth - L.InnerBeamWidth)) * Beam.WidthScale;
+						Col = FLinearColor(L.InnerColor.R + S * (L.OuterColor.R - L.InnerColor.R) * L.InnerColor.A,
+							L.InnerColor.G + S * (L.OuterColor.G - L.InnerColor.G) * L.InnerColor.A,
+							L.InnerColor.B + S * (L.OuterColor.B - L.InnerColor.B) * L.InnerColor.A, 1.f);
+					}
+					// "number of times to tile texture across each segment"
+					const double Tiles = (Tex && L.bTile && Width > 0.f) ? double(SegLength) / double(Width) * Aspect * double(L.TilingScalar) : 1.0;
+					const FVector Side = SideDir * (FMath::Max(double(Width) * Cm, MinWidth) * 0.5);
+					AddQuadUV(B.Vertices, B.UVs, B.Colors, Tail - Side, Tail + Side, Head + Side, Head - Side, Scroll, Scroll + Tiles, Col);
+				}
+			}
+		}
+	}
 }
 
 void UGenFXManager::FlushBatches()
 {
-	TArray<int32> Indices;
-	for (int32 i = 0; i < Batches.Num(); ++i)
+	GEN_PERF_SCOPE("R.FX.Flush");
+	// A layer's batches one after the other in one run of vertices, which goes to the render thread as
+	// it is: one upload per layer, and a draw per batch out of it.
+	for (int32 Layer = 0; Layer < NumLayers; ++Layer)
 	{
-		FBatch& B = Batches[i];
-		UProceduralMeshComponent* C = BatchComponents[i];
-		const int32 NumQuads = B.Vertices.Num() / 4;
-		if (NumQuads == 0 || !C)
+		UGenQuadBatchComponent* C = LayerComponents[Layer];
+		if (!C)
 		{
-			if (B.bShown && C)
-			{
-				C->SetVisibility(false);
-				B.bShown = false;
-			}
 			continue;
 		}
-		// The section keeps a fixed vertex count (unused quads collapse to a point), so most frames only
-		// update vertex data; it is re-created only when it has to grow.
-		const bool bGrow = NumQuads > B.Capacity;
-		if (bGrow)
+		int32 NumVerts = 0;
+		for (const FBatch& B : Batches)
 		{
-			B.Capacity = FMath::Max<int32>(32, FMath::RoundUpToPowerOfTwo(uint32(NumQuads)));
+			if (B.Layer == Layer && B.Material)
+			{
+				NumVerts += B.Vertices.Num();
+			}
 		}
-		const int32 NumVerts = B.Capacity * 4;
-		const FVector Pad = B.Vertices.Last();
-		const int32 Used = B.Vertices.Num();
-		B.Vertices.SetNumUninitialized(NumVerts);
-		for (int32 v = Used; v < NumVerts; ++v)
+		FGenQuadFrame Frame;
+		if (NumVerts > 0)
 		{
-			B.Vertices[v] = Pad;
+			Frame.Positions.Reserve(NumVerts);
+			Frame.UVs.Reserve(NumVerts);
+			Frame.Colors.Reserve(NumVerts);
+			for (const FBatch& B : Batches)
+			{
+				if (B.Layer != Layer || !B.Material || B.Vertices.Num() < 4)
+				{
+					continue;
+				}
+				FGenQuadDraw& Draw = Frame.Draws.AddDefaulted_GetRef();
+				Draw.Material = B.Material->GetRenderProxy();
+				Draw.FirstQuad = Frame.Positions.Num() / 4;
+				Draw.NumQuads = B.Vertices.Num() / 4;
+				Frame.Positions.Append(B.Vertices);
+				Frame.UVs.Append(B.UVs);
+				Frame.Colors.Append(B.Colors);
+			}
 		}
-		B.UVs.SetNumZeroed(NumVerts);
-		B.Colors.SetNumZeroed(NumVerts);
-		if (bGrow)
-		{
-			QuadIndices(B.Capacity, Indices);
-			C->CreateMeshSection_LinearColor(0, B.Vertices, Indices, TArray<FVector>(), B.UVs, B.Colors, TArray<FProcMeshTangent>(), false, false);
-		}
-		else
-		{
-			C->UpdateMeshSection_LinearColor(0, B.Vertices, TArray<FVector>(), B.UVs, B.Colors, TArray<FProcMeshTangent>(), false);
-		}
-		if (!B.bShown)
-		{
-			C->SetVisibility(true);
-			B.bShown = true;
-		}
+		GEN_PERF_COUNT("R.FX.Quads#", NumVerts / 4);
+		GEN_PERF_COUNT("R.FX.Draws#", Frame.Draws.Num());
+		C->SetFrame(Frame);
 	}
 }
 

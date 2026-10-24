@@ -36,6 +36,8 @@ public:
 	void SetShakeOffset(const FVector2f& OffsetGen) { ShakeOffset = OffsetGen; }
 
 	float GetYaw() const { return Yaw; }
+	/** Height above the look-at point now (Generals units). */
+	float GetHeight() const { return Height; }
 	UCameraComponent* GetCamera() const { return Camera; }
 
 	UPROPERTY(EditAnywhere, Category = "Generals")

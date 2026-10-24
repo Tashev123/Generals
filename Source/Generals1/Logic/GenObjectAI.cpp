@@ -2,6 +2,7 @@
 // Simplified from AIStates.cpp (AIHuntState, AIFollowWaypointPathState, AIAttackMoveToState) and AIGuard.cpp.
 
 #include "Logic/GenObject.h"
+#include "Core/GenPerf.h"
 #include "Logic/GenGameData.h"
 #include "Logic/GenGameLogic.h"
 #include "Logic/GenSkirmishAI.h"
@@ -51,7 +52,7 @@ void FGenObject::CommandGuard(const FVector2f& Pos, float Radius, const FGenPoly
 	GuardArea = Area;
 	// AIGuardMachine::getStdGuardRange: vision range times the AI's inner guard modifier.
 	const FGenAIData& AI = FGenAIData::Get();
-	GuardRadius = Radius > 0.f ? Radius : FMath::Max(Template->VisionRange, 100.f) * AI.GuardInnerModifierAI;
+	GuardRadius = Radius > 0.f ? Radius : FMath::Max(GetVisionRange(), 100.f) * AI.GuardInnerModifierAI;
 	GuardOuterRadius = GuardRadius * (AI.GuardOuterModifierAI / FMath::Max(AI.GuardInnerModifierAI, 0.01f));
 	GuardMode = EGenGuardMode::Normal;
 	GuardObject = GenInvalidObjectID;
@@ -74,7 +75,7 @@ void FGenObject::CommandGuardPosition(const FVector2f& Pos, EGenGuardMode Mode, 
 		return; // (an aircraft on the ground keeps the order for when it is up)
 	}
 	const FGenAIData& AI = FGenAIData::Get();
-	const float Vision = FMath::Max(Template->VisionRange, 100.f);
+	const float Vision = FMath::Max(GetVisionRange(), 100.f);
 	GuardRadius = Vision * AI.GuardInnerModifierHuman;
 	GuardOuterRadius = Vision * AI.GuardOuterModifierHuman;
 	GuardMode = Mode;
@@ -125,36 +126,92 @@ void FGenObject::CommandFollowPath(const TArray<FVector2f>& Points)
 	CommandStop();
 }
 
+bool FGenObject::AppendToRoute(const FVector2f& Point)
+{
+	// AIUpdateInterface::privateFollowPathAppend: "getAIStateType() == AI_FOLLOW_PATH && getGoalPathSize() > 0 &&
+	// effectivelyMoving". (Between two legs - one point reached, the next not yet set off for - it is still on it.)
+	if (bDead || AIMode != EGenAIMode::FollowPath || RoutePoints.Num() == 0 || (!bMoving && !IsWaitingForPath() && !RoutePoints.IsValidIndex(RouteIndex)))
+	{
+		return false;
+	}
+	RoutePoints.Add(Point);
+	return true;
+}
+
+bool FGenObject::StartNextRouteLeg()
+{
+	// AIFollowPathState::update: on to the next point of the path, past whatever points lie within a cell of here.
+	const FVector2f Here(Position.X, Position.Y);
+	while (RoutePoints.IsValidIndex(RouteIndex) && FVector2f::DistSquared(RoutePoints[RouteIndex], Here) < FMath::Square(GenLogic::PathfindCellSize))
+	{
+		++RouteIndex;
+	}
+	if (!RoutePoints.IsValidIndex(RouteIndex))
+	{
+		PathExtraDistance = 0.f;
+		return false; // "reached the end of the path"
+	}
+	const FVector2f P = RoutePoints[RouteIndex++];
+	const bool bLast = !RoutePoints.IsValidIndex(RouteIndex);
+	if (bLast)
+	{
+		PathExtraDistance = 0.f;
+	}
+	else
+	{
+		// "We are in the middle of a path, so don't set the final goal location yet": the way goes on for
+		// as far as the next point is, and then some if there is one after that.
+		PathExtraDistance = FVector2f::Distance(RoutePoints[RouteIndex], P) + (RoutePoints.IsValidIndex(RouteIndex + 1) ? 4.f * GenLogic::PathfindCellSize : 0.f);
+	}
+	return StartPath(FVector3f(P.X, P.Y, Logic->GetGroundHeight(P.X, P.Y)), false, nullptr, false, !bLast);
+}
+
 FGenObject* FGenObject::FindEnemyNear(const FVector2f& Center, float Radius, const FGenPolygonTrigger* Area) const
 {
+	GEN_PERF_SCOPE("Obj.FindEnemyNear");
 	FGenObject* Best = nullptr;
 	float BestDistSq = FLT_MAX;
 	const FVector2f Self(Position.X, Position.Y);
-	for (FGenObjectID OtherId : Logic->GetObjectIDs())
+	auto Consider = [&](FGenObject& Other)
 	{
-		FGenObject* O = Logic->FindObject(OtherId);
-		if (!O || O == this || !O->IsTargetable() || Logic->GetRelationship(Owner, O->Owner) != EGenRelationship::Enemies
-			|| O->Template->IsKindOf(TEXT("HULK")) || ChooseWeapon(*O) == INDEX_NONE)
+		FGenObject* O = &Other;
+		if (O == this || !O->IsAttackable() || Logic->GetRelationship(Owner, O->Owner) != EGenRelationship::Enemies)
 		{
-			continue;
+			return;
 		}
 		const FVector2f P(O->Position.X, O->Position.Y);
+		const float DistSq = FVector2f::DistSquared(P, Self);
+		if (DistSq > BestDistSq || (DistSq == BestDistSq && Best && Best->ID < O->ID))
+		{
+			return;
+		}
 		if ((Radius >= 0.f && FVector2f::DistSquared(P, Center) > Radius * Radius) || (Area && !Area->Contains(P.X, P.Y)))
 		{
-			continue;
+			return;
 		}
-		const float DistSq = FVector2f::DistSquared(P, Self);
-		if (DistSq < BestDistSq)
+		if (O->Template->IsKindOf(TEXT("HULK")) || IgnoresAsAutoTarget(*O) || ChooseWeapon(*O) == INDEX_NONE)
 		{
-			BestDistSq = DistSq;
-			Best = O;
+			return;
 		}
+		BestDistSq = DistSq;
+		Best = O;
+	};
+	if (Radius >= 0.f)
+	{
+		// Within a circle: what is in the cells the circle covers.
+		Logic->GetPartition().ForEachInRange(Center, Radius, Consider);
+	}
+	else
+	{
+		// Anywhere at all (a hunt): outward from where we are, until nothing nearer can be left.
+		Logic->GetPartition().ForEachByRings(Self, -1.f, Consider, [&](float SeenRadius) { return Best && BestDistSq <= SeenRadius * SeenRadius; });
 	}
 	return Best;
 }
 
 void FGenObject::UpdateAIMode(uint32 Frame)
 {
+	GEN_PERF_SCOPE("Obj.AIMode");
 	const uint32 FPS = uint32(GenLogic::GetLogicFPS());
 	switch (AIMode)
 	{
@@ -238,7 +295,7 @@ void FGenObject::UpdateAIMode(uint32 Frame)
 		if (Frame >= NextAIModeFrame)
 		{
 			NextAIModeFrame = Frame + FPS / 2 + (ID % 7);
-			const FGenObject* Enemy = HasWeapons() ? FindEnemyNear(FVector2f(Position.X, Position.Y), Template->VisionRange) : nullptr;
+			const FGenObject* Enemy = HasWeapons() ? FindEnemyNear(FVector2f(Position.X, Position.Y), GetVisionRange()) : nullptr;
 			if (Enemy)
 			{
 				TargetID = Enemy->ID;
@@ -261,15 +318,13 @@ void FGenObject::UpdateAIMode(uint32 Frame)
 		// AIFollowWaypointPathState: one leg after the other; done (idle) after the last.
 		if (!bMoving && TargetID == GenInvalidObjectID)
 		{
-			if (RoutePoints.IsValidIndex(RouteIndex))
+			if (!StartNextRouteLeg() && !bMoving)
 			{
-				const FVector2f P = RoutePoints[RouteIndex++];
-				StartPath(FVector3f(P.X, P.Y, Position.Z), false);
-			}
-			else
-			{
-				AIMode = EGenAIMode::None;
-				RoutePoints.Reset();
+				if (!RoutePoints.IsValidIndex(RouteIndex))
+				{
+					AIMode = EGenAIMode::None;
+					RoutePoints.Reset();
+				}
 			}
 		}
 		break;

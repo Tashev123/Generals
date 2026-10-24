@@ -179,7 +179,7 @@ bool FGenMapData::LoadFromMemory(TConstArrayView<uint8> InData)
 				if (C.Version >= 4) { R.AStr(); } // layer name
 				T.ID = R.I32();
 				if (C.Version >= 2) { T.bWater = R.U8() != 0; }
-				if (C.Version >= 3) { T.bRiver = R.U8() != 0; R.I32(); }
+				if (C.Version >= 3) { T.bRiver = R.U8() != 0; T.RiverStart = R.I32(); }
 				const int32 NumPoints = R.I32();
 				for (int32 p = 0; p < NumPoints; ++p)
 				{
@@ -274,6 +274,33 @@ float FGenMapData::GetGroundHeight(float WorldX, float WorldY) const
 	return FMath::Lerp(FMath::Lerp(H00, H10, TX), FMath::Lerp(H01, H11, TX), TY);
 }
 
+FVector3f FGenMapData::GetGroundNormal(float WorldX, float WorldY) const
+{
+	// BaseHeightMapRenderObjClass::getHeightMapHeight: the slopes across the corners of the cell and of its
+	// neighbours, blended by where in the cell the point is (off the height map: straight up).
+	const float FX = WorldX / GenCoords::MapXYFactor + float(Border);
+	const float FY = WorldY / GenCoords::MapXYFactor + float(Border);
+	const int32 X = FMath::FloorToInt32(FX);
+	const int32 Y = FMath::FloorToInt32(FY);
+	if (X < 1 || Y < 1 || X > Width - 3 || Y > Height - 3)
+	{
+		return FVector3f::UpVector;
+	}
+	const float TX = FX - float(X), TY = FY - float(Y);
+	const float D0 = GetHeightAt(X, Y), D1 = GetHeightAt(X + 1, Y), D2 = GetHeightAt(X + 1, Y + 1), D3 = GetHeightAt(X, Y + 1);
+	const float D4 = GetHeightAt(X, Y - 1), D5 = GetHeightAt(X + 1, Y - 1), D6 = GetHeightAt(X + 2, Y), D7 = GetHeightAt(X + 2, Y + 1);
+	const float D8 = GetHeightAt(X + 1, Y + 2), D9 = GetHeightAt(X, Y + 2), D11 = GetHeightAt(X - 1, Y);
+	// (deltaZ_X3 repeats deltaZ_X1 in the original.)
+	const float DX0 = D1 - D11, DX1 = D6 - D0, DX2 = D7 - D3, DX3 = D6 - D0;
+	const float DY0 = D3 - D4, DY1 = D2 - D5, DY2 = D8 - D1, DY3 = D9 - D0;
+	const float DXLeft = DX0 * (1.f - TX) + TX * DX3, DXRight = DX1 * (1.f - TX) + TX * DX2;
+	const float DYLeft = DY0 * (1.f - TX) + TX * DY3, DYRight = DY1 * (1.f - TX) + TX * DY2;
+	const float DZX = DXLeft * (1.f - TY) + TY * DXRight;
+	const float DZY = DYLeft * (1.f - TY) + TY * DYRight;
+	const FVector3f L2R(2.f * GenCoords::MapXYFactor, 0.f, DZX), N2F(0.f, 2.f * GenCoords::MapXYFactor, DZY);
+	return FVector3f::CrossProduct(L2R, N2F).GetSafeNormal(UE_SMALL_NUMBER, FVector3f::UpVector);
+}
+
 FBox2f FGenMapData::GetPlayableBounds() const
 {
 	const FIntPoint B = Boundaries.Num() > 0 ? Boundaries[0] : FIntPoint(Width - 2 * Border, Height - 2 * Border);
@@ -302,6 +329,21 @@ const FGenPolygonTrigger* FGenMapData::FindTrigger(const FString& Name) const
 		}
 	}
 	return nullptr;
+}
+
+bool FGenMapData::LowerRawHeight(int32 X, int32 Y, int32 RawHeight)
+{
+	if (X < 0 || Y < 0 || X >= Width || Y >= Height || !Heights.IsValidIndex(Y * Width + X))
+	{
+		return false;
+	}
+	uint8& H = Heights[Y * Width + X];
+	if (int32(H) <= RawHeight)
+	{
+		return false;
+	}
+	H = uint8(FMath::Clamp(RawHeight, 0, 255));
+	return true;
 }
 
 const FGenMapObject* FGenMapData::FindWaypointByID(int32 Id) const

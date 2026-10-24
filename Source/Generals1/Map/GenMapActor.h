@@ -6,6 +6,10 @@
 
 class FGenMapData;
 class UGenTerrainComponent;
+class UGenWaterComponent;
+class UGenRoadComponent;
+class UGenBridgeComponent;
+struct FGenBridgeInfo;
 class UGenModelComponent;
 class UDirectionalLightComponent;
 class UPostProcessComponent;
@@ -40,6 +44,12 @@ public:
 	bool LoadMapByName(const FString& Name);
 
 	const FGenMapData* GetMapData() const { return Map.Get(); }
+	/** For the game logic, which levels building sites (TerrainLogic::flattenTerrain). */
+	FGenMapData* GetMapDataForLogic() { return Map.Get(); }
+	/** The heights of those cells (array indices, border included) have changed: the terrain's mesh there is made anew, a chunk a frame. */
+	void MarkTerrainDirty(const FIntRect& Cells);
+	/** One chunk's worth of that. True if there was something to do. */
+	bool RebuildDirtyTerrain();
 
 	/** Waypoint position in Unreal space (on the ground). */
 	bool GetWaypointLocation(const FString& WaypointName, FVector& OutLocation) const;
@@ -68,17 +78,36 @@ public:
 	/** Creates an unplaced visual showing a bare W3D model (debris chunks). */
 	UGenModelComponent* CreateModelVisual(const FString& Model, const FLinearColor& HouseColor);
 
+	/** The map-wide post process settings (the fog of war adds its material here). */
+	UPostProcessComponent* GetPostProcess() const { return PostProcess; }
+	const UGenTerrainComponent* GetTerrain() const { return Terrain; }
+	/** W3DWater's sky box: centred on the camera every frame ("center skybox around camera"). */
+	void UpdateSkyBox(const FVector& CameraLocation);
+	/** The map's bridges, for the game logic. */
+	const TArray<FGenBridgeInfo>& GetBridges() const;
+
 protected:
 	virtual void BeginDestroy() override;
 
 private:
 	void SetupLighting();
 	void SpawnMapObjects();
+	/** WaterRenderObjClass::init: the sky box model (new_skybox.w3d at SkyBoxScale), made once. */
+	void BuildSkyBox();
 
 	TSharedPtr<FGenMapData> Map;
 
 	UPROPERTY(VisibleAnywhere, Category = "Generals")
 	TObjectPtr<UGenTerrainComponent> Terrain;
+
+	UPROPERTY(VisibleAnywhere, Category = "Generals")
+	TObjectPtr<UGenWaterComponent> Water;
+
+	UPROPERTY(VisibleAnywhere, Category = "Generals")
+	TObjectPtr<UGenRoadComponent> Roads;
+
+	UPROPERTY(VisibleAnywhere, Category = "Generals")
+	TObjectPtr<UGenBridgeComponent> Bridges;
 
 	/** Map global light 0 (casts shadows) and the two optional fill lights. */
 	UPROPERTY(VisibleAnywhere, Category = "Generals")
@@ -98,4 +127,7 @@ private:
 
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<UGenModelComponent>> ObjectModels;
+
+	UPROPERTY(Transient)
+	TObjectPtr<class UProceduralMeshComponent> SkyBox;
 };

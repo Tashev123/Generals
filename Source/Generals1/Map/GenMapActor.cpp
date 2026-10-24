@@ -3,10 +3,18 @@
 #include "Core/GenCoords.h"
 #include "Core/GenFileSystem.h"
 #include "Logic/GenGameData.h"
+#include "Map/GenBridges.h"
 #include "Map/GenMapData.h"
+#include "Map/GenRoads.h"
 #include "Map/GenTerrain.h"
+#include "Map/GenWater.h"
 #include "W3D/GenModelComponent.h"
+#include "W3D/GenAssets.h"
+#include "W3D/GenW3D.h"
 #include "Generals1.h"
+#include "ProceduralMeshComponent.h"
+#include "Engine/Texture2D.h"
+#include "Materials/MaterialInstanceDynamic.h"
 #include "Components/DirectionalLightComponent.h"
 #include "Components/ExponentialHeightFogComponent.h"
 #include "Components/PostProcessComponent.h"
@@ -21,6 +29,12 @@ AGenMapActor::AGenMapActor()
 
 	Terrain = CreateDefaultSubobject<UGenTerrainComponent>(TEXT("Terrain"));
 	Terrain->SetupAttachment(RootComponent);
+	Water = CreateDefaultSubobject<UGenWaterComponent>(TEXT("Water"));
+	Water->SetupAttachment(RootComponent);
+	Roads = CreateDefaultSubobject<UGenRoadComponent>(TEXT("Roads"));
+	Roads->SetupAttachment(RootComponent);
+	Bridges = CreateDefaultSubobject<UGenBridgeComponent>(TEXT("Bridges"));
+	Bridges->SetupAttachment(RootComponent);
 
 	auto MakeLight = [this](const TCHAR* Name, bool bShadows)
 	{
@@ -70,6 +84,12 @@ void AGenMapActor::BeginDestroy()
 	Super::BeginDestroy();
 }
 
+const TArray<FGenBridgeInfo>& AGenMapActor::GetBridges() const
+{
+	static const TArray<FGenBridgeInfo> None;
+	return Bridges ? Bridges->GetInfos() : None;
+}
+
 void AGenMapActor::LoadMap()
 {
 	LoadMapByName(MapName);
@@ -83,6 +103,9 @@ void AGenMapActor::ClearMap()
 	}
 	ObjectModels.Reset();
 	if (Terrain) { Terrain->Clear(); }
+	if (Water) { Water->Clear(); }
+	if (Roads) { Roads->Clear(); }
+	if (Bridges) { Bridges->Clear(); }
 	Map.Reset();
 }
 
@@ -106,9 +129,14 @@ bool AGenMapActor::LoadMapByName(const FString& Name)
 	}
 	Map = NewMap;
 	GD.ApplyMapIni(Folder);
+	FGenWaterSettings::LoadForMap(Folder);
 
 	Terrain->Build(*Map);
+	Roads->Build(*Map, Terrain);
+	Bridges->Build(*Map);
+	Water->Build(*Map);
 	SetupLighting();
+	BuildSkyBox();
 	if (bSpawnMapObjects)
 	{
 		SpawnMapObjects();
@@ -175,6 +203,97 @@ void AGenMapActor::SetupLighting()
 	}
 }
 
+void AGenMapActor::BuildSkyBox()
+{
+	// WaterRenderObjClass::init: Create_Render_Obj("new_skybox", SkyBoxScale) - a box of five faces (the
+	// top and four sides, a texture each), drawn as it is (its material is all emissive: no light changes it).
+	const FGenGameData& GD = FGenGameData::Get();
+	if (SkyBox || !GD.bDrawSkyBox)
+	{
+		return;
+	}
+	UGenAssetSubsystem* Assets = UGenAssetSubsystem::Get();
+	TSharedPtr<const FGenW3DFile> File = Assets ? Assets->LoadW3D(TEXT("new_skybox")) : nullptr;
+	const FGenW3DMesh* Mesh = File.IsValid() && File->Meshes.Num() > 0 ? &File->Meshes[0] : nullptr;
+	UMaterialInterface* Base = LoadObject<UMaterialInterface>(nullptr, TEXT("/Game/Generals/Materials/M_Sky.M_Sky"));
+	if (!Mesh || !Base || Mesh->Passes.Num() == 0 || Mesh->Passes[0].Stages.Num() == 0)
+	{
+		UE_LOG(LogGenerals, Warning, TEXT("Sky box: %s"), !Base ? TEXT("no M_Sky material (gen_setup.ps1 -Only sky)") : TEXT("new_skybox.w3d not usable"));
+		return;
+	}
+	const FGenW3DTextureStage& Stage = Mesh->Passes[0].Stages[0];
+	const float Scale = GD.SkyBoxScale * GenCoords::UnitsToCm;
+	SkyBox = NewObject<UProceduralMeshComponent>(this, TEXT("SkyBox"), RF_Transient);
+	SkyBox->SetupAttachment(RootComponent);
+	SkyBox->SetUsingAbsoluteLocation(true);
+	SkyBox->SetCastShadow(false);
+	SkyBox->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	SkyBox->bReceivesDecals = false;
+	SkyBox->SetVisibleInRayTracing(false);
+	SkyBox->bAffectDistanceFieldLighting = false;
+	SkyBox->RegisterComponent();
+	// One section per texture (the stage gives a texture per triangle).
+	TMap<int32, int32> SectionOfTexture;
+	TArray<TArray<FVector>> Positions;
+	TArray<TArray<FVector2D>> UVs;
+	TArray<TArray<int32>> Indices;
+	TArray<int32> SectionTexture;
+	for (int32 t = 0; t < Mesh->Triangles.Num(); ++t)
+	{
+		const int32 TexId = Stage.TextureIds.Num() == 0 ? 0 : int32(Stage.TextureIds[FMath::Min(t, Stage.TextureIds.Num() - 1)]);
+		int32* Found = SectionOfTexture.Find(TexId);
+		if (!Found)
+		{
+			Found = &SectionOfTexture.Add(TexId, Positions.Num());
+			Positions.AddDefaulted();
+			UVs.AddDefaulted();
+			Indices.AddDefaulted();
+			SectionTexture.Add(TexId);
+		}
+		const int32 Sec = *Found;
+		const FIntVector3& Tri = Mesh->Triangles[t];
+		// (W3D's y is mirrored into Unreal's, which turns the winding round.)
+		for (const int32 V : { Tri.X, Tri.Z, Tri.Y })
+		{
+			const FVector3f& P = Mesh->Vertices.IsValidIndex(V) ? Mesh->Vertices[V] : FVector3f::ZeroVector;
+			Positions[Sec].Add(FVector(P.X * Scale, -P.Y * Scale, P.Z * Scale));
+			const FVector2f UV = Stage.TexCoords.IsValidIndex(V) ? Stage.TexCoords[V] : FVector2f::ZeroVector;
+			UVs[Sec].Add(FVector2D(UV.X, 1.f - UV.Y));
+			Indices[Sec].Add(Indices[Sec].Num());
+		}
+	}
+	for (int32 s = 0; s < Positions.Num(); ++s)
+	{
+		SkyBox->CreateMeshSection(s, Positions[s], Indices[s], TArray<FVector>(), UVs[s], TArray<FColor>(), TArray<FProcMeshTangent>(), false);
+		UMaterialInstanceDynamic* M = UMaterialInstanceDynamic::Create(Base, SkyBox);
+		const FString TexName = Mesh->Textures.IsValidIndex(SectionTexture[s]) ? Mesh->Textures[SectionTexture[s]].Name : FString();
+		if (UTexture2D* Tex = TexName.IsEmpty() ? nullptr : Assets->GetTexture(TexName))
+		{
+			// ("Enable clamping on all textures used by the skybox (to reduce corner seams).")
+			if (Tex->AddressX != TA_Clamp || Tex->AddressY != TA_Clamp)
+			{
+				Tex->AddressX = TA_Clamp;
+				Tex->AddressY = TA_Clamp;
+				Tex->UpdateResource();
+			}
+			M->SetTextureParameterValue(TEXT("SkyTexture"), Tex);
+		}
+		SkyBox->SetMaterial(s, M);
+	}
+	// The height fog stops short of it: its pictures are the distance already (and it would be all fog).
+	Fog->SetFogCutoffDistance(0.9f * Mesh->BoundsMax.X * Scale);
+	UE_LOG(LogGenerals, Log, TEXT("Sky box: new_skybox.w3d, %d faces, scale %.1f"), Positions.Num(), GD.SkyBoxScale);
+}
+
+void AGenMapActor::UpdateSkyBox(const FVector& CameraLocation)
+{
+	if (SkyBox)
+	{
+		// "pos = camera position; pos.Z = SkyBoxPositionZ"
+		SkyBox->SetWorldLocation(FVector(CameraLocation.X, CameraLocation.Y, FGenGameData::Get().SkyBoxPositionZ * GenCoords::UnitsToCm));
+	}
+}
+
 void AGenMapActor::SpawnMapObjects()
 {
 	const FGenGameData& GD = FGenGameData::Get();
@@ -223,6 +342,7 @@ UGenModelComponent* AGenMapActor::CreateObjectVisual(const FGenThingTemplate& Te
 	{
 		return nullptr;
 	}
+	GenDrawable::NoteTemplate(Template);
 
 	UGenModelComponent* MC = NewObject<UGenModelComponent>(this, NAME_None, RF_Transient);
 	MC->SetupAttachment(RootComponent);
@@ -240,6 +360,19 @@ UGenModelComponent* AGenMapActor::CreateObjectVisual(const FGenThingTemplate& Te
 	GenDrawable::ApplyState(MC, *Draw, Draw->FindBestState(Flags), bNight);
 	ObjectModels.Add(MC);
 	return MC;
+}
+
+void AGenMapActor::MarkTerrainDirty(const FIntRect& Cells)
+{
+	if (Terrain && Map)
+	{
+		Terrain->MarkCellsDirty(*Map, Cells.Min.X, Cells.Min.Y, Cells.Max.X, Cells.Max.Y);
+	}
+}
+
+bool AGenMapActor::RebuildDirtyTerrain()
+{
+	return Terrain && Map && Terrain->RebuildDirtyChunk(*Map);
 }
 
 UGenModelComponent* AGenMapActor::CreateAttachedVisual(UGenModelComponent* Parent, const FLinearColor& HouseColor)
