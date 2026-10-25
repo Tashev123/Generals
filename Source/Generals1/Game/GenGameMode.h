@@ -11,7 +11,7 @@ struct FGenSetupData;
 /** Where the game is between starting the program and leaving a finished game. */
 enum class EGenGamePhase : uint8
 {
-	Menu,       // the skirmish setup screen
+	Menu,       // the menus before a game: the main menu, the skirmish setup, the online screen (EGenMenuScreen)
 	Loading,    // "Loading" is on screen; the map is read on the next tick
 	Playing,
 	Score,      // the score screen, over the game
@@ -19,14 +19,24 @@ enum class EGenGamePhase : uint8
 	Server,     // this program is a network game's server (-GenServer): no game, no screen
 };
 
+/** Which of the menus before a game is up (the phase is Menu for all of them). */
+enum class EGenMenuScreen : uint8
+{
+	Main,       // the main menu: skirmish, online, options, exit
+	Skirmish,   // the skirmish setup
+	Online,     // host a network game or join one
+};
+
 /**
- * Skirmish game mode: the skirmish menu, then the game it sets up, then the score screen and back
- * to the menu (the original's Shell -> SkirmishGameOptionsMenu -> game -> ScoreScreen).
+ * Skirmish game mode: the main menu, the skirmish menu, then the game it sets up, then the score screen and back
+ * to the menu (the original's Shell -> MainMenu -> SkirmishGameOptionsMenu -> game -> ScoreScreen).
+ * The program starts on the main menu; after a game the menu comes back on the screen it was left from.
  *
  * A run with test switches skips the menu and starts at once: the map of the URL option "?GenMap=Name"
  * or the command line "-GenMap=Name" (default: Tournament Desert), the local player (-GenFaction=,
  * default FactionAmerica) against -GenEnemy= (default FactionChina). -GenNoMenu does the same without
- * any other switch; -GenTestMenu= shows the menu in a test run and works it.
+ * any other switch; -GenTestMenu= shows the menu in a test run and works it (from the skirmish setup, or
+ * from the main menu if the script has "Main." ids).
  *
  * Test automation (command line):
  *   -GenShot=<file.png>        take a screenshot after the map loads, then quit
@@ -69,6 +79,9 @@ public:
 	EGenGamePhase GetPhase() const { return Phase; }
 	/** The interface has the mouse: the menu, the score screen, or the in-game menu is up. */
 	bool IsShellActive() const { return Phase != EGenGamePhase::Playing || bQuitMenuOpen; }
+	/** The menu screen shown while the phase is Menu. */
+	EGenMenuScreen GetMenuScreen() const { return MenuScreen; }
+	void SetMenuScreen(EGenMenuScreen Screen);
 	/** Why the game couldn't start, to show in the menu. */
 	const FString& GetShellError() const { return ShellError; }
 	void ClearShellError() { ShellError.Reset(); }
@@ -81,7 +94,7 @@ public:
 	void RestartGame();
 	/** The in-game menu's "exit": to the score screen. */
 	void EndGame();
-	/** The score screen's "continue": back to the skirmish menu. */
+	/** The score screen's "continue": back to the menu, on the screen the game was started from. */
 	void ExitToMenu();
 	/** The score screen after a defeat while others fight on: back to the game, as a spectator. */
 	void KeepWatching();
@@ -134,6 +147,7 @@ public:
 	TObjectPtr<AGenMapActor> MapActor;
 
 	EGenGamePhase Phase = EGenGamePhase::Playing;
+	EGenMenuScreen MenuScreen = EGenMenuScreen::Main;
 	FString ShellError;
 	TArray<FGenSkirmishSlot> PendingSlots;   // settled by RequestStart, used when the loading tick comes
 	int32 LoadingTicks = 0;

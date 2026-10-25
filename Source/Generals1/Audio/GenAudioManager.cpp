@@ -33,6 +33,13 @@ namespace
 	 */
 	constexpr float OutputGain = 1.41f;
 
+	/** The player's volumes (SetUserVolumes): the options' audio page. */
+	struct FUserVolumes
+	{
+		float Master = 1.f, Music = 1.f, Sound = 1.f, Voice = 1.f, Speech = 1.f;
+	};
+	FUserVolumes UserVolumes;
+
 	uint64 LoopKey(FGenObjectID Object, int32 Slot)
 	{
 		return (uint64(Object) << 8) | uint64(Slot & 0xff);
@@ -198,6 +205,37 @@ float UGenAudioManager::GetEffectiveVolume(const FVoice& Voice) const
 	}
 	// Relative2DVolume: "if less than 0, 2D volumes will be 100% - x%, while 3D sounds will be 100%".
 	return OutputGain * Voice.Volume * S.DefaultSoundVolume * (S.Relative2DVolume < 0.f ? 1.f + S.Relative2DVolume : 1.f);
+}
+
+float UGenAudioManager::GetUserScale(const FVoice& Voice)
+{
+	const float Kind = (Voice.bStream || Voice.bSpeech) ? UserVolumes.Speech
+		: ((Voice.Info && (Voice.Info->Type & GenSoundType::Voice)) ? UserVolumes.Voice : UserVolumes.Sound);
+	return UserVolumes.Master * Kind;
+}
+
+void UGenAudioManager::SetUserVolumes(float Master, float Music, float Sound, float Voice, float Speech)
+{
+	UserVolumes.Master = FMath::Clamp(Master, 0.f, 1.f);
+	UserVolumes.Music = FMath::Clamp(Music, 0.f, 1.f);
+	UserVolumes.Sound = FMath::Clamp(Sound, 0.f, 1.f);
+	UserVolumes.Voice = FMath::Clamp(Voice, 0.f, 1.f);
+	UserVolumes.Speech = FMath::Clamp(Speech, 0.f, 1.f);
+}
+
+void UGenAudioManager::ApplyUserVolumes()
+{
+	if (MusicComponent && MusicWave)
+	{
+		MusicComponent->SetVolumeMultiplier(FMath::Max(MusicBaseVolume * UserVolumes.Master * UserVolumes.Music, 0.0001f));
+	}
+	for (const FVoice& V : Voices)
+	{
+		if (Components.IsValidIndex(V.Slot) && Components[V.Slot])
+		{
+			Components[V.Slot]->SetVolumeMultiplier(FMath::Max(GetEffectiveVolume(V) * GetUserScale(V), 0.0001f));
+		}
+	}
 }
 
 void UGenAudioManager::GetPan(const FVoice& Voice, float& OutLeft, float& OutRight) const
@@ -594,7 +632,7 @@ uint32 UGenAudioManager::StartVoice(const FRequest& Request)
 	C->Stop();
 	C->SetSound(Wave);
 	const float Volume = GetEffectiveVolume(V);
-	C->SetVolumeMultiplier(FMath::Max(Volume, 0.0001f));
+	C->SetVolumeMultiplier(FMath::Max(Volume * GetUserScale(V), 0.0001f));
 	C->SetPitchMultiplier(V.Pitch);
 	C->Play();
 	++NumPlayed;
@@ -706,7 +744,7 @@ void UGenAudioManager::Update(float DeltaSeconds)
 				continue;
 			}
 		}
-		C->SetVolumeMultiplier(FMath::Max(Volume, 0.0001f));
+		C->SetVolumeMultiplier(FMath::Max(Volume * GetUserScale(V), 0.0001f));
 	}
 
 	UpdateLoops();
@@ -983,6 +1021,16 @@ void UGenAudioManager::UpdateEva()
 		return;
 	}
 	EvaHandle = PlayUI((*Sounds)[Random.RandRange(0, Sounds->Num() - 1)], Local);
+	// (The adviser speaks through an interface sound: heard at the speech volume, not the sound effects'.)
+	if (const int32 Index = FindVoice(EvaHandle); Index != INDEX_NONE)
+	{
+		FVoice& V = Voices[Index];
+		V.bSpeech = true;
+		if (Components.IsValidIndex(V.Slot) && Components[V.Slot])
+		{
+			Components[V.Slot]->SetVolumeMultiplier(FMath::Max(GetEffectiveVolume(V) * GetUserScale(V), 0.0001f));
+		}
+	}
 	UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [audio f%u] the adviser: %s (%s)"), Logic->GetFrame(), *Event->Name, EvaHandle ? TEXT("playing") : TEXT("could not play"));
 }
 
@@ -1028,7 +1076,8 @@ void UGenAudioManager::PlayMusic(const FString& Track)
 	MusicPlaying = Info->Name;
 	MusicComponent->SetSound(Wave);
 	// (A music track goes to the speakers as it is, each side at its own level: no gain to make up.)
-	MusicComponent->SetVolumeMultiplier(FMath::Max(Info->Volume * FGenAudioData::Get().GetSettings().DefaultMusicVolume, 0.0001f));
+	MusicBaseVolume = Info->Volume * FGenAudioData::Get().GetSettings().DefaultMusicVolume;
+	MusicComponent->SetVolumeMultiplier(FMath::Max(MusicBaseVolume * UserVolumes.Master * UserVolumes.Music, 0.0001f));
 	MusicComponent->Play();
 	UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [audio f%u] music: %s (%s, %d Hz, %d channels)"), Logic ? Logic->GetFrame() : 0, *Info->Name, *Info->Filename,
 		int32(Wave->GetSampleRateForCurrentPlatform()), Wave->NumChannels);

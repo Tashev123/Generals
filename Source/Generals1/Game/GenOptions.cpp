@@ -78,10 +78,11 @@ void AGenHUD::DrawOptions()
 	}
 	Shell.bUnderOptions = false;
 
-	// Everything else is behind a dark veil.
-	DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.6f), 0.f, 0.f, Canvas->SizeX, Canvas->SizeY);
-	ShellPanel(ShellRect(180, 70, 1240, 760), 0.97f);
-	ShellText(TEXT("OPTIONS"), ShellRect(800, 88, 0, 0).Min.X, ShellRect(800, 88, 0, 0).Min.Y, ShellGold, 34.f, 1, true);
+	// Everything else is behind a dark veil, and the panel itself is solid: nothing shows through it.
+	DrawRect(FLinearColor(0.f, 0.004f, 0.015f, 0.8f), 0.f, 0.f, Canvas->SizeX, Canvas->SizeY);
+	ShellPanel(ShellRect(180, 60, 1240, 780), 1.f);
+	ShellTextEx(TEXT("OPTIONS"), ShellRect(220, 0, 0, 0).Min.X, ShellRect(0, 84, 0, 0).Min.Y, ShellGold, 32.f, 0, true, 140);
+	ShellTextEx(TEXT("ESC  CANCEL"), ShellRect(1380, 0, 0, 0).Min.X, ShellRect(0, 100, 0, 0).Min.Y, ShellDim * 1.3f, 12.f, 2, true, 160);
 
 	static const TArray<FString> TabNames = { TEXT("Video"), TEXT("Controls"), TEXT("Hotkeys"), TEXT("Audio") };
 	const int32 Tab = ShellTabs(TEXT("Options.Tab"), ShellRect(220, 150, 1160, 50), TabNames, Options.Tab);
@@ -106,7 +107,12 @@ void AGenHUD::DrawOptions()
 	default: break;
 	}
 
-	if (ShellButton(TEXT("Options.Defaults"), ShellRect(220, 760, 260, 50), TEXT("RESET TO DEFAULTS")))
+	// The buttons under a line of their own.
+	{
+		const FBox2D Rule = ShellRect(220, 752, 1160, 0);
+		DrawRect(ShellLine, Rule.Min.X, Rule.Min.Y, Rule.GetSize().X, FMath::Max(1.f, Shell.Scale));
+	}
+	if (ShellButton(TEXT("Options.Defaults"), ShellRect(220, 770, 260, 50), TEXT("RESET TO DEFAULTS")))
 	{
 		switch (Options.Tab)
 		{
@@ -117,11 +123,11 @@ void AGenHUD::DrawOptions()
 		default: break;
 		}
 	}
-	if (ShellButton(TEXT("Options.Cancel"), ShellRect(940, 760, 210, 50), TEXT("CANCEL")) || bEsc)
+	if (ShellButton(TEXT("Options.Cancel"), ShellRect(940, 770, 210, 50), TEXT("CANCEL")) || bEsc)
 	{
 		CloseOptions(false);
 	}
-	else if (ShellButton(TEXT("Options.Apply"), ShellRect(1170, 760, 210, 50), TEXT("APPLY")))
+	else if (ShellPrimaryButton(TEXT("Options.Apply"), ShellRect(1170, 770, 210, 50), TEXT("APPLY")))
 	{
 		CloseOptions(true);
 	}

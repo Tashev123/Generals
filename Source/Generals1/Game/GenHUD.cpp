@@ -63,7 +63,7 @@ void AGenHUD::DrawHUD()
 	BeginShell(PC);
 	if (GM && GM->GetPhase() == EGenGamePhase::Menu)
 	{
-		DrawSkirmishMenu(GM);
+		DrawShellMenu(GM); // the main menu, the skirmish setup or the online screen
 		DrawOptions();
 		EndShell();
 		return;

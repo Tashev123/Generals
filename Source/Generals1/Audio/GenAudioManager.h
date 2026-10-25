@@ -77,6 +77,16 @@ public:
 	/** One track, round and round, instead of the game's own (the score screen's). */
 	void PlayTrackOnly(const FString& Track);
 
+	/**
+	 * The player's volumes (the options' audio page), 0..1 each, on top of the original's own: the music;
+	 * sound effects (the world's and the interface's); the units' voices (Voice events: "an object says one
+	 * thing at a time"); speech (the adviser, and dialogue streamed from Speech). Master scales them all.
+	 * Kept for the program's whole run: every level's manager plays by them.
+	 */
+	static void SetUserVolumes(float Master, float Music, float Sound, float Voice, float Speech);
+	/** Puts the volumes into effect on what plays now as well (the music and every voice), not only on what starts next. */
+	void ApplyUserVolumes();
+
 	// --- for tests ---
 	int32 GetNumPlaying() const { return Voices.Num(); }
 	/** Decodes every sound file an event refers to; logs what fails. Returns the number of files that decode. */
@@ -103,6 +113,7 @@ private:
 		int32 Slot = INDEX_NONE;        // which audio component
 		bool bPositional = false;
 		bool bStream = false;           // speech
+		bool bSpeech = false;           // the adviser's (played as an interface sound, heard at the speech volume)
 		FVector3f Pos = FVector3f::ZeroVector;
 		FGenObjectID Object = GenInvalidObjectID;
 		float Volume = 1.f;             // the event's volume times this play's random shift
@@ -135,6 +146,8 @@ private:
 	bool ShouldPlayLocally(const FGenAudioEventInfo& Info, int32 Player) const;
 	bool IsPositional(const FRequest& Request) const;
 	float GetEffectiveVolume(const FVoice& Voice) const;
+	/** The player's volume for this voice's kind of sound (SetUserVolumes). */
+	static float GetUserScale(const FVoice& Voice);
 	/** How much of a voice goes to the left and to the right speaker. */
 	void GetPan(const FVoice& Voice, float& OutLeft, float& OutRight) const;
 	float GetRangeScale(const FGenAudioEventInfo& Info, const FVector3f& Pos) const;
@@ -222,6 +235,7 @@ private:
 	int32 MusicTrackNumber = 0;
 	double MusicNextStart = 0.0;
 	FString MusicPlaying;
+	float MusicBaseVolume = 1.f;        // the track's volume by the original's rules, before the player's
 
 	bool bTrace = false;
 	int32 NumPlayed = 0;

@@ -46,6 +46,9 @@ namespace
 	/** How long "victory" or "defeat" stands on the screen before the score screen comes. */
 	constexpr float ScoreScreenDelay = 4.f;
 
+	/** The menu screen to come back to after a game (the level, and with it the game mode, is loaded anew). */
+	EGenMenuScreen LastMenuScreen = EGenMenuScreen::Skirmish;
+
 	FRandomStream MakeSetupRandom()
 	{
 		int32 Seed = int32(FPlatformTime::Cycles64() & 0x7fffffff);
@@ -185,6 +188,20 @@ void AGenGameMode::StartPlay()
 			}
 		}
 		Phase = EGenGamePhase::Menu;
+		// The program starts on the main menu (a test script only if it works the main menu: "Main." ids);
+		// after a game the menu comes back where it was left - the skirmish setup or the online screen.
+		static bool bMenuShown = false;
+		if (!bMenuShown)
+		{
+			bMenuShown = true;
+			FString Spec;
+			FParse::Value(Cmd, TEXT("GenTestMenu="), Spec, false);
+			SetMenuScreen(bMenuTest && !Spec.Contains(TEXT("Main."), ESearchCase::IgnoreCase) ? EGenMenuScreen::Skirmish : EGenMenuScreen::Main);
+		}
+		else
+		{
+			SetMenuScreen(LastMenuScreen);
+		}
 		if (UGenAudioManager* Audio = UGenAudioManager::Get(this))
 		{
 			Audio->StartShell(MapActor);
@@ -770,9 +787,17 @@ void AGenGameMode::LeaveNetworkGame()
 	NetAutoStage = 0;
 	bNetTeamSent = false;
 	Phase = EGenGamePhase::Menu;
+	SetMenuScreen(EGenMenuScreen::Online); // (back where the game was hosted or joined)
 }
 
 // ---- the shell: menu, in-game menu, score screen -------------------------------------------------
+
+void AGenGameMode::SetMenuScreen(EGenMenuScreen Screen)
+{
+	MenuScreen = Screen;
+	// (Kept over the reloads of the level between the menu and a game: "continue" comes back to it.)
+	LastMenuScreen = Screen == EGenMenuScreen::Main ? EGenMenuScreen::Skirmish : Screen;
+}
 
 void AGenGameMode::RequestStart()
 {

@@ -23,9 +23,10 @@ struct FGenMapInfo;
  * footprint of a building being placed, and the radar (W3DRadar::draw). A stand-in for the original's
  * WND control bar.
  *
- * It also draws the shell (GenShell.cpp): the skirmish menu with its map selection, the in-game menu
- * and the score screen - stand-ins for SkirmishGameOptionsMenu.wnd, QuitMenu.wnd and ScoreScreen.wnd
- * that offer what those offer, from the same data.
+ * It also draws the shell (GenShell.cpp): the main menu, the skirmish menu with its map selection, the
+ * online screen, the in-game menu and the score screen - stand-ins for MainMenu.wnd,
+ * SkirmishGameOptionsMenu.wnd, QuitMenu.wnd and ScoreScreen.wnd that offer what those offer, from the
+ * same data and art, in a look of their own.
  */
 UCLASS()
 class GENERALS1_API AGenHUD : public AHUD
@@ -108,6 +109,11 @@ private:
 		// test automation
 		FString TestClick;
 		int32 TestClickFrames = 0;
+		// the look: each element's hover / press state eases in and out (ShellAnim), by real time
+		double LastTime = 0.0;
+		float DeltaTime = 0.f;
+		TMap<FString, float> Anim;
+		bool bQuitConfirm = false;      // the in-game menu asks whether to quit to the desktop
 	};
 	/** The setup the menu shows: the skirmish's, or (a network game) a copy of the host's lobby that this frame's
 	 *  clicks change and that is then sent to the host. */
@@ -172,6 +178,28 @@ private:
 	void ShellScrollArea(const FString& Id, const FBox2D& R, float ContentHeight, float& Scroll);
 	/** The text shown by the mouse while it is over R (drawn by EndShell, over everything). */
 	void ShellTooltip(const FBox2D& R, const FString& Text);
+
+	// --- the menus before a game (GenShell.cpp): the main menu, the skirmish setup, the online screen ---
+	/** The screen of the menu phase the game mode is on (EGenMenuScreen); Esc goes back one screen. */
+	void DrawShellMenu(AGenGameMode* GM);
+	void DrawMainMenu(AGenGameMode* GM);
+	void DrawOnlineMenu(AGenGameMode* GM);
+	/** How far the element with this id has eased towards bOn (0..1): hover and press feedback. */
+	float ShellAnim(const FString& Id, bool bOn, float Speed = 14.f);
+	/** ShellText with letter spacing (thousandths of an em) and the shadow optional. */
+	void ShellTextEx(const FString& Text, float X, float Y, const FLinearColor& Color, float Size, int32 Align, bool bBold, int32 LetterSpacing, bool bShadow = true);
+	/** ShellButton for the one thing a screen is for (play, apply, continue): gold instead of blue. */
+	bool ShellPrimaryButton(const FString& Id, const FBox2D& R, const FString& Label, bool bEnabled = true);
+	/** One of the main menu's big entries: a label and a line under it saying what it does. */
+	bool ShellMenuItem(const FString& Id, const FBox2D& R, const FString& Label, const FString& Sub, bool bEnabled = true);
+	/** A screen's title at the top left, the way back above it ("MAIN MENU"), and the rule under them. */
+	void ShellHeader(const FString& Title, const FString& Crumb);
+	/** The strip along the bottom of a screen that carries its buttons. */
+	void ShellBottomBar();
+	/** A heading inside a panel (design units), with a divider under it W wide. */
+	void ShellSection(const FString& Title, float X, float Y, float W);
+	/** A line of text that can be typed into (the player's name, an address); bEditing says it has the keyboard. */
+	void ShellTextField(const FBox2D& R, FString& Text, int32 MaxLen, bool& bEditing, const FString& Placeholder, bool& bOutFinished);
 
 	// --- the options screen (GenOptions.cpp: its frame; a file for each page) ---
 	struct FOptionsState
