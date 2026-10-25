@@ -64,6 +64,7 @@ void AGenHUD::DrawHUD()
 	if (GM && GM->GetPhase() == EGenGamePhase::Menu)
 	{
 		DrawShellMenu(GM); // the main menu, the skirmish setup or the online screen
+		DrawVideoOverlay(); // (the frame rate, and the "keep these settings?" countdown after a display change)
 		DrawOptions();
 		EndShell();
 		return;
@@ -71,6 +72,7 @@ void AGenHUD::DrawHUD()
 	if (GM && GM->GetPhase() == EGenGamePhase::NetLobby)
 	{
 		DrawSkirmishMenu(GM);
+		DrawVideoOverlay();
 		DrawOptions();
 		EndShell();
 		return;
