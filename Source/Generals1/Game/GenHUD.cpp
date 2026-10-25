@@ -791,6 +791,18 @@ void AGenHUD::DrawBarButton(const FGenBarButton& B, bool bHovered, float Scale, 
 		DrawLine(Min.X + Size.X, Min.Y + Size.Y, Min.X, Min.Y + Size.Y, Edge, T);
 		DrawLine(Min.X, Min.Y + Size.Y, Min.X, Min.Y, Edge, T);
 	}
+	if (B.Hotkey.IsValid())
+	{
+		// Its key (GenBarHotkeys.cpp), small in the top left corner on a dark tab - dimmer while it can't be used.
+		const FString Key = B.Hotkey.GetShortText();
+		const float TextScale = FMath::Max(0.45f, 0.72f * Scale);
+		float TW = 0.f, TH = 0.f;
+		GetTextSize(Key, TW, TH, nullptr, TextScale);
+		const float Pad = FMath::Max(1.f, 2.f * Scale);
+		const float X = float(Min.X) + 1.f, Y = float(Min.Y) + 1.f;
+		DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.62f), X, Y, TW + Pad * 2.f, TH);
+		DrawText(Key, B.bEnabled ? FLinearColor(1.f, 0.93f, 0.62f) : FLinearColor(0.62f, 0.6f, 0.52f), X + Pad, Y, nullptr, TextScale);
+	}
 }
 
 void AGenHUD::DrawControlBar(AGenPlayerController* PC, UGenGameLogic* Logic)
@@ -1143,6 +1155,12 @@ void AGenHUD::DrawTooltip(const FGenBarButton& B, const FVector2D& Mouse, float 
 	{
 		MaxLen = FMath::Max(MaxLen, L.Len());
 	}
+	// The button's key after its name, in brackets (GenBarHotkeys.cpp).
+	const FString KeyText = (B.Hotkey.IsValid() && B.QueueIndex == INDEX_NONE) ? FString::Printf(TEXT("[%s]"), *B.Hotkey.GetShortText()) : FString();
+	if (!KeyText.IsEmpty())
+	{
+		MaxLen = FMath::Max(MaxLen, Title.Len() + KeyText.Len() + 2);
+	}
 	const float LineH = 19.f * Scale;
 	const float TW = MaxLen * 8.2f * Scale + 16.f;
 	const float TH = 28.f * Scale + Lines.Num() * LineH;
@@ -1155,6 +1173,12 @@ void AGenHUD::DrawTooltip(const FGenBarButton& B, const FVector2D& Mouse, float 
 	}
 	DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.9f), TX, TY, TW, TH);
 	DrawText(Title, FLinearColor(1.f, 0.95f, 0.6f), TX + 8.f, TY + 4.f, nullptr, 1.1f * Scale);
+	if (!KeyText.IsEmpty())
+	{
+		float TitleW = 0.f, TitleH = 0.f;
+		GetTextSize(Title + TEXT("  "), TitleW, TitleH, nullptr, 1.1f * Scale);
+		DrawText(KeyText, FLinearColor(0.62f, 0.78f, 1.f), TX + 8.f + TitleW, TY + 4.f, nullptr, 1.1f * Scale);
+	}
 	for (int32 i = 0; i < Lines.Num(); ++i)
 	{
 		const FLinearColor Color = i < NumStatusLines ? (bWarn ? FLinearColor(1.f, 0.5f, 0.4f) : FLinearColor::White) : FLinearColor(0.75f, 0.8f, 0.85f);

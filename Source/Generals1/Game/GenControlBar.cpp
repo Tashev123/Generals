@@ -108,6 +108,111 @@ void FGenControlBar::Layout(UGenGameLogic* Logic, const TArray<FGenObjectID>& Se
 	LayoutGenerals(Logic);
 	LayoutShortcuts(Logic, ViewSize);
 	LayoutSelection(Logic, Selection);
+	AssignHotkeys();
+}
+
+bool FGenControlBar::GetGridCell(int32 Slot, int32& OutRow, int32& OutCol)
+{
+	// The cells' places in ControlBar.wnd, sorted into rows (by top edge) and columns (by left edge): 01, 03 .. 13 make
+	// the top row and 02, 04 .. 14 the one under it, as the layout has them.
+	constexpr int32 NumCells = 14;
+	static const FGenWndLayout* CachedFor = nullptr;
+	static int32 Rows[NumCells], Cols[NumCells];
+	const FGenWndLayout* Layout = GenWnd::Load(TEXT("ControlBar.wnd"));
+	if (!Layout || Slot < 0 || Slot >= NumCells)
+	{
+		return false;
+	}
+	if (CachedFor != Layout)
+	{
+		CachedFor = Layout;
+		TArray<float> Tops, Lefts;
+		FBox2D Cells[NumCells];
+		for (int32 i = 0; i < NumCells; ++i)
+		{
+			const FGenWndWindow* W = Layout->Find(*FString::Printf(TEXT("ButtonCommand%02d"), i + 1));
+			Cells[i] = W ? W->Rect : FBox2D(ForceInit);
+			if (!Cells[i].bIsValid)
+			{
+				continue;
+			}
+			// (Cells of one row or column line up to within a few pixels.)
+			auto AddUnique = [](TArray<float>& List, float V) { if (!List.ContainsByPredicate([V](float O) { return FMath::Abs(O - V) < 6.f; })) { List.Add(V); } };
+			AddUnique(Tops, float(Cells[i].Min.Y));
+			AddUnique(Lefts, float(Cells[i].Min.X));
+		}
+		Tops.Sort();
+		Lefts.Sort();
+		for (int32 i = 0; i < NumCells; ++i)
+		{
+			Rows[i] = Cols[i] = INDEX_NONE;
+			if (!Cells[i].bIsValid)
+			{
+				continue;
+			}
+			const float Y = float(Cells[i].Min.Y), X = float(Cells[i].Min.X);
+			Rows[i] = Tops.IndexOfByPredicate([Y](float V) { return FMath::Abs(V - Y) < 6.f; });
+			Cols[i] = Lefts.IndexOfByPredicate([X](float V) { return FMath::Abs(V - X) < 6.f; });
+		}
+	}
+	OutRow = Rows[Slot];
+	OutCol = Cols[Slot];
+	return OutRow != INDEX_NONE && OutCol != INDEX_NONE;
+}
+
+void FGenControlBar::AssignHotkeys()
+{
+	const FGenInput& Input = FGenInput::Get();
+	for (TArray<FGenBarButton>* List : { &Buttons, &Sciences, &Shortcuts })
+	{
+		for (FGenBarButton& B : *List)
+		{
+			B.Hotkey = FGenKeyChord();
+			if (B.Button && B.QueueIndex == INDEX_NONE && B.System == EGenBarSystem::None && !B.bGeneralsToggle)
+			{
+				// (The text shown: a power upgraded by a promotion takes the promotion's name, and its letter.)
+				B.Hotkey = Input.GetButtonKey(B.Button->Name, B.TextLabel.IsEmpty() ? B.Button->TextLabel : B.TextLabel, B.GridRow, B.GridCol);
+			}
+		}
+	}
+}
+
+const FGenBarButton* FGenControlBar::FindHotkey(const FGenKeyChord& Pressed) const
+{
+	if (!Pressed.IsValid())
+	{
+		return nullptr;
+	}
+	auto Search = [&Pressed](const TArray<FGenBarButton>& List) -> const FGenBarButton*
+	{
+		const FGenBarButton* Greyed = nullptr;
+		for (const FGenBarButton& B : List)
+		{
+			if (B.Hotkey.IsValid() && B.Hotkey == Pressed)
+			{
+				if (B.bEnabled)
+				{
+					return &B;
+				}
+				Greyed = Greyed ? Greyed : &B;
+			}
+		}
+		return Greyed;
+	};
+	const FGenBarButton* Found = nullptr;
+	if (bHasGenerals && bGeneralsOpen)
+	{
+		Found = Search(Sciences);
+	}
+	if (!Found && bVisible)
+	{
+		Found = Search(Buttons);
+	}
+	if (!Found)
+	{
+		Found = Search(Shortcuts);
+	}
+	return Found;
 }
 
 void FGenControlBar::LayoutSystemButtons(UGenGameLogic* Logic)
@@ -412,6 +517,7 @@ void FGenControlBar::LayoutSelection(UGenGameLogic* Logic, const TArray<FGenObje
 		}
 		B.Button = Btn;
 		B.Source = Subject;
+		GetGridCell(Slot, B.GridRow, B.GridCol);
 		B.Thing = FGenGameData::Get().FindTemplate(Btn->Object);
 		// getCommandAvailability: "BSTATUS_NO" (and Only_By_AI for a person) - COMMAND_HIDDEN.
 		if ((Btn->Command == EGenCommand::UnitBuild || Btn->Command == EGenCommand::DozerConstruct) && B.Thing

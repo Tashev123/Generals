@@ -1,8 +1,10 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Game/GenInput.h"
 #include "Logic/GenLogicTypes.h"
 
+class AGenPlayerController;
 class FGenObject;
 class UGenGameLogic;
 struct FGenCommandButton;
@@ -48,6 +50,9 @@ struct FGenBarButton
 	float Recharge = 0.f;                          // special power: share of its reload still to go
 	uint32 ReadyFrame = 0;
 	int32 QueueIndex = INDEX_NONE;                 // >= 0: production queue entry (click cancels it)
+	int32 GridRow = INDEX_NONE;                    // the command window's cell it is in (ButtonCommand01..14), by
+	int32 GridCol = INDEX_NONE;                    // ... row and column of ControlBar.wnd's layout
+	FGenKeyChord Hotkey;                           // its key (GenInput's style; none: no key)
 };
 
 /** A text of a layout drawn as it stands (a static text window): where, what, how big. */
@@ -75,6 +80,15 @@ public:
 	void Layout(UGenGameLogic* Logic, const TArray<FGenObjectID>& Selection, const FVector2D& ViewSize);
 
 	const FGenBarButton* HitTest(const FVector2D& P) const;
+	/**
+	 * The shown button on that key with exactly those modifiers (HotKeyTranslator: a button's key while it is shown):
+	 * the open promotions panel's first, then the command window's, then the power shortcut tray's; one that can be
+	 * used before one greyed out. None: nullptr.
+	 */
+	const FGenBarButton* FindHotkey(const FGenKeyChord& Pressed) const;
+	/** The row and column of the command window's slot (0-based: ButtonCommand01 is 0) in ControlBar.wnd's layout:
+	 *  its two rows of seven. False if the layout has no such button. */
+	static bool GetGridCell(int32 Slot, int32& OutRow, int32& OutCol);
 	/** Over any part of the interface: a click there never reaches the world. */
 	bool IsOverPanel(const FVector2D& P) const;
 	/** A rectangle of the 800 x 600 bar layouts on the screen. */
@@ -143,6 +157,8 @@ private:
 	void LayoutGenerals(UGenGameLogic* Logic);
 	void LayoutShortcuts(UGenGameLogic* Logic, const FVector2D& ViewSize);
 	void LayoutSystemButtons(UGenGameLogic* Logic);
+	/** Every button's key (FGenBarButton::Hotkey), after the layout. */
+	void AssignHotkeys();
 	/** Fills in a special power button; false if it should not be shown at all. */
 	bool FillPower(UGenGameLogic* Logic, const FGenObject* Source, FGenBarButton& B) const;
 	/** The screen rectangle of a window of ControlBar.wnd (empty if it isn't there). */
@@ -151,3 +167,7 @@ private:
 	FBox2D ShortcutArea = FBox2D(ForceInit);
 	uint32 IdleWorkerCheckFrame = 0;
 };
+
+/** GenBarHotkeys.cpp: presses the shown button on that key (FGenControlBar::FindHotkey) as a click would, and takes
+ *  the key for this frame (FGenInput::Consume). The command button pressed (maybe greyed out), or nullptr. */
+const FGenCommandButton* GenPressBarHotkey(AGenPlayerController* PC, const FGenKeyChord& Pressed);

@@ -1,5 +1,6 @@
 #include "Game/GenInput.h"
 #include "Game/GenSettings.h"
+#include "Logic/GenCommandData.h"
 #include "GameFramework/PlayerController.h"
 
 // ---- chords ---------------------------------------------------------------------------------------
@@ -27,6 +28,19 @@ FString FGenKeyChord::GetDisplayText() const
 	if (bCtrl) { S += TEXT("Ctrl + "); }
 	if (bShift) { S += TEXT("Shift + "); }
 	if (bAlt) { S += TEXT("Alt + "); }
+	return S + Key.GetDisplayName(false).ToString();
+}
+
+FString FGenKeyChord::GetShortText() const
+{
+	if (!Key.IsValid())
+	{
+		return FString();
+	}
+	FString S;
+	if (bCtrl) { S += TEXT("Ctrl+"); }
+	if (bShift) { S += TEXT("Shift+"); }
+	if (bAlt) { S += TEXT("Alt+"); }
 	return S + Key.GetDisplayName(false).ToString();
 }
 
@@ -112,11 +126,24 @@ void FGenInput::ResetToDefaults()
 	{
 		Chords[int32(Info.Action)] = Info.Default;
 	}
+	Style = EGenHotkeyStyle::Classic;
+	ButtonKeys.Reset();
+	ButtonNames.Reset();
 }
 
 void FGenInput::Load(const FGenHotkeySettings& Settings)
 {
 	ResetToDefaults();
+	Style = Settings.Style;
+	for (const FString& Line : Settings.ButtonKeys)
+	{
+		FString Name, Value;
+		FGenKeyChord Chord;
+		if (Line.Split(TEXT("="), &Name, &Value) && !Name.TrimStartAndEnd().IsEmpty() && FGenKeyChord::Parse(Value, Chord))
+		{
+			SetButtonOverride(Name.TrimStartAndEnd(), &Chord);
+		}
+	}
 	for (const FString& Line : Settings.Bindings)
 	{
 		FString Name, Value;
@@ -135,6 +162,13 @@ void FGenInput::Load(const FGenHotkeySettings& Settings)
 
 void FGenInput::Save(FGenHotkeySettings& Settings) const
 {
+	Settings.Style = Style;
+	Settings.ButtonKeys.Reset();
+	for (const TPair<FString, FGenKeyChord>& It : ButtonKeys)
+	{
+		Settings.ButtonKeys.Add(FString::Printf(TEXT("%s=%s"), *ButtonNames.FindRef(It.Key), It.Value.IsValid() ? *It.Value.ToString() : TEXT("None")));
+	}
+	Settings.ButtonKeys.Sort();
 	Settings.Bindings.Reset();
 	for (const FGenActionInfo& Info : GetActions())
 	{
@@ -160,6 +194,65 @@ EGenAction FGenInput::FindConflict(EGenAction Action, const FGenKeyChord& Chord)
 		}
 	}
 	return EGenAction::Count;
+}
+
+// ---- the command bar's buttons ------------------------------------------------------------------
+
+FGenKeyChord FGenInput::GetClassicKey(const FString& Label)
+{
+	// HotKeyManager::searchHotKey: the character after the '&' of the button's text.
+	const TCHAR Letter = FGenCommandData::Get().GetHotkeyLetter(Label);
+	if (Letter >= TEXT('A') && Letter <= TEXT('Z'))
+	{
+		return FGenKeyChord(FKey(FName(FString::Chr(Letter))));
+	}
+	static const FKey Digits[10] = { EKeys::Zero, EKeys::One, EKeys::Two, EKeys::Three, EKeys::Four, EKeys::Five, EKeys::Six, EKeys::Seven, EKeys::Eight, EKeys::Nine };
+	if (Letter >= TEXT('0') && Letter <= TEXT('9'))
+	{
+		return FGenKeyChord(Digits[Letter - TEXT('0')]);
+	}
+	return FGenKeyChord();
+}
+
+FGenKeyChord FGenInput::GetGridKey(int32 Row, int32 Col)
+{
+	static const TCHAR* const Rows[3] = { TEXT("QWERTYUIOP"), TEXT("ASDFGHJKL"), TEXT("ZXCVBNM") };
+	if (Row < 0 || Row >= 3 || Col < 0 || Col >= FCString::Strlen(Rows[Row]))
+	{
+		return FGenKeyChord();
+	}
+	return FGenKeyChord(FKey(FName(FString::Chr(Rows[Row][Col]))));
+}
+
+FGenKeyChord FGenInput::GetButtonKey(const FString& Name, const FString& Label, int32 Row, int32 Col) const
+{
+	if (Style == EGenHotkeyStyle::Grid && Row >= 0)
+	{
+		return GetGridKey(Row, Col);
+	}
+	if (Style == EGenHotkeyStyle::Custom)
+	{
+		if (const FGenKeyChord* Own = FindButtonOverride(Name))
+		{
+			return *Own;
+		}
+	}
+	return GetClassicKey(Label);
+}
+
+void FGenInput::SetButtonOverride(const FString& Name, const FGenKeyChord* Chord)
+{
+	const FString Key = Name.ToLower();
+	if (Chord)
+	{
+		ButtonKeys.Add(Key, *Chord);
+		ButtonNames.Add(Key, Name);
+	}
+	else
+	{
+		ButtonKeys.Remove(Key);
+		ButtonNames.Remove(Key);
+	}
 }
 
 // ---- this frame's keys ----------------------------------------------------------------------------

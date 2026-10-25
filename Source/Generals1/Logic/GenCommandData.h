@@ -102,6 +102,13 @@ public:
 
 	/** String for a label such as "CONTROLBAR:Sell" (hotkey markers removed); the label itself if unknown. */
 	FString GetText(const FString& Label) const;
+	/** The original's hotkey of a label: the letter its text marks with '&' ("&Barracks": 'B', upper case;
+	 *  HotKeyManager::searchHotKey). 0: none. */
+	TCHAR GetHotkeyLetter(const FString& Label) const;
+
+	/** Every button and command set (keys: lower-case names), for the options' hotkeys page. */
+	const TMap<FString, FGenCommandButton>& GetButtons() const { return Buttons; }
+	const TMap<FString, FGenCommandSet>& GetSets() const { return Sets; }
 
 private:
 	void LoadStrings();
@@ -112,4 +119,5 @@ private:
 	TMap<FString, FGenMappedImage> Images;
 	TMap<FString, FGenRadiusDecalTemplate> RadiusCursors; // key: the RadiusCursorType, upper case
 	TMap<FString, FString> Strings;             // key: lowercase label
+	TMap<FString, TCHAR> HotkeyLetters;         // key: lowercase label; the letter after its text's '&'
 };

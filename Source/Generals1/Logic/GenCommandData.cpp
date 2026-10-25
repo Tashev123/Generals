@@ -297,13 +297,35 @@ void FGenCommandData::LoadStrings()
 				Text.Reserve(Len);
 				for (int32 i = 0; i < Len; ++i)
 				{
-					const uint16 Ch = uint16(~(uint16(Data[Pos + i * 2]) | (uint16(Data[Pos + i * 2 + 1]) << 8)));
-					if (Ch != TEXT('&')) // hotkey marker
-					{
-						Text.AppendChar(TCHAR(Ch));
-					}
+					Text.AppendChar(TCHAR(uint16(~(uint16(Data[Pos + i * 2]) | (uint16(Data[Pos + i * 2 + 1]) << 8)))));
 				}
-				Strings.Add(Label.ToLower(), MoveTemp(Text));
+				// The interface's texts mark their button's hotkey with '&' before its letter ("&Barracks", "Ran&ger"):
+				// the letter is kept, the mark taken out. (Elsewhere '&' is the word: "Command & Conquer", "C&C".)
+				const FString Key = Label.ToLower();
+				if (Key.StartsWith(TEXT("controlbar:")) || Key.StartsWith(TEXT("mouse:")))
+				{
+					FString Plain;
+					Plain.Reserve(Text.Len());
+					TCHAR Letter = 0;
+					for (int32 i = 0; i < Text.Len(); ++i)
+					{
+						if (Text[i] == TEXT('&') && i + 1 < Text.Len() && FChar::IsAlnum(Text[i + 1]))
+						{
+							if (!Letter)
+							{
+								Letter = FChar::ToUpper(Text[i + 1]);
+							}
+							continue;
+						}
+						Plain.AppendChar(Text[i]);
+					}
+					if (Letter)
+					{
+						HotkeyLetters.Add(Key, Letter);
+					}
+					Text = MoveTemp(Plain);
+				}
+				Strings.Add(Key, MoveTemp(Text));
 			}
 			Pos += Len * 2;
 			if (Tag == TagStringW && Pos + 4 <= Data.Num())
@@ -337,4 +359,10 @@ FString FGenCommandData::GetText(const FString& Label) const
 {
 	const FString* Found = Label.IsEmpty() ? nullptr : Strings.Find(Label.ToLower());
 	return Found ? *Found : Label;
+}
+
+TCHAR FGenCommandData::GetHotkeyLetter(const FString& Label) const
+{
+	const TCHAR* Found = Label.IsEmpty() ? nullptr : HotkeyLetters.Find(Label.ToLower());
+	return Found ? *Found : TCHAR(0);
 }

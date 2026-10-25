@@ -1330,6 +1330,7 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 	//        money,Amount       cash
 	//        generals           opens the promotions panel (for a screenshot)
 	//        click,Button       a left click on that command button, wherever the interface shows it
+	//        key,Key            that key (FGenKeyChord's form: B, Ctrl+F) pressed for the command bar's buttons (GenBarHotkeys)
 	//        target,x,y         the left click on the ground that fires the power being aimed
 	//        rally,Type,x,y     sets the rally point of our first building of that type
 	//        damage,Type,Pct    leaves our first object of that type with that percentage of its health
@@ -2014,6 +2015,13 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 				AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC);
 				const bool bClicked = GenPC && GenPC->TestClickButton(Arg);
 				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: click %s %s"), Logic->GetFrame(), *Arg, bClicked ? TEXT("done") : TEXT("NOT POSSIBLE (not shown, or greyed out)"));
+			}
+			else if (What.Equals(TEXT("key"), ESearchCase::IgnoreCase))
+			{
+				// (Input is off in a test run: the key goes straight to the command bar, as UpdateBarHotkeys would send it.)
+				FGenKeyChord Chord;
+				const FGenCommandButton* Pressed = FGenKeyChord::Parse(Arg, Chord) ? GenPressBarHotkey(Cast<AGenPlayerController>(PC), Chord) : nullptr;
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: key %s pressed %s"), Logic->GetFrame(), *Arg, Pressed ? *Pressed->Name : TEXT("NOTHING (no button shown on that key)"));
 			}
 			else if (What.Equals(TEXT("target"), ESearchCase::IgnoreCase) && Parts.Num() >= 4)
 			{
