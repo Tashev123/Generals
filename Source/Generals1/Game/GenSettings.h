@@ -76,6 +76,9 @@ struct FGenVideoExtras
 
 	UPROPERTY(config) bool bRayTracing = false;
 	UPROPERTY(config) bool bShowFPS = false;
+	/** The game's video defaults (SetVideoDefaults) have been put over the engine's (GenOptionsVideo.cpp): a
+	 *  first start, or a settings file from before they existed, gets them once. */
+	UPROPERTY(config) int32 DefaultsVersion = 0;
 };
 
 /** The video page while it is being changed (the engine's settings are only touched on Apply). */
