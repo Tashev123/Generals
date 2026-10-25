@@ -43,6 +43,10 @@ struct FGenRadiusDecalTemplate;
  *   Radar:    left click or drag on the radar looks there; while aiming an order or a power, a left click
  *             on the radar gives it at that spot; Space jumps to the last thing the radar reported
  *   Menu:     Esc or F10 during a game: the in-game menu (the game stands still while it is up)
+ *   Layout:   all of the above is the Classic mouse layout (the original's). The controls page's Modern one:
+ *             the left button only selects (a click on the ground deselects), a right click gives the order
+ *             a classic left click would (with Ctrl, Alt as there) and on the radar sends what moves there;
+ *             placing a building and aiming a power or an order still go left to do, right to back out
  */
 UCLASS()
 class GENERALS1_API AGenPlayerController : public APlayerController
@@ -53,6 +57,7 @@ public:
 	AGenPlayerController();
 
 	virtual void BeginPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void PlayerTick(float DeltaTime) override;
 
 	const TArray<FGenObjectID>& GetSelection() const { return Selection; }
@@ -73,6 +78,11 @@ public:
 	/** Test automation: a left click at that spot of the world (with Ctrl held: bForce; with Alt: bWaypoint, which
 	    then stays held for the rest of the run). What it did, and the cursor it showed. */
 	FString TestClickAt(const FVector3f& Pos, bool bForce, bool bWaypoint = false);
+	/** Test automation: the mouse as the controls page has it laid out. "left,x,y" / "right,x,y": a click (no drag)
+	    with that button there, as the real one would be handled; "scheme,classic|modern": that layout from now on
+	    (not saved); "camera,key|edge|drag|zoom|rotate[,amount]": what that input would do to the view, at the
+	    speeds set. Says what came of it. */
+	FString TestMouse(const TArray<FString>& Args);
 	bool GetTestCursor(FVector2D& OutPos) const { OutPos = TestCursorPos; return bTestCursor; }
 	/** The kind of cursor showing (Mouse.ini's names). */
 	const FString& GetCursorName() const;
@@ -269,4 +279,31 @@ private:
 
 	bool bMiddleDragging = false;
 	float LastMouseX = 0.f;
+
+	// --- the controls page's settings (GenSettings.h's FGenControlSettings; the page is GenOptionsControls.cpp) ---
+	/** The Modern mouse layout: left selects, right gives orders. */
+	bool IsModernMouse() const;
+	/** A plain left click on the world (not a drag, not on the interface, nothing being placed or aimed). Classic:
+	    what EvaluateClick says - select or order; Modern: it only selects. What it did: OutEval. */
+	void WorldLeftClick(float MX, float MY, bool bShift, FClickEval* OutEval = nullptr);
+	/** A right click that wasn't a drag: backs out of placing or aiming; then Classic closes the promotions or
+	    clears the selection, Modern gives the order (WorldRightClick, or on the radar RadarRightClick). */
+	void RightClick(float MX, float MY, bool bShift, FClickEval* OutEval = nullptr);
+	/** Modern: the order a classic left click would give the selection there - never a selection. */
+	void WorldRightClick(float MX, float MY, bool bShift, FClickEval* OutEval = nullptr);
+	/** Modern: a right click on the radar sends what of the selection moves there. False: nothing went. */
+	bool RadarRightClick(const FVector2D& Pixel);
+	/** Whether a game is on with the mouse ours (no menu, no options, not a test run). */
+	bool IsPlayingWithMouse() const;
+	/** Keeps the mouse inside the window while a game is on, if the player wants it; lets it go in the menus and
+	    while another window is in front. */
+	void UpdateMouseConfine(bool bPlaying);
+	bool bMouseConfined = false;
+	bool bMouseConfineSet = false;     // (the first tick says either way: a lock may be left from the level before)
+	FIntRect ConfineBounds;            // where it is held (the desktop's pixels)
+	/** The pointer's speed (CursorSpeed, 1: untouched): how far the mouse moved, scaled, and the cursor put there. */
+	void UpdatePointerSpeed(bool bPlaying);
+	bool bPointerScaling = false;
+	FVector2D PointerExact = FVector2D::ZeroVector; // where the scaled pointer is, unrounded ...
+	FIntPoint PointerPlaced = FIntPoint::ZeroValue; // ... and the pixel the cursor was put on
 };

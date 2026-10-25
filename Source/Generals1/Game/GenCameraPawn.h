@@ -38,6 +38,8 @@ public:
 	float GetYaw() const { return Yaw; }
 	/** Height above the look-at point now (Generals units). */
 	float GetHeight() const { return Height; }
+	/** ... and the height the wheel has asked for, that it is easing towards. */
+	float GetTargetHeight() const { return TargetHeight; }
 	UCameraComponent* GetCamera() const { return Camera; }
 
 	UPROPERTY(EditAnywhere, Category = "Generals")

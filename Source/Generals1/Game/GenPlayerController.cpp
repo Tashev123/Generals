@@ -20,6 +20,16 @@
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Generals1.h"
 #include "InputCoreTypes.h"
+#include "Game/GenSettings.h"
+#include "Engine/GameViewportClient.h"
+#include "Engine/LocalPlayer.h"
+#include "Framework/Application/SlateApplication.h"
+#include "GenericPlatform/ICursor.h"
+#if PLATFORM_WINDOWS
+#include "Windows/WindowsHWrapper.h" // (RECT, for ICursor::Lock)
+#endif
+#include "Widgets/SViewport.h"
+#include "Widgets/SWindow.h"
 
 static TAutoConsoleVariable<float> CVarGenPickSlack(
 	TEXT("gen.PickSlack"), 3.f,
@@ -62,8 +72,16 @@ void AGenPlayerController::BeginPlay()
 	Super::BeginPlay();
 	FInputModeGameAndUI Mode;
 	Mode.SetHideCursorDuringCapture(false);
-	Mode.SetLockMouseToViewportBehavior(EMouseLockMode::LockAlways);
+	// (Held in the window only while a game is on, and if the player wants it: UpdateMouseConfine.)
+	Mode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
 	SetInputMode(Mode);
+}
+
+void AGenPlayerController::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	// The level is loaded anew between a game and the menu: the mouse goes free with this one.
+	UpdateMouseConfine(false);
+	Super::EndPlay(EndPlayReason);
 }
 
 AGenCameraPawn* AGenPlayerController::GetCameraPawn() const
@@ -102,6 +120,10 @@ void AGenPlayerController::PlayerTick(float DeltaTime)
 		}
 	}
 	ControlBar.Layout(UGenGameLogic::Get(this), Selection, FVector2D(ViewX, ViewY));
+	// The controls page's mouse: held in the window, and the pointer's own speed - while a game is on.
+	const bool bPlaying = IsPlayingWithMouse();
+	UpdateMouseConfine(bPlaying);
+	UpdatePointerSpeed(bPlaying);
 	if (!bGenInputEnabled)
 	{
 		if (bTestCursor)
@@ -1082,36 +1104,99 @@ void AGenPlayerController::ConfirmPlacement()
 	}
 }
 
+namespace
+{
+	/** The settings the mouse and the camera go by (the defaults until the engine's settings are there). */
+	const FGenControlSettings& ControlSettings()
+	{
+		static const FGenControlSettings Defaults;
+		const UGenUserSettings* Settings = UGenUserSettings::Get();
+		return Settings ? Settings->Controls : Defaults;
+	}
+
+	/** A speed of the controls page as a multiplier, kept within what the page offers (the file may say anything). */
+	float SpeedOf(float Value)
+	{
+		return FMath::Clamp(Value, 0.25f, 3.f);
+	}
+
+	/** The game's window, if there is one. */
+	TSharedPtr<SWindow> GameWindow()
+	{
+		return GEngine && GEngine->GameViewport ? GEngine->GameViewport->GetWindow() : nullptr;
+	}
+
+	/** Whether the game's window is the one in front (the mouse is the player's business otherwise). */
+	bool IsGameWindowInFront()
+	{
+		const TSharedPtr<SWindow> Window = GameWindow();
+		return Window.IsValid() && Window->GetNativeWindow().IsValid() && Window->GetNativeWindow()->IsForegroundWindow();
+	}
+
+	/** Edge scrolling, if it is on: in a window only if the player wants it there too (fullscreen, borderless or
+	    not, has the screen's edge for the window's). */
+	bool IsEdgeScrollOn(const FGenControlSettings& C)
+	{
+		if (!C.bEdgeScroll)
+		{
+			return false;
+		}
+		const TSharedPtr<SWindow> Window = GameWindow();
+		return C.bEdgeScrollWindowed || !Window.IsValid() || Window->GetWindowMode() != EWindowMode::Windowed;
+	}
+
+	/** The view's movement this frame (screen x right, y up) from the scroll keys and the screen's edge, each -1..1
+	    a side: each at its own speed, together no faster than the faster of them (at 1 and 1: as it always was). */
+	FVector2D ScrollPan(const FVector2D& Keys, const FVector2D& Edge, const FGenControlSettings& C, float ScrollSpeed, float DeltaTime)
+	{
+		const float KeySpeed = SpeedOf(C.KeyScrollSpeed), EdgeSpeed = SpeedOf(C.EdgeScrollSpeed);
+		const float Top = FMath::Max(Keys.IsZero() ? 0.f : KeySpeed, Edge.IsZero() ? 0.f : EdgeSpeed);
+		return (Keys * KeySpeed + Edge * EdgeSpeed).GetClampedToMaxSize(Top) * ScrollSpeed * DeltaTime * 10.f;
+	}
+
+	/** ... from the right button held D (a fraction of the screen, y down) away from where it went down. */
+	FVector2D DragPan(const FVector2D& D, const FGenControlSettings& C, float ScrollSpeed, float DeltaTime)
+	{
+		const float Sign = C.bInvertDragScroll ? -1.f : 1.f;
+		return FVector2D(D.X * 1.6f, -D.Y * 2.0f) * ScrollSpeed * DeltaTime * 30.f * SpeedOf(C.DragScrollSpeed) * Sign;
+	}
+
+	/** Mouse wheel steps to zoom steps; and the middle button moved this many pixels across, to degrees. */
+	float ZoomSteps(float Wheel, const FGenControlSettings& C) { return Wheel * SpeedOf(C.ZoomSpeed); }
+	float RotateDegrees(float Pixels, const FGenControlSettings& C) { return Pixels * 0.3f * SpeedOf(C.RotateSpeed); }
+}
+
 void AGenPlayerController::UpdateCamera(float DeltaTime, AGenCameraPawn* Cam, float MX, float MY, bool bHasMouse)
 {
 	int32 ViewX = 0, ViewY = 0;
 	GetViewportSize(ViewX, ViewY);
+	const FGenControlSettings& Controls = ControlSettings();
 
-	FVector2D Scroll(0.f, 0.f);
+	FVector2D Keys(0.f, 0.f);
 	const FGenInput& Input = FGenInput::Get();
-	if (Input.IsDown(this, EGenAction::ScrollLeft)) { Scroll.X -= 1.f; }
-	if (Input.IsDown(this, EGenAction::ScrollRight)) { Scroll.X += 1.f; }
-	if (Input.IsDown(this, EGenAction::ScrollUp)) { Scroll.Y += 1.f; }
-	if (Input.IsDown(this, EGenAction::ScrollDown)) { Scroll.Y -= 1.f; }
+	if (Input.IsDown(this, EGenAction::ScrollLeft)) { Keys.X -= 1.f; }
+	if (Input.IsDown(this, EGenAction::ScrollRight)) { Keys.X += 1.f; }
+	if (Input.IsDown(this, EGenAction::ScrollUp)) { Keys.Y += 1.f; }
+	if (Input.IsDown(this, EGenAction::ScrollDown)) { Keys.Y -= 1.f; }
 
+	// The screen's edge (if the controls page has it on; and not while another window is in front).
 	ScrollScreen = FVector2D::ZeroVector;
-	if (bHasMouse && ViewX > 0 && ViewY > 0 && !bRightScrolling && !bBoxSelecting)
+	FVector2D AtEdge(0.0, 0.0);
+	if (bHasMouse && ViewX > 0 && ViewY > 0 && !bRightScrolling && !bBoxSelecting && IsEdgeScrollOn(Controls) && IsGameWindowInFront())
 	{
 		const float Edge = 4.f;
-		FVector2D AtEdge(0.0, 0.0);
 		if (MX <= Edge) { AtEdge.X -= 1.0; }
 		if (MX >= ViewX - 1 - Edge) { AtEdge.X += 1.0; }
 		if (MY <= Edge) { AtEdge.Y += 1.0; }
 		if (MY >= ViewY - 1 - Edge) { AtEdge.Y -= 1.0; }
-		Scroll += AtEdge;
 		ScrollScreen = FVector2D(AtEdge.X, -AtEdge.Y); // (the scroll cursor points the way the mouse pushes the view)
 	}
-	if (!Scroll.IsZero())
+	if (!Keys.IsZero() || !AtEdge.IsZero())
 	{
-		Cam->Pan(Scroll.GetClampedToMaxSize(1.f) * Cam->ScrollSpeed * DeltaTime * 10.f);
+		Cam->Pan(ScrollPan(Keys, AtEdge, Controls, Cam->ScrollSpeed, DeltaTime));
 	}
 
-	// Right button: drag scrolls (RMB scroll); a click without dragging clears the selection.
+	// Right button: drag scrolls (RMB scroll); a click without dragging is RightClick's.
 	if (IsInputKeyDown(EKeys::RightMouseButton) && bHasMouse)
 	{
 		if (!bRightDown)
@@ -1127,8 +1212,9 @@ void AGenPlayerController::UpdateCamera(float DeltaTime, AGenCameraPawn* Cam, fl
 		if (bRightScrolling)
 		{
 			const FVector2D D = (FVector2D(MX, MY) - RightStart) / FMath::Max(1, FMath::Min(ViewX, ViewY));
-			Cam->Pan(FVector2D(D.X * 1.6f, -D.Y * 2.0f) * Cam->ScrollSpeed * DeltaTime * 30.f);
-			ScrollScreen = D.IsNearlyZero() ? FVector2D(1.0, 0.0) : D;
+			Cam->Pan(DragPan(D, Controls, Cam->ScrollSpeed, DeltaTime));
+			// (The cursor points the way the view goes: against the drag when that is turned round.)
+			ScrollScreen = D.IsNearlyZero() ? FVector2D(1.0, 0.0) : (Controls.bInvertDragScroll ? -D : D);
 		}
 	}
 	else if (bRightDown)
@@ -1136,12 +1222,7 @@ void AGenPlayerController::UpdateCamera(float DeltaTime, AGenCameraPawn* Cam, fl
 		bRightDown = false;
 		if (!bRightScrolling)
 		{
-			// Right click: back out of placing a building or aiming a power, close the promotions,
-			// otherwise clear the selection.
-			if (PlacingTemplate) { EndPlacement(); }
-			else if (TargetingButton) { EndTargeting(); }
-			else if (ControlBar.bGeneralsOpen) { ControlBar.bGeneralsOpen = false; }
-			else { Selection.Reset(); }
+			RightClick(MX, MY, IsInputKeyDown(EKeys::LeftShift) || IsInputKeyDown(EKeys::RightShift));
 		}
 		bRightScrolling = false;
 	}
@@ -1151,7 +1232,7 @@ void AGenPlayerController::UpdateCamera(float DeltaTime, AGenCameraPawn* Cam, fl
 	{
 		if (bMiddleDragging)
 		{
-			Cam->AddYaw((MX - LastMouseX) * 0.3f);
+			Cam->AddYaw(RotateDegrees(MX - LastMouseX, Controls));
 		}
 		bMiddleDragging = true;
 		LastMouseX = MX;
@@ -1164,7 +1245,7 @@ void AGenPlayerController::UpdateCamera(float DeltaTime, AGenCameraPawn* Cam, fl
 	const float Wheel = GetInputAnalogKeyState(EKeys::MouseWheelAxis);
 	if (Wheel != 0.f)
 	{
-		Cam->Zoom(Wheel);
+		Cam->Zoom(ZoomSteps(Wheel, Controls));
 	}
 	if (Input.JustPressed(this, EGenAction::CameraReset))
 	{
@@ -1180,6 +1261,302 @@ void AGenPlayerController::UpdateCamera(float DeltaTime, AGenCameraPawn* Cam, fl
 			LookAt(EventPos);
 		}
 	}
+}
+
+// ---- the mouse buttons' layout, and the mouse itself (the controls page) -------------------------
+
+bool AGenPlayerController::IsModernMouse() const
+{
+	return ControlSettings().MouseScheme == EGenMouseScheme::Modern;
+}
+
+void AGenPlayerController::WorldLeftClick(float MX, float MY, bool bShift, FClickEval* OutEval)
+{
+	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	FClickEval Eval;
+	if (!IsModernMouse())
+	{
+		// Classic: what it does is worked out by EvaluateClick - the cursor has shown it beforehand.
+		EvaluateClick(PickObject(MX, MY, ClickPickTypes()), MX, MY, Eval);
+	}
+	else if (Logic)
+	{
+		// Modern: the left button only selects - one of ours (Shift adds or takes it away; twice quickly: all of
+		// its kind), somebody else's thing on its own; a click on the ground deselects (with Shift, nothing).
+		const FGenObjectID Hit = PickObject(MX, MY, PickSelectable);
+		const FGenObject* HitObj = Hit != GenInvalidObjectID ? Logic->FindObject(Hit) : nullptr;
+		const bool bSelectable = HitObj && HitObj->IsSelectable();
+		Eval.Hit = HitObj ? Hit : GenInvalidObjectID;
+		Eval.Action = bSelectable && Logic->CanPlayerCommand(Logic->GetLocalPlayer(), *HitObj) ? EClickAction::SelectOwn
+			: bShift ? EClickAction::Nothing
+			: bSelectable ? EClickAction::SelectOther
+			: EClickAction::Deselect;
+	}
+	ExecuteClick(Eval, bShift);
+	UE_CLOG(Logic && Logic->IsTracing(), LogGenerals, Log, TEXT("  [mouse f%u] %s left click: action %d by %d unit(s), %d selected now"), Logic->GetFrame(),
+		IsModernMouse() ? TEXT("modern") : TEXT("classic"), int32(Eval.Action), Eval.Units.Num(), Selection.Num());
+	if (OutEval)
+	{
+		*OutEval = MoveTemp(Eval);
+	}
+}
+
+void AGenPlayerController::RightClick(float MX, float MY, bool bShift, FClickEval* OutEval)
+{
+	if (OutEval)
+	{
+		*OutEval = FClickEval();
+	}
+	// Either layout: back out of placing a building or aiming a power (or an order).
+	if (PlacingTemplate)
+	{
+		EndPlacement();
+	}
+	else if (TargetingButton)
+	{
+		EndTargeting();
+	}
+	else if (!IsModernMouse())
+	{
+		// Classic: close the promotions, otherwise clear the selection.
+		if (ControlBar.bGeneralsOpen) { ControlBar.bGeneralsOpen = false; }
+		else { Selection.Reset(); }
+	}
+	else if (ControlBar.IsOverPanel(RightStart))
+	{
+		// Modern, on the command bar: on the radar, what moves goes there; elsewhere it closes the promotions.
+		if (ControlBar.Radar.bIsValid && ControlBar.Radar.IsInside(RightStart))
+		{
+			RadarRightClick(FVector2D(MX, MY));
+		}
+		else if (ControlBar.bGeneralsOpen)
+		{
+			ControlBar.bGeneralsOpen = false;
+		}
+	}
+	else
+	{
+		WorldRightClick(MX, MY, bShift, OutEval);
+	}
+}
+
+void AGenPlayerController::WorldRightClick(float MX, float MY, bool bShift, FClickEval* OutEval)
+{
+	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	if (!Logic || !Logic->IsRunning())
+	{
+		return;
+	}
+	// The order a classic left click would give (EvaluateClick: move, attack, get in, mend, the rally point; with
+	// Ctrl a force attack, with Alt a waypoint) - but the right button never selects: on one of ours (that takes no
+	// order from the selection), or with nothing of ours to command, it does nothing.
+	FClickEval Eval;
+	EvaluateClick(PickObject(MX, MY, ClickPickTypes()), MX, MY, Eval);
+	if (Eval.Action == EClickAction::SelectOwn || Eval.Action == EClickAction::SelectOther || Eval.Action == EClickAction::Deselect)
+	{
+		Eval.Action = EClickAction::Nothing;
+		Eval.Units.Reset();
+	}
+	ExecuteClick(Eval, bShift);
+	UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [mouse f%u] modern right click: action %d by %d unit(s)"), Logic->GetFrame(), int32(Eval.Action), Eval.Units.Num());
+	if (OutEval)
+	{
+		*OutEval = MoveTemp(Eval);
+	}
+}
+
+bool AGenPlayerController::RadarRightClick(const FVector2D& Pixel)
+{
+	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	FVector2f World;
+	if (!Logic || !Logic->IsRunning() || !Logic->HasRadar(Logic->GetLocalPlayer()) || !GenRadar::PixelToWorld(Pixel, ControlBar.Radar, ControlBar.RadarMapSize, World))
+	{
+		return false;
+	}
+	const int32 Local = Logic->GetLocalPlayer();
+	TArray<FGenObjectID> Movers;
+	for (FGenObjectID Id : Selection)
+	{
+		const FGenObject* O = Logic->FindObject(Id);
+		if (O && Logic->CanPlayerCommand(Local, *O) && !O->GetTemplate()->bForbidPlayerCommands && O->CanMove())
+		{
+			Movers.Add(Id);
+		}
+	}
+	if (Movers.Num() == 0)
+	{
+		return false;
+	}
+	Logic->IssueMove(Movers, FVector3f(World.X, World.Y, Logic->GetGroundHeight(World.X, World.Y)));
+	PlayMoveVoice(Movers);
+	return true;
+}
+
+bool AGenPlayerController::IsPlayingWithMouse() const
+{
+	const AGenGameMode* GM = GetWorld() ? GetWorld()->GetAuthGameMode<AGenGameMode>() : nullptr;
+	const AGenHUD* GenHUD = Cast<AGenHUD>(GetHUD());
+	const UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	return bGenInputEnabled && GM && !GM->IsShellActive() && !(GenHUD && GenHUD->IsOptionsOpen()) && Logic && Logic->IsRunning();
+}
+
+void AGenPlayerController::UpdateMouseConfine(bool bPlaying)
+{
+	const ULocalPlayer* LocalPlayer = Cast<ULocalPlayer>(Player);
+	UGameViewportClient* Client = LocalPlayer ? LocalPlayer->ViewportClient.Get() : nullptr;
+	const TSharedPtr<SViewport> Widget = Client ? Client->GetGameViewportWidget() : nullptr;
+	const TSharedPtr<ICursor> Cursor = FSlateApplication::IsInitialized() ? FSlateApplication::Get().GetPlatformApplication()->Cursor : nullptr;
+	if (!Client || !Cursor.IsValid())
+	{
+		return;
+	}
+	const bool bWant = bPlaying && Widget.IsValid() && ControlSettings().bConfineMouse && IsGameWindowInFront();
+	// Where the game's picture is on the desktop (rounded inwards); looked at every frame, the window may move or change size.
+	FIntRect Bounds;
+	if (bWant)
+	{
+		const FSlateRect R = Widget->GetCachedGeometry().GetLayoutBoundingRect();
+		Bounds = FIntRect(FMath::CeilToInt(R.Left), FMath::CeilToInt(R.Top), FMath::FloorToInt(R.Right), FMath::FloorToInt(R.Bottom));
+		if (Bounds.Width() <= 0 || Bounds.Height() <= 0)
+		{
+			return; // (not laid out yet)
+		}
+	}
+	if (bMouseConfineSet && bWant == bMouseConfined && (!bWant || Bounds == ConfineBounds))
+	{
+		return;
+	}
+	if (bWant != bMouseConfined || !bMouseConfineSet)
+	{
+		// The viewport's own lock too (it locks on a click; with this, it keeps it on letting go).
+		Client->SetMouseLockMode(bWant ? EMouseLockMode::LockAlways : EMouseLockMode::DoNotLock);
+	}
+	bMouseConfineSet = true;
+	bMouseConfined = bWant;
+	ConfineBounds = Bounds;
+	if (bWant)
+	{
+		RECT Clip;
+		Clip.left = Bounds.Min.X;
+		Clip.top = Bounds.Min.Y;
+		Clip.right = Bounds.Max.X;
+		Clip.bottom = Bounds.Max.Y;
+		Cursor->Lock(&Clip);
+	}
+	else
+	{
+		Cursor->Lock(nullptr);
+	}
+}
+
+void AGenPlayerController::UpdatePointerSpeed(bool bPlaying)
+{
+	// The cursor is Windows' own: a speed other than 1 is had by moving it by hand - each frame it is put where the
+	// mouse's movement since the last, scaled, takes it. Only in a game, with the window in front (never in the menus).
+	const float Speed = SpeedOf(ControlSettings().CursorSpeed);
+	int32 ViewX = 0, ViewY = 0;
+	GetViewportSize(ViewX, ViewY);
+	float MX = 0.f, MY = 0.f;
+	if (!bPlaying || FMath::IsNearlyEqual(Speed, 1.f, 0.01f) || ViewX <= 0 || ViewY <= 0 || !IsGameWindowInFront() || !GetMousePosition(MX, MY))
+	{
+		bPointerScaling = false;
+		return;
+	}
+	const FIntPoint Now(FMath::RoundToInt(MX), FMath::RoundToInt(MY));
+	const FIntPoint Moved = Now - PointerPlaced;
+	// (A first frame, or a jump no hand makes in one - the cursor came back into the window somewhere else: from there.)
+	if (!bPointerScaling || FMath::Abs(Moved.X) > ViewX / 3 || FMath::Abs(Moved.Y) > ViewY / 3)
+	{
+		bPointerScaling = true;
+		PointerExact = FVector2D(Now);
+		PointerPlaced = Now;
+		return;
+	}
+	if (Moved == FIntPoint::ZeroValue)
+	{
+		return;
+	}
+	PointerExact += FVector2D(Moved) * Speed;
+	PointerExact = FVector2D(FMath::Clamp(PointerExact.X, 0.0, double(ViewX - 1)), FMath::Clamp(PointerExact.Y, 0.0, double(ViewY - 1)));
+	PointerPlaced = FIntPoint(FMath::RoundToInt(PointerExact.X), FMath::RoundToInt(PointerExact.Y));
+	if (PointerPlaced != Now)
+	{
+		SetMouseLocation(PointerPlaced.X, PointerPlaced.Y);
+	}
+}
+
+FString AGenPlayerController::TestMouse(const TArray<FString>& Args)
+{
+	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	const FString What = Args.Num() > 0 ? Args[0] : FString();
+	if (What.Equals(TEXT("scheme"), ESearchCase::IgnoreCase) && Args.Num() >= 2)
+	{
+		UGenUserSettings* Settings = UGenUserSettings::Get();
+		if (!Settings)
+		{
+			return TEXT("no settings");
+		}
+		Settings->Controls.MouseScheme = Args[1].Equals(TEXT("modern"), ESearchCase::IgnoreCase) ? EGenMouseScheme::Modern : EGenMouseScheme::Classic;
+		return IsModernMouse() ? TEXT("the Modern layout") : TEXT("the Classic layout");
+	}
+	if ((What.Equals(TEXT("left"), ESearchCase::IgnoreCase) || What.Equals(TEXT("right"), ESearchCase::IgnoreCase)) && Args.Num() >= 3 && Logic)
+	{
+		const float X = FCString::Atof(*Args[1]), Y = FCString::Atof(*Args[2]);
+		const FVector3f Pos(X, Y, Logic->GetGroundHeight(X, Y));
+		FVector2D Screen(0.0, 0.0);
+		const FGenObjectID Hit = TestPickAt(Pos, &Screen);
+		const FString Cursor = CursorForClick(Hit, float(Screen.X), float(Screen.Y));
+		const int32 Before = Selection.Num();
+		FClickEval Eval;
+		if (What.Equals(TEXT("left"), ESearchCase::IgnoreCase))
+		{
+			WorldLeftClick(float(Screen.X), float(Screen.Y), false, &Eval);
+		}
+		else
+		{
+			RightStart = Screen; // (where the button went down: RightClick looks there for the command bar)
+			RightClick(float(Screen.X), float(Screen.Y), false, &Eval);
+		}
+		const FGenObject* O = Logic->FindObject(Hit);
+		return FString::Printf(TEXT("%s %s click on %s: action %d by %d unit(s), selected %d -> %d, cursor %s"), IsModernMouse() ? TEXT("modern") : TEXT("classic"), *What.ToLower(),
+			O ? *FString::Printf(TEXT("#%u %s"), Hit, *O->GetTemplate()->Name) : TEXT("the ground"), int32(Eval.Action), Eval.Units.Num(), Before, Selection.Num(), *Cursor);
+	}
+	AGenCameraPawn* Cam = GetCameraPawn();
+	if (What.Equals(TEXT("camera"), ESearchCase::IgnoreCase) && Args.Num() >= 2 && Cam)
+	{
+		// One frame's worth of the input (at 30 frames a second), through the same sums as UpdateCamera's; the view is put back after.
+		const FGenControlSettings& Controls = ControlSettings();
+		const FString Kind = Args[1];
+		const float Amount = Args.Num() >= 3 ? FCString::Atof(*Args[2]) : 1.f;
+		const FVector Start = Cam->GetTarget();
+		const float StartYaw = Cam->GetYaw(), StartHeight = Cam->GetTargetHeight();
+		constexpr float Dt = 1.f / 30.f;
+		if (Kind.Equals(TEXT("key"), ESearchCase::IgnoreCase)) { Cam->Pan(ScrollPan(FVector2D(1.0, 0.0), FVector2D::ZeroVector, Controls, Cam->ScrollSpeed, Dt)); }
+		else if (Kind.Equals(TEXT("edge"), ESearchCase::IgnoreCase)) { Cam->Pan(ScrollPan(FVector2D::ZeroVector, FVector2D(1.0, 0.0), Controls, Cam->ScrollSpeed, Dt)); }
+		else if (Kind.Equals(TEXT("drag"), ESearchCase::IgnoreCase)) { Cam->Pan(DragPan(FVector2D(Amount * 0.1, 0.0), Controls, Cam->ScrollSpeed, Dt)); }
+		FString Result;
+		if (Kind.Equals(TEXT("zoom"), ESearchCase::IgnoreCase))
+		{
+			Cam->Zoom(ZoomSteps(Amount, Controls));
+			Result = FString::Printf(TEXT("%.1f wheel step(s): height %.1f -> %.1f"), Amount, StartHeight, Cam->GetTargetHeight());
+			Cam->Zoom(-ZoomSteps(Amount, Controls));
+		}
+		else if (Kind.Equals(TEXT("rotate"), ESearchCase::IgnoreCase))
+		{
+			Cam->AddYaw(RotateDegrees(Amount * 100.f, Controls));
+			Result = FString::Printf(TEXT("middle drag %.0f px: %.1f degrees"), Amount * 100.f, Cam->GetYaw() - StartYaw);
+			Cam->AddYaw(StartYaw - Cam->GetYaw());
+		}
+		else
+		{
+			const FVector Moved = GenCoords::FromUE(Cam->GetTarget()) - GenCoords::FromUE(Start);
+			Result = FString::Printf(TEXT("%s scroll, one frame: the view moved (%.1f, %.1f)"), *Kind.ToLower(), Moved.X, Moved.Y);
+			Cam->SetTarget(Start);
+		}
+		return FString::Printf(TEXT("%s (speeds: edge %.2f, keys %.2f, drag %.2f%s, zoom %.2f, rotate %.2f)"), *Result, Controls.EdgeScrollSpeed, Controls.KeyScrollSpeed,
+			Controls.DragScrollSpeed, Controls.bInvertDragScroll ? TEXT(" inverted") : TEXT(""), Controls.ZoomSpeed, Controls.RotateSpeed);
+	}
+	return TEXT("NOT UNDERSTOOD (left,x,y / right,x,y / scheme,classic|modern / camera,key|edge|drag|zoom|rotate[,amount])");
 }
 
 void AGenPlayerController::UpdateSelectionInput(float MX, float MY, bool bHasMouse)
@@ -1259,10 +1636,8 @@ void AGenPlayerController::UpdateSelectionInput(float MX, float MY, bool bHasMou
 		}
 		else
 		{
-			// A plain left click: what it does is worked out by EvaluateClick - the cursor has shown it beforehand.
-			FClickEval Eval;
-			EvaluateClick(PickObject(MX, MY, ClickPickTypes()), MX, MY, Eval);
-			ExecuteClick(Eval, bShift);
+			// A plain left click: selects, or (the Classic layout) gives the order the cursor has shown beforehand.
+			WorldLeftClick(MX, MY, bShift);
 		}
 		bBoxSelecting = false;
 		bLeftOnRadar = false;

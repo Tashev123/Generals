@@ -2102,6 +2102,15 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 				const FString Done = GenPC ? GenPC->TestClickAt(FVector3f(At.X, At.Y, Logic->GetGroundHeight(At.X, At.Y)), bForce, bWaypoint) : FString(TEXT("no controller"));
 				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: %s at (%.0f, %.0f) %s"), Logic->GetFrame(), *What, At.X, At.Y, *Done);
 			}
+			else if (What.Equals(TEXT("mouse"), ESearchCase::IgnoreCase) && Parts.Num() >= 3)
+			{
+				// "frame,mouse,left|right,x,y" / "frame,mouse,scheme,classic|modern" / "frame,mouse,camera,key|edge|drag|zoom|rotate[,amount]":
+				// the mouse as the controls page lays it out (AGenPlayerController::TestMouse)
+				AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC);
+				TArray<FString> Args(Parts.GetData() + 2, Parts.Num() - 2);
+				const FString Done = GenPC ? GenPC->TestMouse(Args) : FString(TEXT("no controller"));
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: mouse %s"), Logic->GetFrame(), *Done);
+			}
 			else if (What.Equals(TEXT("steer"), ESearchCase::IgnoreCase) && Parts.Num() >= 4)
 			{
 				// "frame,steer,x,y": our gunships on their run are told to fire there
