@@ -12,6 +12,8 @@
 #include "Map/GenMapActor.h"
 #include "W3D/GenModelComponent.h"
 #include "Game/GenCursors.h"
+#include "Game/GenHUD.h"
+#include "Game/GenInput.h"
 #include "Logic/GenSkirmishAI.h"
 #include "W3D/GenAssets.h"
 #include "Components/DecalComponent.h"
@@ -117,7 +119,9 @@ void AGenPlayerController::PlayerTick(float DeltaTime)
 	}
 	// The menus have the mouse while they are up (the skirmish menu, the score screen, the in-game menu).
 	AGenGameMode* GM = GetWorld()->GetAuthGameMode<AGenGameMode>();
-	if (GM && (WasInputKeyJustPressed(EKeys::Escape) || WasInputKeyJustPressed(EKeys::F10)))
+	// (While the options are up, Esc is theirs: it closes them, or stops waiting for a key.)
+	const AGenHUD* GenHUD = Cast<AGenHUD>(GetHUD());
+	if (GM && !(GenHUD && GenHUD->IsOptionsOpen()) && (WasInputKeyJustPressed(EKeys::Escape) || FGenInput::Get().JustPressed(this, EGenAction::Menu)))
 	{
 		GM->ToggleQuitMenu();
 	}
@@ -1084,10 +1088,11 @@ void AGenPlayerController::UpdateCamera(float DeltaTime, AGenCameraPawn* Cam, fl
 	GetViewportSize(ViewX, ViewY);
 
 	FVector2D Scroll(0.f, 0.f);
-	if (IsInputKeyDown(EKeys::Left)) { Scroll.X -= 1.f; }
-	if (IsInputKeyDown(EKeys::Right)) { Scroll.X += 1.f; }
-	if (IsInputKeyDown(EKeys::Up)) { Scroll.Y += 1.f; }
-	if (IsInputKeyDown(EKeys::Down)) { Scroll.Y -= 1.f; }
+	const FGenInput& Input = FGenInput::Get();
+	if (Input.IsDown(this, EGenAction::ScrollLeft)) { Scroll.X -= 1.f; }
+	if (Input.IsDown(this, EGenAction::ScrollRight)) { Scroll.X += 1.f; }
+	if (Input.IsDown(this, EGenAction::ScrollUp)) { Scroll.Y += 1.f; }
+	if (Input.IsDown(this, EGenAction::ScrollDown)) { Scroll.Y -= 1.f; }
 
 	ScrollScreen = FVector2D::ZeroVector;
 	if (bHasMouse && ViewX > 0 && ViewY > 0 && !bRightScrolling && !bBoxSelecting)
@@ -1161,12 +1166,12 @@ void AGenPlayerController::UpdateCamera(float DeltaTime, AGenCameraPawn* Cam, fl
 	{
 		Cam->Zoom(Wheel);
 	}
-	if (WasInputKeyJustPressed(EKeys::Home))
+	if (Input.JustPressed(this, EGenAction::CameraReset))
 	{
 		Cam->ResetView();
 	}
 	// Space: to the last thing the radar reported (an attack, a finished building or upgrade).
-	if (WasInputKeyJustPressed(EKeys::SpaceBar))
+	if (Input.JustPressed(this, EGenAction::JumpToEvent))
 	{
 		const UGenGameLogic* Logic = UGenGameLogic::Get(this);
 		FVector3f EventPos;
@@ -1263,7 +1268,10 @@ void AGenPlayerController::UpdateSelectionInput(float MX, float MY, bool bHasMou
 		bLeftOnRadar = false;
 	}
 
-	if (WasInputKeyJustPressed(EKeys::S) && Selection.Num() > 0)
+	// The command bar's buttons have their keys first (a key one of them takes is gone for the commands below).
+	UpdateBarHotkeys();
+	const FGenInput& Input = FGenInput::Get();
+	if (Input.JustPressed(this, EGenAction::Stop) && Selection.Num() > 0)
 	{
 		Logic->IssueStop(Selection);
 	}
@@ -1271,27 +1279,26 @@ void AGenPlayerController::UpdateSelectionInput(float MX, float MY, bool bHasMou
 	// selects it, with Shift adds it, with Alt looks at it; E: everything like the selection; Q: every
 	// fighting unit; W: every aircraft.
 	{
-		const bool bCtrl = IsInputKeyDown(EKeys::LeftControl) || IsInputKeyDown(EKeys::RightControl);
-		const bool bAlt = IsInputKeyDown(EKeys::LeftAlt) || IsInputKeyDown(EKeys::RightAlt);
-		static const FKey Digits[10] = { EKeys::Zero, EKeys::One, EKeys::Two, EKeys::Three, EKeys::Four, EKeys::Five, EKeys::Six, EKeys::Seven, EKeys::Eight, EKeys::Nine };
+		const bool bCtrl = FGenInput::CtrlDown(this);
+		const bool bAlt = FGenInput::AltDown(this);
 		for (int32 Group = 0; Group < 10; ++Group)
 		{
-			if (WasInputKeyJustPressed(Digits[Group]))
+			if (Input.JustPressed(this, FGenInput::GroupAction(Group)))
 			{
 				GroupKey(Group, bCtrl ? EGroupKey::Create : bAlt ? EGroupKey::View : bShift ? EGroupKey::Add : EGroupKey::Select);
 			}
 		}
 		if (!bCtrl && !bAlt)
 		{
-			if (WasInputKeyJustPressed(EKeys::E) && SelectMatching(false) == 0)
+			if (Input.JustPressed(this, EGenAction::SelectMatching) && SelectMatching(false) == 0)
 			{
 				SelectMatching(true); // InGameUI::selectUnitsMatchingCurrentSelection: none more on the screen - then the map
 			}
-			if (WasInputKeyJustPressed(EKeys::Q))
+			if (Input.JustPressed(this, EGenAction::SelectAllUnits))
 			{
 				SelectAllUnits(false);
 			}
-			if (WasInputKeyJustPressed(EKeys::W))
+			if (Input.JustPressed(this, EGenAction::SelectAllAircraft))
 			{
 				SelectAllUnits(true);
 			}
@@ -1303,17 +1310,17 @@ void AGenPlayerController::UpdateSelectionInput(float MX, float MY, bool bHasMou
 		const FGenObject* O = Logic->FindObject(Id);
 		return O && Logic->CanPlayerCommand(Logic->GetLocalPlayer(), *O) && O->CanMove();
 	});
-	if (bHasMovers && WasInputKeyJustPressed(EKeys::A))
+	if (bHasMovers && Input.JustPressed(this, EGenAction::AttackMove))
 	{
 		BeginOrderTargeting(FGenCommandData::Get().FindButton(TEXT("Command_AttackMove")));
 	}
-	if (bHasMovers && WasInputKeyJustPressed(EKeys::G))
+	if (bHasMovers && Input.JustPressed(this, EGenAction::Guard))
 	{
 		BeginOrderTargeting(FGenCommandData::Get().FindButton(TEXT("Command_Guard")));
 	}
 	// Ctrl+F (CREATE_FORMATION): the selected units keep their places relative to one another when they
 	// move, at the pace of the slowest - or, if they are a formation already, no longer.
-	if (bHasMovers && WasInputKeyJustPressed(EKeys::F) && (IsInputKeyDown(EKeys::LeftControl) || IsInputKeyDown(EKeys::RightControl)))
+	if (bHasMovers && Input.JustPressed(this, EGenAction::Formation))
 	{
 		TArray<FGenObjectID> Own;
 		for (FGenObjectID Id : Selection)

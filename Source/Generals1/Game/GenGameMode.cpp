@@ -1,4 +1,5 @@
 #include "Game/GenGameMode.h"
+#include "Game/GenSettings.h"
 #include "Algo/Find.h"
 #include "Audio/GenAudioManager.h"
 #include "AudioDeviceManager.h"
@@ -62,6 +63,11 @@ void AGenGameMode::StartPlay()
 		World->bShouldSimulatePhysics = false;
 	}
 	Super::StartPlay();
+	// The player's settings (resolution and the like are the engine's, put into effect as it started).
+	if (UGenUserSettings* Settings = UGenUserSettings::Get())
+	{
+		Settings->ApplyAtStartup();
+	}
 
 	// The server of a network game (-GenServer, started by the host's game): no game of its own here, no
 	// screen; it runs until its match is over and the players have gone.

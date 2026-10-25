@@ -2,6 +2,8 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/HUD.h"
+#include "Game/GenInput.h"
+#include "Game/GenSettings.h"
 #include "GenHUD.generated.h"
 
 class AGenGameMode;
@@ -36,6 +38,10 @@ public:
 	/** Test automation: the interface element with this id counts as clicked the next time it is drawn. */
 	void ShellTestClick(const FString& Id);
 	bool HasShellTestClick() const { return !Shell.TestClick.IsEmpty(); }
+
+	/** The options screen (GenOptions.cpp): over the main menu or the in-game menu. While it is up it has the keys. */
+	void OpenOptions();
+	bool IsOptionsOpen() const { return Options.bOpen; }
 
 private:
 	void DrawGroundCircle(const FVector& CenterUE, float RadiusUE, const FLinearColor& Color);
@@ -76,6 +82,10 @@ private:
 		bool bRightClick = false;
 		float Wheel = 0.f;
 		bool bBlocked = false;          // what is being drawn lies under a dialog: it doesn't react
+		bool bUnderOptions = false;     // ... under the options screen (set for everything but the options themselves)
+		bool bMouseDown = false;        // the left button is held
+		FString DragId;                 // the slider (or scroll bar) the left button is dragging
+		FString Tooltip;                // the text of what the mouse is on, drawn last (ShellTooltip)
 		// layout: the design is 1600 x 900, scaled to fit and centred
 		float Scale = 1.f;
 		FVector2D Origin = FVector2D::ZeroVector;
@@ -132,11 +142,81 @@ private:
 	void ShellPanel(const FBox2D& R, float Alpha = 0.78f);
 	/** Align: 0 left, 1 centred on X, 2 right. Size is in design units (about a point size). */
 	void ShellText(const FString& Text, float X, float Y, const FLinearColor& Color, float Size, int32 Align = 0, bool bBold = false);
+	/** The size on the screen (pixels) of a line of ShellText at that size. */
+	FVector2D ShellMeasure(const FString& Text, float Size, bool bBold = false) const;
 	bool ShellButton(const FString& Id, const FBox2D& R, const FString& Label, bool bEnabled = true);
 	bool ShellCheckbox(const FString& Id, const FBox2D& R, const FString& Label, bool bValue);
 	/** A drop-down list: true when another item was chosen (OutPicked). A test id "Id=Item label" chooses directly. */
 	bool ShellDropdown(const FString& Id, const FBox2D& R, const TArray<FString>& Items, const TArray<FLinearColor>& Colors, int32 Current, int32& OutPicked);
 	UTexture2D* GetMapPreview(const FString& MapName);
+
+	// --- more elements (GenShell.cpp). Rectangles are on the screen (ShellRect); test ids as noted. ---
+	/** A row of tabs: the one now chosen. Test id "Id=Label". */
+	int32 ShellTabs(const FString& Id, const FBox2D& R, const TArray<FString>& Labels, int32 Current);
+	/** A slider: clicked or dragged, Value goes Min..Max in Steps (0: smooth); true when it changed. ValueText is
+	 *  shown at its right. Test id "Id=0.75" sets the value. */
+	bool ShellSlider(const FString& Id, const FBox2D& R, float& Value, float Min, float Max, float Step, const FString& ValueText);
+	/** A button showing a key ("Ctrl + F"), lit while it waits for one (bWaiting). True when clicked. */
+	bool ShellKeyButton(const FString& Id, const FBox2D& R, const FString& Text, bool bWaiting);
+	/**
+	 * While a key button waits: true when a key went down this frame (with the modifiers held then) - Out is it;
+	 * Esc: bOutCancelled. Modifier keys alone don't count. Test id "Key=Ctrl+F" (FGenKeyChord's form) presses
+	 * that, "Key=Escape" cancels.
+	 */
+	bool ShellCaptureKey(FGenKeyChord& Out, bool& bOutCancelled);
+	/**
+	 * A scrolling area: the wheel over it (or its bar, dragged) moves Scroll, in design units, kept within
+	 * 0 .. ContentHeight - its height. Draws the bar when the content is taller. The caller draws its rows at
+	 * minus Scroll and leaves out those not wholly inside R. Test id "Id=Top" / "Id=Bottom".
+	 */
+	void ShellScrollArea(const FString& Id, const FBox2D& R, float ContentHeight, float& Scroll);
+	/** The text shown by the mouse while it is over R (drawn by EndShell, over everything). */
+	void ShellTooltip(const FBox2D& R, const FString& Text);
+
+	// --- the options screen (GenOptions.cpp: its frame; a file for each page) ---
+	struct FOptionsState
+	{
+		bool bOpen = false;
+		int32 Tab = 0;                  // EOptionsTab
+		// each page's copy of the settings, changed freely, put into effect by Apply
+		FGenVideoDraft Video;
+		FGenControlSettings Controls;
+		FGenHotkeySettings Hotkeys;
+		FGenVolumeSettings Audio;
+		float Scroll[4] = { 0.f, 0.f, 0.f, 0.f };
+		FString CaptureId;              // the key button waiting for a key, if any
+	};
+	enum EOptionsTab : int32 { OptionsVideo, OptionsControls, OptionsHotkeys, OptionsAudio, OptionsTabCount };
+	FOptionsState Options;
+	void DrawOptions();
+	void CloseOptions(bool bApply);
+	/**
+	 * Each page: Load fills its draft from the settings in effect; Draw draws it into Body (design units, the
+	 * 1600 x 900 layout: ShellRect(Body.Min.X + x, ...)); Apply puts the draft into the settings (the frame
+	 * saves them after); Defaults sets the draft to the defaults; Cancel undoes what the page tried out live.
+	 */
+	void OptionsLoadVideo();
+	void DrawOptionsVideo(const FBox2D& Body);
+	void OptionsApplyVideo();
+	void OptionsDefaultsVideo();
+	void OptionsCancelVideo();
+	void OptionsLoadControls();
+	void DrawOptionsControls(const FBox2D& Body);
+	void OptionsApplyControls();
+	void OptionsDefaultsControls();
+	void OptionsCancelControls();
+	void OptionsLoadHotkeys();
+	void DrawOptionsHotkeys(const FBox2D& Body);
+	void OptionsApplyHotkeys();
+	void OptionsDefaultsHotkeys();
+	void OptionsCancelHotkeys();
+	void OptionsLoadAudio();
+	void DrawOptionsAudio(const FBox2D& Body);
+	void OptionsApplyAudio();
+	void OptionsDefaultsAudio();
+	void OptionsCancelAudio();
+	/** Over the HUD while a game is on, options or not (GenOptionsVideo.cpp: the frame rate read-out). */
+	void DrawVideoOverlay();
 
 	FShellState Shell;
 

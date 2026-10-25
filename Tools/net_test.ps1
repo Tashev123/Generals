@@ -29,7 +29,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$ue = "C:\Program Files\Epic Games\UE_5.8\Engine\Binaries\Win64\UnrealEditor.exe"
+. "$PSScriptRoot\gen_lock.ps1"
+$ue = "$(Get-GenEngine)\Engine\Binaries\Win64\UnrealEditor.exe"
 $root = Split-Path $PSScriptRoot
 $proj = Join-Path $root "Generals1.uproject"
 $logs = Join-Path $root "Saved\Logs"

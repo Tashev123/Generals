@@ -6,6 +6,10 @@ public class Generals1 : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
+		// Each .cpp on its own: many files keep helpers of the same name in anonymous namespaces
+		// (CellSize, ReadU32, ClientFPS ...), which collide when unity builds merge files.
+		bUseUnity = false;
+
 		PublicIncludePaths.Add(ModuleDirectory);
 
 		PublicDependencyModuleNames.AddRange(new string[]

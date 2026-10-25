@@ -13,3 +13,4 @@ Contains/
 *.user
 *.userosscache
 *.sln.docusers
+__pycache__/

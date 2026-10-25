@@ -125,6 +125,9 @@ private:
 	AGenCameraPawn* GetCameraPawn() const;
 	void UpdateCamera(float DeltaTime, AGenCameraPawn* Cam, float MX, float MY, bool bHasMouse);
 	void UpdateSelectionInput(float MX, float MY, bool bHasMouse);
+	/** The command bar's buttons by their keys (GenBarHotkeys.cpp): a button whose key went down is pressed, and
+	    the key is taken (FGenInput::Consume) so no command on it fires as well. */
+	void UpdateBarHotkeys();
 	void UpdatePlacement(float MX, float MY, bool bHasMouse);
 	void EndPlacement();
 	void UpdateTargeting(float MX, float MY, bool bHasMouse);

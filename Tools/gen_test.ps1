@@ -44,13 +44,18 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$ue = "C:\Program Files\Epic Games\UE_5.8"
+# One build or test run at a time on this PC (several worktrees may be worked on at once): held to the end.
+. "$PSScriptRoot\gen_lock.ps1"
+$ue = Get-GenEngine
+Enter-GenLock
 $proj = Join-Path $PSScriptRoot "..\Generals1.uproject" | Resolve-Path
 $log = Join-Path $PSScriptRoot "..\Saved\Logs\GenTest.log"
 
 if ($Build) {
-    $out = & "$ue\Engine\Build\BatchFiles\Build.bat" Generals1Editor Win64 Development "-Project=$proj" -WaitMutex 2>&1
-    $errors = $out | Select-String -Pattern "error|Result:"
+    $ErrorActionPreference = "Continue"
+    $out = & cmd /c "`"$ue\Engine\Build\BatchFiles\Build.bat`" Generals1Editor Win64 Development `"-Project=$proj`" -WaitMutex 2>&1"
+    $ErrorActionPreference = "Stop"
+    $errors = $out | Select-String -Pattern ": (fatal )?error |Result:"
     $errors | ForEach-Object { $_.Line }
     if (-not ($out | Select-String -Pattern "Result: Succeeded")) { exit 1 }
 }

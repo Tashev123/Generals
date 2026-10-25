@@ -64,12 +64,14 @@ void AGenHUD::DrawHUD()
 	if (GM && GM->GetPhase() == EGenGamePhase::Menu)
 	{
 		DrawSkirmishMenu(GM);
+		DrawOptions();
 		EndShell();
 		return;
 	}
 	if (GM && GM->GetPhase() == EGenGamePhase::NetLobby)
 	{
 		DrawSkirmishMenu(GM);
+		DrawOptions();
 		EndShell();
 		return;
 	}
@@ -337,6 +339,11 @@ void AGenHUD::DrawHUD()
 	{
 		DrawMouseOverName(PC, Logic, bTestCursor ? TestCursor : PC->GetMousePos());
 	}
+	if (!GM || GM->GetPhase() == EGenGamePhase::Playing)
+	{
+		DrawVideoOverlay();
+	}
+	DrawOptions();
 	if (bTestCursor)
 	{
 		DrawTestCursor(TestCursor);

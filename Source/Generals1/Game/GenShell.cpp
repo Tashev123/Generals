@@ -19,6 +19,7 @@
 #include "Game/GenGameMode.h"
 #include "Game/GenPlayerController.h"
 #include "Game/GenShellData.h"
+#include "Game/GenShellStyle.h"
 #include "Game/GenSkirmishSetup.h"
 #include "Logic/GenCommandData.h"
 #include "Logic/GenGameData.h"
@@ -42,16 +43,7 @@
 
 namespace
 {
-	const FLinearColor ShellGold(1.f, 0.8f, 0.22f);
-	const FLinearColor ShellTextColor(0.86f, 0.9f, 1.f);
-	const FLinearColor ShellDim(0.45f, 0.5f, 0.6f);
-	const FLinearColor ShellFill(0.03f, 0.06f, 0.13f, 0.92f);
-	const FLinearColor ShellHot(0.1f, 0.24f, 0.5f, 0.95f);
-	const FLinearColor ShellEdge(0.22f, 0.42f, 0.78f);
-	const FLinearColor ShellRed(1.f, 0.3f, 0.25f);
-
-	constexpr float DesignWidth = 1600.f;
-	constexpr float DesignHeight = 900.f;
+	using namespace GenShellStyle;
 
 	/**
 	 * A crisp font at any size: the engine's Roboto, rendered as it is asked for (its other canvas fonts
@@ -90,6 +82,11 @@ namespace
 
 // ---- the elements ---------------------------------------------------------------------------------
 
+FVector2D AGenHUD::ShellMeasure(const FString& Text, float Size, bool bBold) const
+{
+	return MeasureShellText(Text, ShellFont(Size * Shell.Scale, bBold));
+}
+
 void AGenHUD::ShellTestClick(const FString& Id)
 {
 	Shell.TestClick = Id;
@@ -103,12 +100,12 @@ FBox2D AGenHUD::ShellRect(float X, float Y, float W, float H) const
 
 bool AGenHUD::ShellHover(const FBox2D& R) const
 {
-	return !Shell.bBlocked && Shell.OpenId.IsEmpty() && R.IsInside(Shell.Mouse);
+	return !Shell.bBlocked && !Shell.bUnderOptions && Shell.OpenId.IsEmpty() && R.IsInside(Shell.Mouse);
 }
 
 bool AGenHUD::ShellTestHit(const FString& Id)
 {
-	if (Shell.bBlocked || Shell.TestClick.IsEmpty() || !Shell.TestClick.Equals(Id, ESearchCase::IgnoreCase))
+	if (Shell.bBlocked || Shell.bUnderOptions || Shell.TestClick.IsEmpty() || !Shell.TestClick.Equals(Id, ESearchCase::IgnoreCase))
 	{
 		return false;
 	}
@@ -260,7 +257,7 @@ bool AGenHUD::ShellDropdown(const FString& Id, const FBox2D& R, const TArray<FSt
 		}
 	}
 	// Test automation: "Id=Item label" chooses without opening the list.
-	if (!Shell.bBlocked && Shell.TestClick.StartsWith(Id + TEXT("="), ESearchCase::IgnoreCase))
+	if (!Shell.bBlocked && !Shell.bUnderOptions && Shell.TestClick.StartsWith(Id + TEXT("="), ESearchCase::IgnoreCase))
 	{
 		const FString Wanted = Shell.TestClick.Mid(Id.Len() + 1);
 		Shell.TestClick.Reset();
@@ -311,6 +308,218 @@ bool AGenHUD::ShellDropdown(const FString& Id, const FBox2D& R, const TArray<FSt
 	return false;
 }
 
+int32 AGenHUD::ShellTabs(const FString& Id, const FBox2D& R, const TArray<FString>& Labels, int32 Current)
+{
+	if (Labels.Num() == 0)
+	{
+		return Current;
+	}
+	int32 Chosen = Current;
+	if (!Shell.bBlocked && !Shell.bUnderOptions && Shell.TestClick.StartsWith(Id + TEXT("="), ESearchCase::IgnoreCase))
+	{
+		const FString Wanted = Shell.TestClick.Mid(Id.Len() + 1);
+		Shell.TestClick.Reset();
+		const int32 Found = Labels.IndexOfByPredicate([&Wanted](const FString& L) { return L.Equals(Wanted, ESearchCase::IgnoreCase); });
+		if (Found == INDEX_NONE)
+		{
+			UE_LOG(LogGenerals, Warning, TEXT("Test menu: '%s' has no tab '%s'"), *Id, *Wanted);
+		}
+		else
+		{
+			Chosen = Found;
+		}
+	}
+	const float W = float(R.GetSize().X) / Labels.Num();
+	const float H = float(R.GetSize().Y);
+	const float T = FMath::Max(1.f, 1.5f * Shell.Scale);
+	for (int32 i = 0; i < Labels.Num(); ++i)
+	{
+		const FBox2D Tab(FVector2D(R.Min.X + W * i, R.Min.Y), FVector2D(R.Min.X + W * (i + 1) - 4.f * Shell.Scale, R.Max.Y));
+		const bool bOn = i == Chosen;
+		const bool bHover = ShellHover(Tab);
+		DrawRect(bOn ? ShellHot : (bHover ? FLinearColor(0.06f, 0.13f, 0.28f, 0.95f) : ShellFill), Tab.Min.X, Tab.Min.Y, Tab.GetSize().X, H);
+		DrawRect(bOn ? ShellGold : ShellEdge, Tab.Min.X, Tab.Max.Y - T * 2.f, Tab.GetSize().X, T * 2.f);
+		const float TextSize = FMath::Clamp(H / Shell.Scale * 0.4f, 13.f, 24.f);
+		const float TextHeight = float(MeasureShellText(Labels[i], ShellFont(TextSize * Shell.Scale, true)).Y);
+		ShellText(Labels[i], Tab.Min.X + Tab.GetSize().X * 0.5f, Tab.Min.Y + (H - TextHeight) * 0.5f, bOn ? ShellGold : (bHover ? FLinearColor::White : ShellTextColor), TextSize, 1, true);
+		if (bHover && Shell.bClick && !bOn)
+		{
+			Shell.bClick = false;
+			ShellClickSound();
+			Chosen = i;
+		}
+	}
+	return Chosen;
+}
+
+bool AGenHUD::ShellSlider(const FString& Id, const FBox2D& R, float& Value, float Min, float Max, float Step, const FString& ValueText)
+{
+	const float Old = Value;
+	auto Settle = [Min, Max, Step](float V)
+	{
+		V = FMath::Clamp(V, Min, Max);
+		return Step > 0.f ? FMath::Clamp(Min + FMath::RoundToFloat((V - Min) / Step) * Step, Min, Max) : V;
+	};
+	// Test automation: "Id=0.75".
+	if (!Shell.bBlocked && !Shell.bUnderOptions && Shell.TestClick.StartsWith(Id + TEXT("="), ESearchCase::IgnoreCase))
+	{
+		Value = Settle(FCString::Atof(*Shell.TestClick.Mid(Id.Len() + 1)));
+		Shell.TestClick.Reset();
+	}
+	// The bar takes the left part; the value's text the rest.
+	const float TextW = 90.f * Shell.Scale;
+	const FBox2D Bar(R.Min, FVector2D(R.Max.X - TextW, R.Max.Y));
+	const float H = float(R.GetSize().Y);
+	const float TrackH = FMath::Max(2.f, H * 0.18f);
+	const float KnobW = FMath::Max(6.f, H * 0.42f);
+	const float X0 = float(Bar.Min.X) + KnobW * 0.5f, X1 = float(Bar.Max.X) - KnobW * 0.5f;
+	const bool bHover = ShellHover(Bar);
+	if (bHover && Shell.bClick)
+	{
+		Shell.bClick = false;
+		Shell.DragId = Id;
+	}
+	const bool bDragging = Shell.DragId == Id && Shell.bMouseDown && !Shell.bBlocked && !Shell.bUnderOptions;
+	if (bDragging && X1 > X0)
+	{
+		Value = Settle(Min + (Max - Min) * FMath::Clamp((float(Shell.Mouse.X) - X0) / (X1 - X0), 0.f, 1.f));
+	}
+	const float Frac = Max > Min ? FMath::Clamp((Value - Min) / (Max - Min), 0.f, 1.f) : 0.f;
+	const float CY = float(R.Min.Y) + H * 0.5f;
+	DrawRect(ShellFill, X0, CY - TrackH * 0.5f, X1 - X0, TrackH);
+	DrawRect((bHover || bDragging) ? ShellGold : ShellEdge, X0, CY - TrackH * 0.5f, (X1 - X0) * Frac, TrackH);
+	const float KX = X0 + (X1 - X0) * Frac;
+	DrawRect((bHover || bDragging) ? ShellGold : ShellTextColor, KX - KnobW * 0.5f, R.Min.Y + H * 0.15f, KnobW, H * 0.7f);
+	const float TextSize = 17.f;
+	const float TextHeight = float(MeasureShellText(TEXT("Ag"), ShellFont(TextSize * Shell.Scale, false)).Y);
+	ShellText(ValueText, R.Max.X, CY - TextHeight * 0.5f, ShellTextColor, TextSize, 2);
+	return Value != Old;
+}
+
+bool AGenHUD::ShellKeyButton(const FString& Id, const FBox2D& R, const FString& Text, bool bWaiting)
+{
+	const bool bHover = ShellHover(R);
+	const FVector2D Size = R.GetSize();
+	DrawRect(bWaiting ? ShellHot : (bHover ? FLinearColor(0.06f, 0.13f, 0.28f, 0.95f) : ShellFill), R.Min.X, R.Min.Y, Size.X, Size.Y);
+	const float T = FMath::Max(1.f, 1.5f * Shell.Scale);
+	const FLinearColor Edge = (bWaiting || bHover) ? ShellGold : ShellEdge;
+	DrawRect(Edge, R.Min.X, R.Min.Y, Size.X, T);
+	DrawRect(Edge, R.Min.X, R.Max.Y - T, Size.X, T);
+	DrawRect(Edge, R.Min.X, R.Min.Y, T, Size.Y);
+	DrawRect(Edge, R.Max.X - T, R.Min.Y, T, Size.Y);
+	const FString Shown = bWaiting ? FString(TEXT("Press a key...")) : Text;
+	const float TextSize = 17.f;
+	const float TextHeight = float(MeasureShellText(Shown, ShellFont(TextSize * Shell.Scale, true)).Y);
+	ShellText(Shown, R.Min.X + Size.X * 0.5f, R.Min.Y + (Size.Y - TextHeight) * 0.5f, bWaiting ? ShellGold : ShellTextColor, TextSize, 1, true);
+	const bool bClicked = (bHover && Shell.bClick) || ShellTestHit(Id);
+	if (bClicked)
+	{
+		Shell.bClick = false;
+		ShellClickSound();
+	}
+	return bClicked;
+}
+
+bool AGenHUD::ShellCaptureKey(FGenKeyChord& Out, bool& bOutCancelled)
+{
+	bOutCancelled = false;
+	// Test automation: "Key=Ctrl+F", "Key=Escape".
+	if (Shell.TestClick.StartsWith(TEXT("Key="), ESearchCase::IgnoreCase))
+	{
+		const FString Wanted = Shell.TestClick.Mid(4);
+		Shell.TestClick.Reset();
+		if (Wanted.Equals(TEXT("Escape"), ESearchCase::IgnoreCase))
+		{
+			bOutCancelled = true;
+			return false;
+		}
+		if (FGenKeyChord::Parse(Wanted, Out) && Out.IsValid())
+		{
+			return true;
+		}
+		UE_LOG(LogGenerals, Warning, TEXT("Test menu: no key '%s'"), *Wanted);
+		return false;
+	}
+	const APlayerController* PC = GetOwningPlayerController();
+	const AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC);
+	if (!PC || !GenPC || !GenPC->IsGenInputEnabled())
+	{
+		return false;
+	}
+	if (PC->WasInputKeyJustPressed(EKeys::Escape))
+	{
+		bOutCancelled = true;
+		return false;
+	}
+	static TArray<FKey> AllKeys;
+	if (AllKeys.Num() == 0)
+	{
+		EKeys::GetAllKeys(AllKeys);
+	}
+	for (const FKey& Key : AllKeys)
+	{
+		if (Key.IsModifierKey() || Key.IsAxis1D() || Key.IsAxis2D() || Key.IsAxis3D() || Key.IsGamepadKey() || Key.IsTouch()
+			|| Key == EKeys::LeftMouseButton || Key == EKeys::RightMouseButton || Key == EKeys::AnyKey)
+		{
+			continue;
+		}
+		if (PC->WasInputKeyJustPressed(Key))
+		{
+			Out = FGenKeyChord(Key, FGenInput::CtrlDown(PC), FGenInput::ShiftDown(PC), FGenInput::AltDown(PC));
+			return true;
+		}
+	}
+	return false;
+}
+
+void AGenHUD::ShellScrollArea(const FString& Id, const FBox2D& R, float ContentHeight, float& Scroll)
+{
+	const float ViewH = float(R.GetSize().Y) / Shell.Scale;
+	const float MaxScroll = FMath::Max(0.f, ContentHeight - ViewH);
+	if (!Shell.bBlocked && !Shell.bUnderOptions && Shell.TestClick.StartsWith(Id + TEXT("="), ESearchCase::IgnoreCase))
+	{
+		Scroll = Shell.TestClick.Mid(Id.Len() + 1).Equals(TEXT("Bottom"), ESearchCase::IgnoreCase) ? MaxScroll : 0.f;
+		Shell.TestClick.Reset();
+	}
+	if (MaxScroll <= 0.f)
+	{
+		Scroll = 0.f;
+		return;
+	}
+	const bool bInside = !Shell.bBlocked && !Shell.bUnderOptions && Shell.OpenId.IsEmpty() && R.IsInside(Shell.Mouse);
+	if (bInside && Shell.Wheel != 0.f)
+	{
+		Scroll -= Shell.Wheel * 60.f;
+		Shell.Wheel = 0.f;
+	}
+	// The bar at the right edge, inside the area.
+	const float BarW = 8.f * Shell.Scale;
+	const FBox2D Track(FVector2D(R.Max.X - BarW, R.Min.Y), R.Max);
+	const float TrackH = float(Track.GetSize().Y);
+	const float ThumbH = FMath::Max(24.f * Shell.Scale, TrackH * ViewH / ContentHeight);
+	if (ShellHover(Track) && Shell.bClick)
+	{
+		Shell.bClick = false;
+		Shell.DragId = Id;
+	}
+	if (Shell.DragId == Id && Shell.bMouseDown && TrackH > ThumbH)
+	{
+		Scroll = MaxScroll * FMath::Clamp((float(Shell.Mouse.Y - Track.Min.Y) - ThumbH * 0.5f) / (TrackH - ThumbH), 0.f, 1.f);
+	}
+	Scroll = FMath::Clamp(Scroll, 0.f, MaxScroll);
+	const float ThumbY = float(Track.Min.Y) + (TrackH - ThumbH) * (Scroll / MaxScroll);
+	DrawRect(ShellFill, Track.Min.X, Track.Min.Y, BarW, TrackH);
+	DrawRect(Shell.DragId == Id ? ShellGold : ShellEdge, Track.Min.X, ThumbY, BarW, ThumbH);
+}
+
+void AGenHUD::ShellTooltip(const FBox2D& R, const FString& Text)
+{
+	if (!Text.IsEmpty() && ShellHover(R))
+	{
+		Shell.Tooltip = Text;
+	}
+}
+
 namespace
 {
 	/** Where the open list goes: under its button, or over it when there is no room below. */
@@ -329,9 +538,11 @@ void AGenHUD::BeginShell(AGenPlayerController* PC)
 	Shell.Scale = FMath::Max(0.25f, FMath::Min(Canvas->SizeX / DesignWidth, Canvas->SizeY / DesignHeight));
 	Shell.Origin = FVector2D((Canvas->SizeX - DesignWidth * Shell.Scale) * 0.5f, (Canvas->SizeY - DesignHeight * Shell.Scale) * 0.5f);
 	Shell.bBlocked = false;
+	Shell.bUnderOptions = Options.bOpen; // (DrawOptions clears it for itself)
 	Shell.Mouse = FVector2D(-10000.0, -10000.0);
-	Shell.bClick = Shell.bRightClick = false;
+	Shell.bClick = Shell.bRightClick = Shell.bMouseDown = false;
 	Shell.Wheel = 0.f;
+	Shell.Tooltip.Reset();
 	float MX = 0.f, MY = 0.f;
 	if (PC && PC->IsGenInputEnabled())
 	{
@@ -341,7 +552,12 @@ void AGenHUD::BeginShell(AGenPlayerController* PC)
 		}
 		Shell.bClick = PC->WasInputKeyJustPressed(EKeys::LeftMouseButton);
 		Shell.bRightClick = PC->WasInputKeyJustPressed(EKeys::RightMouseButton);
+		Shell.bMouseDown = PC->IsInputKeyDown(EKeys::LeftMouseButton);
 		Shell.Wheel = PC->GetInputAnalogKeyState(EKeys::MouseWheelAxis);
+	}
+	if (!Shell.bMouseDown)
+	{
+		Shell.DragId.Reset();
 	}
 	// A click while a list is open is the list's: on an item it chooses that, anywhere else it closes the list.
 	if (!Shell.OpenId.IsEmpty() && (Shell.bClick || Shell.bRightClick))
@@ -384,6 +600,17 @@ void AGenHUD::EndShell()
 		DrawRect(ShellGold, List.Min.X, List.Max.Y - T, Width, T);
 		DrawRect(ShellGold, List.Min.X, List.Min.Y, T, List.GetSize().Y);
 		DrawRect(ShellGold, List.Max.X - T, List.Min.Y, T, List.GetSize().Y);
+	}
+	if (!Shell.Tooltip.IsEmpty())
+	{
+		const float TextSize = 15.f;
+		const FVector2D Size = MeasureShellText(Shell.Tooltip, ShellFont(TextSize * Shell.Scale, false));
+		const float Pad = 8.f * Shell.Scale;
+		FVector2D At = Shell.Mouse + FVector2D(18.f, 22.f) * Shell.Scale;
+		At.X = FMath::Min(At.X, Canvas->SizeX - Size.X - Pad * 2.f - 2.f);
+		At.Y = FMath::Min(At.Y, Canvas->SizeY - Size.Y - Pad * 2.f - 2.f);
+		ShellPanel(FBox2D(At, At + Size + FVector2D(Pad * 2.f, Pad * 2.f)), 0.97f);
+		ShellText(Shell.Tooltip, At.X + Pad, At.Y + Pad, ShellTextColor, TextSize);
 	}
 	// A scripted click that nothing on the screen answered to.
 	if (!Shell.TestClick.IsEmpty() && ++Shell.TestClickFrames > 20)
@@ -767,7 +994,7 @@ void AGenHUD::DrawSkirmishMenu(AGenGameMode* GM)
 	// --- go ---
 	const APlayerController* PC = GetOwningPlayerController();
 	const AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC);
-	const bool bEnter = !Shell.bMapSelect && !Shell.bEditingName && !Shell.bEditingAddress && GenPC && GenPC->IsGenInputEnabled() && PC->WasInputKeyJustPressed(EKeys::Enter);
+	const bool bEnter = !Shell.bMapSelect && !Options.bOpen && !Shell.bEditingName && !Shell.bEditingAddress && GenPC && GenPC->IsGenInputEnabled() && PC->WasInputKeyJustPressed(EKeys::Enter);
 	if (Client)
 	{
 		// The network game: what is going on, then leave or (the host) start.
@@ -1051,7 +1278,7 @@ void AGenHUD::DrawQuitMenu(AGenGameMode* GM)
 		return;
 	}
 	DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.55f), 0.f, 0.f, Canvas->SizeX, Canvas->SizeY);
-	ShellPanel(ShellRect(590, 250, 420, 400), 0.95f);
+	ShellPanel(ShellRect(590, 250, 420, 480), 0.95f);
 	if (!ShellImage(TEXT("GeneralsLogo"), ShellRect(700, 266, 200, 100)))
 	{
 		ShellText(TEXT("GENERALS"), Canvas->SizeX * 0.5f, ShellRect(0, 296, 0, 0).Min.Y, ShellGold, 30.f, 1, true);
@@ -1066,7 +1293,11 @@ void AGenHUD::DrawQuitMenu(AGenGameMode* GM)
 	{
 		GM->RestartGame();
 	}
-	else if (ShellButton(TEXT("Menu.Exit"), ShellRect(630, 550, 340, 60), FGenShellData::Text(TEXT("GUI:Exit"), TEXT("EXIT GAME"))))
+	else if (ShellButton(TEXT("Menu.Options"), ShellRect(630, 550, 340, 60), FGenShellData::Text(TEXT("GUI:Options"), TEXT("OPTIONS"))))
+	{
+		OpenOptions();
+	}
+	else if (ShellButton(TEXT("Menu.Exit"), ShellRect(630, 630, 340, 60), FGenShellData::Text(TEXT("GUI:Exit"), TEXT("EXIT GAME"))))
 	{
 		GM->EndGame();
 	}

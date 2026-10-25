@@ -6,7 +6,8 @@
 param([string]$Only = "")
 
 $ErrorActionPreference = "Stop"
-$ue = "C:\Program Files\Epic Games\UE_5.8"
+. "$PSScriptRoot\gen_lock.ps1"
+$ue = Get-GenEngine
 $proj = Join-Path $PSScriptRoot "..\Generals1.uproject" | Resolve-Path
 $script = (Join-Path $PSScriptRoot "ue_setup.py" | Resolve-Path).Path.Replace("\", "/")   # (Unreal eats "\u")
 
