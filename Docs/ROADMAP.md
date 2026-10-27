@@ -1630,6 +1630,18 @@ The user played Twilight Flame and listed what was wrong; fixed first, with what
       criteria" in weapon choice; and (not the original, asked for) a helicopter whose preferred weapon is
       reloading fires another that is ready and in reach - the cannon works on vehicles between missile
       volleys. Flares: launched once the airfield's countermeasures upgrade is done (tested)
+      What the original actually does, read in its source (electronicarts/CnC_Generals_Zero_Hour): one weapon
+      at a time. WeaponSet::chooseBestWeaponForTarget sets a single m_curWeapon, and its own comment is the
+      alternating case ("a tank with a slow reloading missile and a fast low damage gun... will choose the
+      missile, then choose the gun"); AIAttackFireWeaponState fires that one weapon and fails when it is not
+      READY_TO_FIRE, so nothing else is fired in its place. A preferred weapon is kept as the choice through
+      its whole cooldown ("preferred weapons are also kept if they are merely reloading"), and a clip that is
+      mid-cooldown reports RELOADING_CLIP, never OUT_OF_AMMO, so at a tank the original fires nothing between
+      volleys - the cannon is its infantry weapon only.
+      Chosen on 2026-10-27: the cannon firing between volleys stays as the house rule. Firing it in the same
+      frames as the volley was looked at and rejected, so the single-weapon model in ChooseWeapon stands; only
+      an empty clip steps the preferred weapon aside, not its time between shots, which is what let the rocket
+      weapon take a group of GLA workers from the cannon.
 - [x] Helix napalm bomb: the bomb falls from the helicopter and goes off on the ground (tested)
 - [x] GLA Stinger Site: its soldiers (SpawnBehavior that keeps its units: at the SpawnPoint bones, held
       there, replaced 30 s after dying, die with the site; HiveStructureBody passes small arms / sniper /
