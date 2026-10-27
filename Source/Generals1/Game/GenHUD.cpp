@@ -332,6 +332,7 @@ void AGenHUD::DrawHUD()
 		// (The in-game menu opens from the bar's options button: the click is the player controller's business.)
 		if (GM)
 		{
+			DrawPause(GM, Logic);
 			DrawQuitMenu(GM);
 		}
 	}
@@ -491,6 +492,26 @@ void AGenHUD::DrawGameOver(UGenGameLogic* Logic)
 	const float X = Canvas->SizeX * 0.5f - Text.Len() * 4.6f * Scale, Y = Canvas->SizeY * 0.3f;
 	DrawText(Text, FLinearColor::Black, X + 4.f, Y + 4.f, nullptr, Scale);
 	DrawText(Text, bWon ? FLinearColor(1.f, 0.85f, 0.2f) : FLinearColor(0.9f, 0.15f, 0.1f), X, Y, nullptr, Scale);
+}
+
+void AGenHUD::DrawPause(AGenGameMode* GM, UGenGameLogic* Logic)
+{
+	// Test automation has no keyboard: a test click stands for the pause hotkey.
+	if (GM && ShellTestHit(TEXT("Pause.Toggle")))
+	{
+		GM->TogglePause();
+		return;
+	}
+	// (While the in-game menu is up, the menu itself says it; a network game never stops.)
+	if (!GM || !Logic || !Logic->IsPaused() || GM->IsQuitMenuOpen())
+	{
+		return;
+	}
+	const FString Text = TEXT("GAME PAUSED");
+	const float Scale = FMath::Clamp(Canvas->SizeY / 1080.f, 0.75f, 2.f) * 3.f;
+	const float X = Canvas->SizeX * 0.5f - Text.Len() * 4.6f * Scale, Y = Canvas->SizeY * 0.18f;
+	DrawText(Text, FLinearColor::Black, X + 2.f, Y + 2.f, nullptr, Scale);
+	DrawText(Text, FLinearColor(1.f, 0.85f, 0.2f), X, Y, nullptr, Scale);
 }
 
 void AGenHUD::DrawTargeting(AGenPlayerController* PC, UGenGameLogic* Logic)

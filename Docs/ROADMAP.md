@@ -766,7 +766,10 @@ when a tank is done, three layers of scaffolding.
       and ActionManager::canEnterObject): one of ours, on the ground, trainable, not yet heroic, of the
       kinds the data asks for - it gains his ranks and he is gone. A computer player's pilot looks for
       one by himself every second (PilotFindVehicleUpdate: within ScanRange, at least MinHealth), and
-      walks home once if there is none
+      walks home once if there is none. "On the ground" is the locomotor actually in use, as the original
+      checks it, so an aircraft parked at its airfield is one too: the plane has chosen its
+      SET_TAXIING locomotor there and the pilot can climb into it (a helicopter on a pad keeps its air
+      locomotor, so it is not; and an aircraft in the air never is).
 - [x] Combat drop (ChinookAIUpdate, AIRappelState, W3DRopeDraw): the button, then a click on the ground
       or on anything with room inside that is no side's own base building; the helicopter flies there
       (over a building at least MinDropHeight above its roof), hangs still, lets down a rope from each
@@ -783,6 +786,10 @@ when a tank is done, three layers of scaffolding.
       Speed was measured with another program busy on a core (the eight-player game 315-322 frames a
       second, 2.7-4.5% of frames over 4.2 ms; a scene none of this touches was as much slower than
       the day before: 300-328 against 334-374)
+- [x] Tried the same for a plane parked at its airfield: on Tournament Desert an airfield with a veteran
+      pilot standing beside it and a Raptor produced there - the plane keeps its parking space with the taxi
+      locomotor, the pilot is told to enter and walks over, and the Raptor becomes Veteran; a Crusader takes
+      the same pilot as before. The computer player's pilot uses the same check when he scans for a vehicle.
 - [ ] Not done yet: CombatDropKillFX (units have no per-unit effects yet); a soldier shot on the rope
       dies where he hangs; a helicopter shot down during a drop leaves the soldiers on the ropes
       sliding on (the original drops them); nothing shows a jet being locked on to (LockonCursor);
@@ -1638,7 +1645,7 @@ The user played Twilight Flame and listed what was wrong; fixed first, with what
       it should look
 - [ ] Not done yet for other generals: the Tank General's tank paradrop (SPECIAL_TANK_PARADROP), the
       ambulance / hazmat cleanup (SPECIAL_CLEANUP_AREA), the GLA angry mob (MobNexusContain and the
-      spawner's budding exit). Units getting stuck in general: better on bridges, not looked at elsewhere
+      spawner's budding exit). (Units getting stuck: the movement section of 2026-10-27 below.)
 
 ## Done (MP1: network games - orders, replays, the host's server, coming back to a match)
 The user's wishes (2026-10-23): a modern client-server game; a player who drops out can come back; free
@@ -1739,12 +1746,84 @@ ground, USA power balance, add-ons, Macedonia, online browser or control bar.
   worktrees. A build in one worktree rewrites the engine's UnrealEditor.modules BuildId: another worktree's
   DLL then doesn't load until it is built again
 
+## Done (the user's report of 2026-10-27: damaged helicopters never landed at the airfield)
+"If I send a damaged helicopter to the airfield, it just hovers over it" - and a captured Chinese base's
+Helix should be mended at an American airfield too.
+- [x] Comanche (JetAIUpdate): the flight home (JetOrHeliReturnForLandingState, an AIInternalMoveToState)
+      ends over the spot at the helicopter's own height; only the way straight down or up
+      (HeliTakeoffOrLandingState) needs 3 units in all three axes - it had both, so the flight home never
+      ended. That descent gives the locomotor an explicit goal (onPathDistToGoal 0), which brakes and slides
+      it onto the point; with the distance passed it circled the approach point instead
+- [x] Where it comes down: doLandingCommand's findPositionAround of the airfield (ten bounding radii) -
+      `UGenGameLogic::FindFreeGroundAround`: rings 5 apart from a random angle, passable ground with nothing
+      within 5 - beside the airfield, a different spot each time, not all on the HeliPark01 bone
+- [x] canGetRepairedAt for aircraft: in the air, damaged, at an ally's FS_AIRFIELD of any side; a click on
+      the airfield gives the GetRepaired cursor and order. Jets land as told to (privateGetRepaired);
+      Chinook and Helix (ChinookAIUpdate::privateGetRepaired): open ground within a hundred radii, land
+      there, mended by the airfield while down (setHealee), up again once whole or once the airfield is gone;
+      any order ends the stay (aiDoCommand's setAirfieldForHealing(INVALID_ID))
+- [x] Tested on Tournament Desert: two Comanches told to land (one at 88 / 220) came down on either side of
+      the airfield, the healthy one rose at once, the other after 398 frames at 220; a Helix (120 / 300) and a
+      Chinook (150 / 300) at an American airfield, by the `fix` step and by a left click; replay of the scene
+      against a Chinese computer player: every frame the same (9849 frames).
+      Recipes: `-Objects "AmericaAirfield@1170:520" -TestQueue "AmericaVehicleComanche,AmericaVehicleComanche"
+      -TestPowers "35,money,5000;2600,damage,AmericaVehicleComanche,40" -TestJets "2500,move,1170,900;2700,land"`
+      (pause f3100 with `-Cam "1150,600,0,300"`); `-Objects "AmericaAirfield@1170:520,ChinaVehicleHelix@1100:950"
+      -TestSelect ChinaVehicleHelix -TestPowers "300,damage,ChinaVehicleHelix,40;400,leftclick,1170,500"`
+      (pause f850); grep `[jet f`, `[jetpos f`, `[repair f`
+
+## Done (the user's report of 2026-10-27: vehicles bump into each other and get stuck)
+"If they move towards each other they could get stuck... if the vehicles are standing very close and I
+move one, it tries to turn but the other vehicle is blocking it." Two causes were the port's, the rest the
+original's stop-and-wait design; the user chose to replace that with modern steering (option 2 of three:
+faithful repair / steering on the original's paths / flow fields - AoE IV's and SupCom 2's - left for later,
+it would replace only the route, not the steering).
+- [x] Port bugs: the locomotor's *blocked branch was missing (Locomotor::locoUpdate_moveTowardsPosition: a
+      blocked unit stops and turns on the spot whatever its locomotor) - a wheeled vehicle turns only as fast
+      as it rolls, so one held to speed 0 could never turn out from behind what blocked it (Humvee behind a
+      parked Crusader: 12 s then the order dropped). And the port's own give-up (4 s / 12 s without speed)
+      didn't reset when the way cleared and counted a braking unit's slide as no progress: a unit that had
+      stepped aside dropped its own order. Now: ground covered or turned through counts, 6 s caught on the
+      ground or 20 s waiting on units, `[steer f..] ... gives up its move` in the trace
+- [x] Steering (Logic/GenSteering.cpp, beyond the original): every frame a moving vehicle looks 1.5 s ahead
+      and tries nine ways (as far round as its locomotor turns in that time - treads slow to turn, wheels
+      turn as they roll) at two paces, the pace of the unit ahead, the way it held last frame and standing;
+      it takes the cheapest of turning off the path, going slower and running into somebody (an oncoming
+      unit counts half - it steers too; traffic going its way only when close; a tie keeps right). Soldiers
+      steer round vehicles; soldiers among soldiers, docking lanes and factory doors keep the original's rules
+- [x] Idle allies in the way make way (Pathfinder::moveAllies / getMoveAwayFromPath: the nearest free spot
+      clear of the mover's way, on the side they are on) and go back to where they stood; a unit that was
+      going somewhere goes on. Parked group mates (same group order, `MoveGroup`) and parked allies in the
+      last 6 cells of a move are eased past at half pace instead, never sent away; what is held to its place
+      (docking, building, packing, an ability, a factory door) is never pushed or eased into
+- [x] Push pass (UGenGameLogic::UpdateCollisions): what overlaps is pushed apart, half the overlap a frame,
+      15 units/s at most, never onto ground the unit can't stand on - a soldier gives all of it to a vehicle,
+      an idle ally 3/4 to the unit driving into it, an enemy standing its ground none
+- [x] Deadlocks: each waiting on the other - the lower priority unit makes way; still wedged 2 s on (or held
+      up by a unit that doesn't steer): the original's cheat, it drives through for 1.5 s (`drives through`
+      in the trace). A turn far round keeps its direction (no rocking between two ways across the back);
+      a vehicle doesn't pivot into a neighbour. Path round parked units keeps a cell clear for vehicles
+- [x] `gen.Steering` (default 1; a match setting - replays are version 2 now) gives the original's stop and
+      wait back, for A/B tests
+- [x] Tested (Tournament Desert unless said; frames until the last one arrives, steering off -> on): Humvee
+      behind a parked Crusader gave up -> f211 (the Crusader makes way and goes back); Humvee beside one,
+      ordered into it -> f211; Humvee and Ambulance head on 4.5 s jam, the Ambulance dropped its order ->
+      they pass keeping right, f181; six Humvees east through six Crusaders west: f752 / f928 with 3 still
+      going -> f570 / f840; Twilight Flame bridge, 12 Crusaders: longest wait 582 frames, one never arrived ->
+      18 frames, all by f1552 (at x2); AI games against a hard China (seeds 11, 4, 23, 5.6 min): 16 give-ups
+      -> 0, supply deliveries unchanged (148-153); replays of 8-player Twilight Flame games: every frame the
+      same (28965 frames). Soldiers through parked tanks: as before (their pace is their route's)
+- [ ] Not done: the destination of a big group still takes a few seconds to settle (late arrivals ease in
+      among the parked ones); soldiers among soldiers keep the original's pass-through
+
 ## Next
 (Performance: no profiling between milestones - one review at the very end, the user's word of
 2026-10-12. Things to look at then are noted where they are made: FindGroundPath asks for the
 clear width round every cell it opens - a long group move is the dearest single search now. A
 wheeled vehicle moving in view poses its model every drawn frame for its wheels (UpdateVehicleDraw), and
-every ground vehicle's body is stepped every logic frame (UpdateChassis), parked ones too.)
+every ground vehicle's body is stepped every logic frame (UpdateChassis), parked ones too. Steering
+(`Obj.Steer`): every moving ground unit asks the partition about a 1.5 s look ahead every logic frame, and
+one with somebody in its way predicts up to ~22 ways against each neighbour.)
 - [x] The powers that were greyed out (M4c, M4i): all in
 - [x] What units couldn't do (the "not done yet" lines of M4c, M4e, M4f, M4i, M5b, M6b): what
       ObjectCreationUpgrade makes - M4j; crates - M4k; clearing a garrison, the shot at a driver,
@@ -1772,6 +1851,21 @@ every ground vehicle's body is stepped every logic frame (UpdateChassis), parked
   when a unit drives onto a bridge and leaves it. A crossing test:
   `gen_test.ps1 -Map "Twilight Flame" -Cam "2380,2750,0,450" -NoAI -Objects AmericaTankCrusader -ObjectsAt "2384,2480" -TestMove "2376,3020" -Trace`
   (over the bridge; from "2200,2750" to "2560,2750" goes under it).
+- Movement / steering (2026-10-27): with `-Trace`, `[steer f..]` lines say who makes way for whom (and
+  where it goes back to), who paths round parked units, who drives through a wedge and who gives up a
+  move. `-Extra "-GenSteerTrace=<id>"` logs that one unit's steering choice and locomotor every frame
+  (want angle, what straight on runs into and when, the way and pace taken; aim, speed, wait, velocity,
+  turning, braking) - object ids repeat with the same setup and seed, so find the id in a first run.
+  `-Extra "-GenStateDump=F1,F2 -GenDumpTag=x"` writes every object's move / path / blocked / stuck at those
+  frames. A/B against the original's stop and wait: `-Extra "-ini:Engine:[ConsoleVariables]:gen.Steering=0"`.
+  Jam scenes on Tournament Desert (`-NoAI -Trace -Cam "1005,780,0,300"`): Humvee behind a parked Crusader
+  `-Objects "AmericaVehicleHumvee@1005:760:0,AmericaTankCrusader@1035:760:0" -TestPowers "60,move,1205,760,AmericaVehicleHumvee"`;
+  head on (AmericaVehicleMedic is a second wheeled type for `move,x,y,Type`)
+  `-Objects "AmericaVehicleHumvee@950:760:0,AmericaVehicleMedic@1060:760:180" -TestPowers "60,move,1150,760,AmericaVehicleHumvee;60,move,850,760,AmericaVehicleMedic"`;
+  two groups crossing: six Humvees at x 860 (y 700 + 24 i, angle 0) and six Crusaders at x 1150 (y 700 + 26 i,
+  angle 180), `60,move,1250,760,AmericaVehicleHumvee;60,move,760,760,AmericaTankCrusader`. AI soak: `-Enemy
+  FactionChina -Difficulty Hard -Speed 8 -Delay 75 -Trace -Seed 11 -Extra "-GenTestUnits"` and count
+  `gives up its move` (0 now) and `delivers`.
 - Capturing and tech buildings: `-GenTestPowers` steps `capture,x,y` (every local unit that has the
   ability captures the building nearest that spot; the log says how many could) and `cost,Template`
   (logs what the local player pays for it now). `-GenTrace` adds `[ability f..]` (begins / captures),

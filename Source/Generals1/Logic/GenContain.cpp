@@ -1233,6 +1233,22 @@ void FGenObject::UpdateChinookFlight(uint32 Frame)
 	{
 		bWaiting = false; // on its way to a combat drop it lands for nobody
 	}
+	if (ChinookHealAirfield != GenInvalidObjectID)
+	{
+		// Sent for repairs: down once there (MOVE_TO_AND_LAND), mended by the airfield while on the ground, and
+		// up again once whole - or once the airfield is gone.
+		const FGenObject* A = Logic->FindObject(ChinookHealAirfield);
+		FGenParkingPlace* PP = (A && !A->IsDead() && A->IsKindOf(TEXT("FS_AIRFIELD"))) ? A->GetParking() : nullptr;
+		if (!PP || (ChinookFlight == EGenChinookFlight::Landed && Health >= MaxHealth))
+		{
+			SetChinookHealAirfield(GenInvalidObjectID);
+		}
+		else
+		{
+			PP->SetHealee(ID, ChinookFlight == EGenChinookFlight::Landed);
+			bWaiting = true;
+		}
+	}
 	const bool bIdle = IsAIIdle();
 	switch (ChinookFlight)
 	{
@@ -1264,6 +1280,33 @@ void FGenObject::UpdateChinookFlight(uint32 Frame)
 	{
 		UpdateCombatDropApproach(Frame);
 	}
+}
+
+void FGenObject::SetChinookHealAirfield(FGenObjectID Airfield)
+{
+	// ChinookAIUpdate::setAirfieldForHealing: the airfield it leaves stops mending it.
+	if (ChinookHealAirfield != GenInvalidObjectID && ChinookHealAirfield != Airfield)
+	{
+		const FGenObject* Old = Logic->FindObject(ChinookHealAirfield);
+		if (Old && Old->GetParking())
+		{
+			Old->GetParking()->SetHealee(ID, false);
+		}
+	}
+	ChinookHealAirfield = Airfield;
+}
+
+void FGenObject::CommandChinookGetRepaired(const FGenObject& Airfield)
+{
+	// ChinookAIUpdate::privateGetRepaired: to open ground beside the airfield, within a hundred of its radius.
+	if (bDead || !Template->bChinookAI || !Contain || !Airfield.GetParking())
+	{
+		return;
+	}
+	SetChinookHealAirfield(Airfield.GetID());
+	CommandMoveTo(Logic->FindFreeGroundAround(Airfield.GetPosition(), Airfield.GetTemplate()->GetBoundingCircleRadius() * 100.f));
+	UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [repair f%u] #%u %s flies to #%u %s for repairs (%.0f / %.0f)"), Logic->GetFrame(), ID,
+		*Template->Name, Airfield.GetID(), *Airfield.GetTemplate()->Name, Health, MaxHealth);
 }
 
 // ---- the combat drop ------------------------------------------------------------------------------

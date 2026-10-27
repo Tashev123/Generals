@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>HUD in the main-menu style</title>
+<style>
+  body { margin:0; background:#12161f; font-family:'Segoe UI',system-ui,sans-serif; display:flex; flex-direction:column; align-items:center; min-height:100vh; padding:24px; color:#dbe5ff; }
+  h1 { font-size:18px; font-weight:600; color:#c79e28; margin:0 0 6px; letter-spacing:.07em; }
+  .desc { font-size:13px; color:#7887a8; margin-bottom:18px; text-align:center; max-width:760px; line-height:1.5; }
+  .desc code { color:#5c9efe; }
+  .wrap { position:relative; }
+  .notes { font-size:12px; color:#7887a8; margin-top:14px; max-width:1200px; line-height:1.6; }
+  .notes b { color:#c79e28; font-weight:600; }
+</style>
+</head>
+<body>
+<h1>IN-GAME HUD — SAME PRIMITIVES AS THE MENUS</h1>
+<p class="desc">Every panel here is drawn with the primitives <code>GenShell.cpp</code> already uses: chamfered at top-left and bottom-right only, dark navy gradient with the light wash along the top edge, blue border at half alpha, the gold accent bar along the top and gold diagonals at the two cut corners, layered shadow below. Buttons are the same button faces — blue at rest, gold border and glow on hover, gold for primary actions. Text is bold, letter-spaced, gold for what matters, blue for what is in use.</p>
+<div class="wrap"><svg id="stage" width="1200" height="675" viewBox="0 0 1200 675"></svg></div>
+<p class="notes"><b>What is faithful to the menu style:</b> the two-corner chamfer, the top gold accent bar, the gold corner diagonals, the panel gradient + top sheen, the half-alpha blue border, the shadow stack, the button faces with their hover glow, the gold primary button, the sunk insets, the thin dividers, letter-spaced bold text. <b>What the HUD adds on top of a menu screen:</b> the radar blips and the in-world health bar / selection ring, which live over the world rather than inside a panel — those stay plain lines, since a menu panel cannot sit over a unit.</p>
+
+<script>
+const NS='http://www.w3.org/2000/svg';
+const C={
+  gold:'#c79e28', goldDim:'rgba(199,158,40,0.9)', goldGlow:'rgba(199,158,40,0.18)',
+  text:'#dbe5ff', dim:'#7887a8',
+  fill:'rgba(8,14,31,0.94)', hot:'rgba(23,51,107,0.96)',
+  edge:'rgba(56,102,189,0.5)', edgeFull:'#3866bd', accent:'#5c9efe',
+  ptop:'rgb(6,10,22)', pbot:'rgb(2,3,8)',
+  inset:'rgba(3,5,13,0.85)', line:'rgba(77,115,204,0.28)',
+  red:'#ff5245', green:'#66e673'
+};
+const svg=document.getElementById('stage');
+function el(t,a){const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);return e;}
+
+// defs: panel gradient, button gradient, top sheen
+{
+  const d=el('defs',{});
+  const mk=(id,c1,c2)=>{const g=el('linearGradient',{id,x1:0,y1:0,x2:0,y2:1});g.appendChild(el('stop',{offset:0,'stop-color':c1}));g.appendChild(el('stop',{offset:1,'stop-color':c2}));d.appendChild(g);};
+  mk('panelG',C.ptop,C.pbot); mk('btnG','rgba(8,15,33,0.96)','rgba(3,5,13,0.96)'); mk('btnHot','rgba(23,51,107,0.97)','rgba(8,20,51,0.97)');
+  mk('goldG','rgba(184,146,44,0.98)','rgba(92,41,3,0.98)'); mk('sheenG','rgba(255,255,255,0.06)','rgba(255,255,255,0)');
+  svg.appendChild(d);
+}
+
+// world
+svg.appendChild(el('rect',{x:0,y:0,width:1200,height:675,fill:'#141d16'}));
+svg.appendChild(el('ellipse',{cx:480,cy:330,rx:520,ry:330,fill:'#253228'}));
+svg.appendChild(el('path',{d:'M180 470 L360 300 L520 400 L700 260 L860 380 L1010 300',stroke:'rgba(255,255,255,0.06)',fill:'none','stroke-width':2}));
+svg.appendChild(el('polygon',{points:'640,300 655,340 625,340',fill:'rgba(102,230,115,0.25)'}));
+svg.appendChild(el('polygon',{points:'800,220 815,260 785,260',fill:'rgba(255,82,69,0.22)'}));
+svg.appendChild(el('polygon',{points:'500,180 515,220 485,220',fill:'rgba(92,158,254,0.22)'}));
+svg.appendChild(el('circle',{cx:640,cy:320,r:40,fill:'none',stroke:'rgba(92,158,254,0.6)','stroke-width':1.5}));
+
+function chamfer(x,y,w,h,c){
+  c=Math.min(c, Math.min(w,h)*0.5);
+  return [[x+c,y],[x+w,y],[x+w,y+h-c],[x+w-c,y+h],[x,y+h],[x,y+c]];
+}
+function polyStr(p){return p.map(q=>q.join(',')).join(' ');}
+function shadow(x,y,w,h,c){
+  for(let k=3;k>=1;--k){
+    const g=k*4;
+    const p=chamfer(x-g, y+5-g, w+2*g, h+2*g, c+g*0.5);
+    svg.appendChild(el('polygon',{points:p, fill:'rgba(0,0,0,0.11)'}));
+  }
+}
+function panel(x,y,w,h,c=16,a=0.94){
+  shadow(x,y,w,h,c);
+  const p=chamfer(x,y,w,h,c);
+  svg.appendChild(el('polygon',{points:p,fill:'url(#panelG)',opacity:a}));
+  // light wash along the top
+  svg.appendChild(el('polygon',{points:p,fill:'url(#sheenG)'}));
+  svg.appendChild(el('polygon',{points:p,fill:'none',stroke:C.edge,'stroke-width':1.5}));
+  // gold accent along the top edge, gold diagonals at the two cut corners
+  const acc=Math.min(90, w*0.25);
+  svg.appendChild(el('line',{x1:x+c,y1:y,x2:x+c+acc,y2:y,stroke:C.gold,'stroke-width':2}));
+  svg.appendChild(el('line',{x1:x+w-c-acc*0.5,y1:y+h,x2:x+w,y2:y+h,stroke:C.gold,'stroke-width':2}));
+  svg.appendChild(el('line',{x1:x,y1:y+c,x2:x+c,y2:y,stroke:C.goldDim,'stroke-width':2}));
+  svg.appendChild(el('line',{x1:x+w-c,y1:y+h,x2:x+w,y2:y+h-c,stroke:C.goldDim,'stroke-width':2}));
+  return p;
+}
+function inset(x,y,w,h){
+  svg.appendChild(el('polygon',{points:chamfer(x,y,w,h,5),fill:C.inset,stroke:'rgba(120,135,168,0.35)','stroke-width':1}));
+}
+function divider(x,y,w){ svg.appendChild(el('line',{x1:x,y1:y,x2:x+w,y2:y,stroke:C.line,'stroke-width':1})); }
+
+function button(x,y,w,h,o={}){
+  const c=Math.min(10,h*0.3);
+  if(o.disabled){
+    svg.appendChild(el('polygon',{points:chamfer(x,y,w,h,c),fill:'rgba(10,13,20,0.85)',stroke:'rgba(120,135,168,0.35)','stroke-width':1.25}));
+    t(o.label,x+w/2,y+h/2+4,{color:'rgba(120,135,168,0.8)',size:11,anchor:'middle',bold:true,ls:'0.05em'});
+    return;
+  }
+  const gold=!!o.primary, hov=!!o.hover;
+  if(hov){
+    const g=3;
+    svg.appendChild(el('polygon',{points:chamfer(x-g,y-g,w+2*g,h+2*g,c+1.5),fill:'none',stroke:gold?C.goldGlow:'rgba(92,158,254,0.18)','stroke-width':3}));
+  }
+  const grad = gold?'goldG' : (hov?'btnHot':'btnG');
+  const p=chamfer(x,y,w,h,c);
+  svg.appendChild(el('polygon',{points:p,fill:'url(#'+grad+')'}));
+  svg.appendChild(el('polygon',{points:[[x+c,y],[x+w,y],[x+w,y+h*0.45],[x+c,y+h*0.45]],fill:'url(#sheenG)'}));
+  svg.appendChild(el('polygon',{points:p,fill:'none',stroke:(gold?(hov?'rgba(255,235,153,1)':'rgba(255,199,61,0.8)'):(hov?C.gold:'rgba(56,102,189,0.7)')),'stroke-width':1.25}));
+  // the mark that grows on hover
+  if(hov) svg.appendChild(el('polygon',{points:[[x+c,y],[x+c+4,y],[x+c+4,y+h],[x,y+h]],fill:gold?C.gold:C.accent,opacity:0.75}));
+  t(o.label,x+w/2,y+h/2+4,{color:gold?'rgba(18,10,0,1)':(hov?'#ffffff':C.text),size:Math.max(10,Math.min(15,h*0.36)),anchor:'middle',bold:true,ls:gold?'0.09em':'0.07em',shadow:!gold});
+}
+
+function t(s,x,y,o={}){
+  const e=el('text',{x,y,fill:o.color,'font-size':o.size||13,'font-weight':o.bold?'700':'400','text-anchor':o.anchor||'start','letter-spacing':o.ls||'0'});
+  if(o.shadow){const sh=el('text',{x:x+1,y:y+1,fill:'rgba(0,0,0,0.6)','font-size':o.size||13,'font-weight':o.bold?'700':'400','text-anchor':o.anchor||'start','letter-spacing':o.ls||'0'});sh.textContent=s;svg.appendChild(sh);}
+  e.textContent=s;
+  if(o.upper) e.setAttribute('font-feature-settings','case');
+  svg.appendChild(e);
+}
+
+// ── control bar ────────────────────────────────────────────────
+panel(300,440,880,215,16);
+// portrait inset + unit
+inset(316,456,110,120);
+svg.appendChild(el('polygon',{points:'371,478 396,520 346,520',fill:'rgba(92,158,254,0.4)'}));
+t('AVATAR BATTALION',371,470,{color:C.gold,size:11,anchor:'middle',ls:'0.06em',bold:true});
+svg.appendChild(el('polygon',{points:chamfer(322,540,98,8,3),fill:'rgba(0,0,0,0.7)'}));
+svg.appendChild(el('polygon',{points:[[323,541],[392,541],[392,547],[323,547]],fill:C.green}));
+t('90%',420,548,{color:C.dim,size:10,anchor:'middle'});
+t('READY',371,566,{color:C.dim,size:10,anchor:'middle',ls:'0.06em'});
+
+// status line
+t('3 Avatar Battalion · Group 1',316,588,{color:C.text,size:12,ls:'0.03em'});
+t('Move · Attack · Guard · Hold · Waypoint',316,604,{color:C.dim,size:10,ls:'0.03em'});
+
+// command grid, 2×7
+for(let r=0;r<2;r++) for(let c2=0;c2<7;c2++){
+  const x=440+c2*58, y=456+r*58;
+  const labels=['⌂','⛊','⚒','◆','◇','⌗','⌘','⌞','⌈','⌋','⌇','⌏','⌌','⌍'];
+  const i=r*7+c2;
+  const o={label:labels[i]};
+  if(i===0) o.hover=true;
+  if([4,5,8,9,10,12,13].includes(i)) o.disabled=true;
+  button(x,y,54,54,o);
+}
+// queue column
+inset(856,456,90,124);
+t('BUILD QUEUE',856+45,470,{color:C.gold,size:10,anchor:'middle',ls:'0.06em',bold:true});
+for(let i=0;i<3;i++){
+  svg.appendChild(el('polygon',{points:chamfer(862,482+i*30,78,26,4),fill:'rgba(3,5,13,0.8)',stroke:'rgba(56,102,189,0.35)','stroke-width':1}));
+  const done=i===0?0.7:(i===1?0.3:0);
+  if(done) svg.appendChild(el('polygon',{points:[[864,484+i*30],[864+74*done,484+i*30],[864+74*done,504+i*30],[864,504+i*30]],fill:'rgba(199,158,40,0.25)'}));
+  t(i===2?'—':(i===0?'Supply Depot':'MGLA'),868,498+i*30,{color:done?C.text:C.dim,size:9,ls:'0.04em'});
+}
+// system buttons row
+button(956,456,54,54,{label:'⚑'});
+button(1016,456,54,54,{label:'✉'});
+button(1076,456,54,54,{label:'☰',hover:true});
+divider(316,452,848);
+
+// ── radar ──────────────────────────────────────────────────────
+panel(28,440,258,215,16);
+t('RADAR',44,460,{color:C.gold,size:11,ls:'0.08em',bold:true});
+divider(44,468,226);
+inset(40,474,232,168);
+svg.appendChild(el('path',{d:'M60 520 L120 470 L180 520 L240 470',stroke:'rgba(255,255,255,0.05)',fill:'none','stroke-width':1}));
+const blips=[[70,560,C.green],[110,590,C.green],[160,510,C.red],[200,600,'#5c9efe'],[120,470,C.dim]];
+blips.forEach(([bx,by,col])=>{ svg.appendChild(el('circle',{cx:bx,cy:by,r:3.5,fill:col})); });
+svg.appendChild(el('polygon',{points:'40,474 272,474 272,642 248,642 40,642 40,480',fill:'none',stroke:'rgba(56,102,189,0.35)','stroke-width':1}));
+t('⌖ 23:41',44,653,{color:C.dim,size:9,ls:'0.04em'});
+
+// ── resources (top right) ──────────────────────────────────────
+panel(962,28,210,130,16);
+t('RESOURCES',978,48,{color:C.gold,size:11,ls:'0.08em',bold:true});
+divider(978,56,178);
+t('CREDITS',978,76,{color:C.dim,size:10,ls:'0.05em'});
+t('$12,400',1160,76,{color:C.gold,size:15,bold:true,anchor:'end',ls:'0.04em'});
+t('POWER',978,100,{color:C.dim,size:10,ls:'0.05em'});
+t('+2,400',1160,100,{color:'#5c9efe',size:13,bold:true,anchor:'end',ls:'0.04em'});
+inset(978,108,178,10);
+svg.appendChild(el('polygon',{points:[[980,110],[1110,110],[1110,116],[980,116]],fill:'rgba(92,158,254,0.7)'}));
+t('SUPPLY 4 / 8',978,138,{color:C.dim,size:10,ls:'0.05em'});
+
+// ── general (top left) ─────────────────────────────────────────
+panel(28,28,220,130,16);
+t('GENERAL',44,48,{color:C.gold,size:11,ls:'0.08em',bold:true});
+divider(44,56,190);
+svg.appendChild(el('polygon',{points:chamfer(44,64,22,22,4),fill:'rgba(3,5,13,0.8)',stroke:'rgba(56,102,189,0.4)','stroke-width':1}));
+t('2',55,79,{color:C.gold,size:12,bold:true,anchor:'middle'});
+t('2 points left',76,79,{color:C.text,size:12,ls:'0.03em'});
+for(let i=0;i<6;i++){
+  const earned=i<3;
+  svg.appendChild(el('polygon',{points:chamfer(44+i*30,88,26,26,4),fill:earned?'rgba(199,158,40,0.14)':'rgba(10,15,25,0.8)',stroke:earned?'rgba(199,158,40,0.5)':'rgba(56,102,189,0.3)','stroke-width':1}));
+  t('★',57+i*30,105,{color:earned?C.gold:'rgba(120,135,168,0.5)',size:12,anchor:'middle'});
+}
+button(44,120,190,32,{label:'OPEN GENERAL',primary:true});
+
+// ── tooltip near the cursor (the mouseover hint as a panel) ───
+panel(690,240,220,84,10);
+t('Avatar Stalwart',704,262,{color:C.gold,size:12,bold:true,ls:'0.04em'});
+divider(704,270,192);
+t('Veterancy level 2 · 90% health',704,288,{color:C.dim,size:11});
+t('Level-up bonus: +25% experience',704,304,{color:C.dim,size:11});
+
+// ── in-world: selection ring, group number, health bar ─────────
+svg.appendChild(el('circle',{cx:640,cy:320,r:40,fill:'none',stroke:'rgba(92,158,254,0.6)','stroke-width':1.5}));
+svg.appendChild(el('polygon',{points:chamfer(610,362,60,8,3),fill:'rgba(0,0,0,0.7)',stroke:'rgba(56,102,189,0.5)','stroke-width':1}));
+svg.appendChild(el('polygon',{points:[[611,363],[665,363],[665,369],[611,369]],fill:C.green}));
+t('1',594,368,{color:C.gold,size:11,bold:true});
+svg.appendChild(el('polygon',{points:chamfer(642,362,44,44,5),fill:'rgba(3,5,13,0.8)',stroke:'rgba(56,102,189,0.4)','stroke-width':1}));
+t('F',664,388,{color:C.gold,size:12,bold:true,anchor:'middle'});
+t('+$600',520,240,{color:'rgba(219,229,255,0.7)',size:15,bold:true});
+
+// ── adviser line over the world (kept plain) ───────────────────
+t('"The enemy has moved into the valley."',40,340,{color:'rgba(219,229,255,0.75)',size:13,ls:'0.02em'});
+
+// caption labels
+const caps=[[300,712,'control bar as a panel'],[28,712,'radar as a panel'],[962,210,'resources as a panel'],[28,210,'general as a panel'],[690,356,'mouseover hint as a panel']];
+caps.forEach(([cx,cy,txt])=>t(txt,cx,cy,{color:'#7887a8',size:11}));
+</script>
+</body>
+</html>

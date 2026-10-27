@@ -157,7 +157,11 @@ void FGenObject::StartDirectMove(const FVector3f& InGoal)
 		Logic->GetPathfinder().UpdateUnitGoal(ID, Path[0], Template->GetBoundingCircleRadius());
 	}
 	bMoving = true;
+	bDirectMove = true;
 	StuckFrames = 0;
+	WaitFrames = 0;
+	ProgressPos = FVector2f(Position.X, Position.Y);
+	ProgressAngle = Orientation;
 	BlockedFrames = 0;
 	bBlocked = false;
 	bBlockedAndStuck = false;
@@ -247,7 +251,11 @@ bool FGenObject::StartPath(const FVector3f& InGoal, bool bAroundUnits, const TFu
 		PF.UpdateUnitGoal(ID, End, Footprint, EndLayer); // (a point on the way is nobody's to keep)
 	}
 	bMoving = true;
+	bDirectMove = false;
 	StuckFrames = 0;
+	WaitFrames = 0;
+	ProgressPos = From;
+	ProgressAngle = Orientation;
 	BlockedFrames = 0;
 	bBlocked = false;
 	bBlockedAndStuck = false;
@@ -290,12 +298,17 @@ bool FGenObject::DoPendingPath()
 	{
 	case FPendingPath::Plain:
 	{
-		const uint32 KeepStuckFrames = StuckFrames, KeepBlockedFrames = BlockedFrames;
+		const uint32 KeepStuckFrames = StuckFrames, KeepWaitFrames = WaitFrames, KeepBlockedFrames = BlockedFrames;
+		const FVector2f KeepProgressPos = ProgressPos;
+		const float KeepProgressAngle = ProgressAngle;
 		bStarted = StartPath(Request.Goal, Request.bAroundUnits, nullptr, Request.bIntoUnit, Request.bWaypoint);
 		if (bStarted && Request.bAroundUnits)
 		{
 			// (As UpdateAI does for the way round a parked unit when it gets it at once.)
 			StuckFrames = KeepStuckFrames;
+			WaitFrames = KeepWaitFrames;
+			ProgressPos = KeepProgressPos;
+			ProgressAngle = KeepProgressAngle;
 			BlockedFrames = KeepBlockedFrames;
 			bSidestepPath = true;
 		}
@@ -314,6 +327,11 @@ bool FGenObject::DoPendingPath()
 		bMoving = Path.Num() > 0;
 		MoveToFreeGround();
 		bStarted = bMoving;
+		break;
+	case FPendingPath::MakeWay:
+		// (Making way failed: on with the way it was on, if it had one.)
+		bMoving = Path.Num() > 0;
+		bStarted = StartMakeWay(Request.Target, Request.Along, Request.bResume, Request.ResumeGoal) || bMoving;
 		break;
 	default:
 		break;
@@ -838,8 +856,11 @@ void FGenObject::UpdateAI(uint32 Frame)
 	const bool bStuck = bBlockedAndStuck;
 	bBlockedAndStuck = false;
 
+	SteerBlocker = GenInvalidObjectID;
 	if (!bMoving || Path.Num() == 0)
 	{
+		SteerSide = 0;
+		SteerHold = 0;
 		if (bFlies)
 		{
 			MaintainPosition(Frame); // hovering takes work even when going nowhere
@@ -854,12 +875,19 @@ void FGenObject::UpdateAI(uint32 Frame)
 	{
 		NextBlockedRepathFrame = Frame + FPS;
 		const FVector3f Dest = RequestedGoal;
-		const uint32 KeepStuckFrames = StuckFrames, KeepBlockedFrames = BlockedFrames;
+		const uint32 KeepStuckFrames = StuckFrames, KeepWaitFrames = WaitFrames, KeepBlockedFrames = BlockedFrames;
+		const FVector2f KeepProgressPos = ProgressPos;
+		const float KeepProgressAngle = ProgressAngle;
+		UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [steer f%u] #%u %s paths round parked units (%s, blocked %u)"), Frame, ID, *Template->Name,
+			bStuck ? TEXT("held up by a parked unit") : TEXT("held up too long"), BlockedFrames);
 		if (StartPath(Dest, true, nullptr, false, bWaypointLeg))
 		{
-			// Re-pathing is not progress, and we are still being held up: keep both counters running
+			// Re-pathing is not progress, and we are still being held up: keep the counters running
 			// (after a second of this, units that merely cross each other are let through).
 			StuckFrames = KeepStuckFrames;
+			WaitFrames = KeepWaitFrames;
+			ProgressPos = KeepProgressPos;
+			ProgressAngle = KeepProgressAngle;
 			BlockedFrames = KeepBlockedFrames;
 			bSidestepPath = true;
 		}
@@ -868,8 +896,13 @@ void FGenObject::UpdateAI(uint32 Frame)
 
 	// Advance through intermediate waypoints once we're close (the original projects ahead on the path).
 	// The first waypoint of a path around a parked unit is the sidestep itself: really go there.
+	// (A unit that steered round somebody may pass a point wide of it: once past it, with the next one in
+	// plain sight, it doesn't turn back for it.)
 	while (PathIndex < Path.Num() - 1
-		&& FVector2f::Distance(Pos2, Path[PathIndex]) < CellSize * ((bSidestepPath && PathIndex == 0) ? 0.5f : 1.5f))
+		&& (FVector2f::Distance(Pos2, Path[PathIndex]) < CellSize * ((bSidestepPath && PathIndex == 0) ? 0.5f : 1.5f)
+			|| (!(bSidestepPath && PathIndex == 0) && FVector2f::DistSquared(Pos2, Path[PathIndex]) < Sqr(5.f * CellSize)
+				&& FVector2f::DotProduct(Pos2 - Path[PathIndex], Path[PathIndex + 1] - Path[PathIndex]) > 0.f
+				&& Logic->GetPathfinder().IsLineClear(Pos2, Path[PathIndex + 1], GetPathSurfaces(), Layer))))
 	{
 		++PathIndex;
 	}
@@ -923,28 +956,70 @@ void FGenObject::UpdateAI(uint32 Frame)
 		return;
 	}
 
-	const FVector3f TargetPos(Target.X, Target.Y, Logic->GetGroundHeight(Target.X, Target.Y));
-	float DesiredSpeed = BlockedFrames > 0 ? FMath::Min(Locomotor->Speed, MaxBlockedSpeed) : Locomotor->Speed;
+	FVector3f TargetPos(Target.X, Target.Y, Logic->GetGroundHeight(Target.X, Target.Y));
+	// doLocomotor: blocked, we go no faster than the unit ahead lets us - and, the locomotor's *blocked,
+	// stop and turn on the spot if that is slower than we are going.
+	const bool bCapped = BlockedFrames > 0 && MaxBlockedSpeed < Locomotor->Speed;
+	float DesiredSpeed = bCapped ? MaxBlockedSpeed : Locomotor->Speed;
 	if (FormationID != 0 && FormationSpeed > 0.f && TargetID == GenInvalidObjectID)
 	{
 		// AIMoveToState / AIFollowPathState::onEnter: a formation moves at its group's speed (its slowest member's).
 		DesiredSpeed = FMath::Min(DesiredSpeed, FormationSpeed);
 	}
-	// (doLocomotor: "onPathDistToGoal + getPathExtraDistance()" - no slowing down for a point on the way.)
-	LocoMoveTowardsPosition(TargetPos, DistToGoal + PathExtraDistance, DesiredSpeed, Frame);
-
-	// Give up if we haven't made progress for a long time. Waiting behind another unit is normal, so a
-	// blocked unit is given much longer (it keeps trying to path around in the meantime).
-	if (Velocity.SizeSquared() < Sqr(0.01f))
+	bool bWait = bCapped;
+	// Steering (beyond the original): the way round whoever is near, or the pace to keep behind them. Not on
+	// the last cell of the move - that ground is ours ("If we are about to arrive, don't get stuck").
+	const float DistToTarget = FVector2f::Distance(Pos2, Target);
+	if (UsesSteering() && !bPlane && !(PathIndex == Path.Num() - 1 && DistToTarget < CellSize))
 	{
-		if (++StuckFrames > FPS * (BlockedFrames > 0 ? 12u : 4u))
+		const FSteerChoice Choice = Steer(Target, DistToTarget, DistToGoal + PathExtraDistance, DesiredSpeed, Frame);
+		if (Choice.bSteered)
 		{
-			CommandStop();
+			// Aim a little way out along the chosen way (no further than the path goes, or the locomotor brakes).
+			const float Ahead = FMath::Min(FMath::Clamp(DistToTarget, 2.f * CellSize, 4.f * CellSize), FMath::Max(DistToGoal + PathExtraDistance, 1.f));
+			const FVector2f Aim = Pos2 + Choice.Dir * Ahead;
+			TargetPos = FVector3f(Aim.X, Aim.Y, Logic->GetGroundHeight(Aim.X, Aim.Y));
+			DesiredSpeed = FMath::Min(DesiredSpeed, Choice.Speed);
 		}
+		bWait = Choice.bWait;
+		if (bWait)
+		{
+			bBlocked = true;
+		}
+	}
+	// (doLocomotor: "onPathDistToGoal + getPathExtraDistance()" - no slowing down for a point on the way.)
+	LocoMoveTowardsPosition(TargetPos, DistToGoal + PathExtraDistance, DesiredSpeed, Frame, bWait);
+	// (-GenSteerTrace=<id>: what that one unit's locomotor made of it, every frame.)
+	static const uint32 SteerTraceID = []() { uint32 V = 0; FParse::Value(FCommandLine::Get(), TEXT("GenSteerTrace="), V); return V; }();
+	UE_CLOG(SteerTraceID == ID, LogGenerals, Log, TEXT("  [steertrace f%u] #%u move: aim (%.1f, %.1f) speed %.3f wait %d dist %.1f -> pos (%.2f, %.2f) ang %.3f vel %.3f accel %.4f turning %d braking %d/%d"),
+		Frame, ID, TargetPos.X, TargetPos.Y, DesiredSpeed, bWait ? 1 : 0, DistToGoal + PathExtraDistance, Position.X, Position.Y, Orientation,
+		FVector2f(Velocity.X, Velocity.Y).Size(), FVector2f(Accel.X, Accel.Y).Size(), int32(Turning), bStatusBraking ? 1 : 0, bLocoBraking ? 1 : 0);
+
+	// Give up when the move gets nowhere for a long time: 6 seconds with nothing in the way (caught on the
+	// ground), 20 waiting on other units. (Not in the original. What counts is ground covered - a braking unit
+	// slides with no speed of its own - or turning round, and time spent waiting is not held against a unit
+	// once it is free.)
+	if (FVector2f::DistSquared(FVector2f(Position.X, Position.Y), ProgressPos) > Sqr(0.5f * CellSize)
+		|| FMath::Abs(GenLogic::AngleDiff(Orientation, ProgressAngle)) > 0.5f)
+	{
+		ProgressPos = FVector2f(Position.X, Position.Y);
+		ProgressAngle = Orientation;
+		StuckFrames = 0;
+		WaitFrames = 0;
+	}
+	else if (bWait || BlockedFrames > 0)
+	{
+		++WaitFrames;
 	}
 	else
 	{
-		StuckFrames = 0;
+		++StuckFrames;
+	}
+	if (StuckFrames > 6 * FPS || WaitFrames > 20 * FPS)
+	{
+		UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [steer f%u] #%u p%d %s gives up its move at (%.0f, %.0f): %s"), Frame, ID, Owner, *Template->Name,
+			Position.X, Position.Y, StuckFrames > 6 * FPS ? TEXT("caught on the ground") : TEXT("waited 20 s on other units"));
+		CommandStop();
 	}
 }
 
@@ -961,11 +1036,40 @@ float FGenObject::GetForwardSpeed2D() const
 	return Velocity.X * Dir.X + Velocity.Y * Dir.Y;
 }
 
-void FGenObject::LocoMoveTowardsPosition(const FVector3f& GoalPos, float OnPathDistToGoal, float DesiredSpeed, uint32 Frame)
+void FGenObject::LocoMoveTowardsPosition(const FVector3f& GoalPos, float OnPathDistToGoal, float DesiredSpeed, uint32 Frame, bool bHeldUp)
 {
 	const float MaxSpeed = Locomotor->Speed;
 	DesiredSpeed = FMath::Min(DesiredSpeed, MaxSpeed);
 	bMaintainPosValid = false;
+	PrevTurning = Turning;
+
+	// Locomotor::locoUpdate_moveTowardsPosition with *blocked: held up by another unit and going faster than
+	// we may, "stop if we are about to run into the blocking object" and turn on the spot towards the way on -
+	// whatever the locomotor, so a wheeled vehicle too can turn out from behind what blocks it. (Not into
+	// somebody else, though: beyond the original, a steered unit whose turn would swing it into a unit waits.)
+	const FVector2f Vel2D(Velocity.X, Velocity.Y);
+	if (bHeldUp && DesiredSpeed <= Vel2D.Size() && !(bFlies && IsAirborneTarget()))
+	{
+		ApplyMotiveForce(FVector3f::ZeroVector, Frame);
+		const float Speed2D = Vel2D.Size();
+		if (Speed2D > DesiredSpeed && Speed2D > 0.f)
+		{
+			// PhysicsBehavior::scrubVelocity2D
+			Velocity.X *= DesiredSpeed / Speed2D;
+			Velocity.Y *= DesiredSpeed / Speed2D;
+		}
+		Turning = 0;
+		const float Rel = GenLogic::AngleDiff(FMath::Atan2(GoalPos.Y - Position.Y, GoalPos.X - Position.X), Orientation);
+		if (FMath::Abs(Rel) > 0.001f && (!UsesSteering() || IsPivotClear(Orientation + FMath::Clamp(Rel, -Locomotor->TurnRate, Locomotor->TurnRate))))
+		{
+			Turning = int8(RotateAroundLocoPivot(GoalPos, Locomotor->TurnRate));
+		}
+		if (bFlies)
+		{
+			HandleBehaviorZ(Frame);
+		}
+		return;
+	}
 
 	const float DistToStopAtMaxSpeed = (MaxSpeed / GetBraking()) * MaxSpeed / 2.f;
 	if (OnPathDistToGoal > CellSize && OnPathDistToGoal > DistToStopAtMaxSpeed)
@@ -1042,7 +1146,7 @@ int32 FGenObject::RotateAroundLocoPivot(const FVector3f& GoalPos, float MaxTurnR
 		{
 			return TurnNone;
 		}
-		float Amount = GenLogic::AngleDiff(FMath::Atan2(DY, DX), Orientation);
+		float Amount = KeepTurningWay(GenLogic::AngleDiff(FMath::Atan2(DY, DX), Orientation));
 		if (OutRelAngle) { *OutRelAngle = Amount; }
 		if (Amount > MaxTurnRate) { Amount = MaxTurnRate; Turn = TurnPositive; }
 		else if (Amount < -MaxTurnRate) { Amount = -MaxTurnRate; Turn = TurnNegative; }
@@ -1056,13 +1160,24 @@ int32 FGenObject::RotateAroundLocoPivot(const FVector3f& GoalPos, float MaxTurnR
 	else
 	{
 		const float DesiredAngle = FMath::Atan2(GoalPos.Y - Position.Y, GoalPos.X - Position.X);
-		float Amount = GenLogic::AngleDiff(DesiredAngle, Orientation);
+		float Amount = KeepTurningWay(GenLogic::AngleDiff(DesiredAngle, Orientation));
 		if (OutRelAngle) { *OutRelAngle = Amount; }
 		if (Amount > MaxTurnRate) { Amount = MaxTurnRate; Turn = TurnPositive; }
 		else if (Amount < -MaxTurnRate) { Amount = -MaxTurnRate; Turn = TurnNegative; }
 		SetOrientation(Orientation + Amount);
 	}
 	return Turn;
+}
+
+float FGenObject::KeepTurningWay(float Amount) const
+{
+	// Beyond the original: with the goal almost straight behind, the turn under way goes on round the way it
+	// was going (hardly further) instead of changing its mind every frame as the goal shifts across the back.
+	if (PrevTurning != 0 && FMath::Abs(Amount) > 0.85f * PI && (Amount > 0.f ? 1 : -1) != PrevTurning)
+	{
+		return Amount > 0.f ? Amount - 2.f * PI : Amount + 2.f * PI;
+	}
+	return Amount;
 }
 
 void FGenObject::ApplyGoalSpeed(float GoalSpeed, float ActualSpeed, float MaxAccel, float InBrakingFactor, bool bBackwards)

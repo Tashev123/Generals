@@ -1065,6 +1065,7 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 		if (E.Key.Equals(TEXT("KindOf"), ESearchCase::IgnoreCase))
 		{
 			for (const FString& V : E.Values) { T->KindOf.Add(V.ToUpper()); }
+			T->bKindInfantry = T->KindOf.Contains(TEXT("INFANTRY"));
 		}
 		else if (E.Key.Equals(TEXT("Side"), ESearchCase::IgnoreCase)) { T->Side = E.Value(0); }
 		else if (E.Key.Equals(TEXT("EditorSorting"), ESearchCase::IgnoreCase)) { T->EditorSorting = E.Value(0); }
@@ -1309,6 +1310,7 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				M.AirOCL = E.Block->GetString(TEXT("AirCreationList"));
 				if (const FGenIniEntry* DT = E.Block->Find(TEXT("DeathTypes"))) { M.DeathTypes = DT->Values; }
 				if (const FGenIniEntry* VL = E.Block->Find(TEXT("VeterancyLevels"))) { M.VeterancyMask = ParseVeterancyMask(VL->Values); }
+				if (const FGenIniEntry* ES = E.Block->Find(TEXT("ExemptStatus"))) { M.ExemptStatus = ES->Values; }
 			}
 			else if (Type.Equals(TEXT("VeterancyCrateCollide"), ESearchCase::IgnoreCase))
 			{
@@ -2118,6 +2120,7 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				{
 					if (DE.Key.Equals(TEXT("DeathTypes"), ESearchCase::IgnoreCase)) { M.DeathTypes = DE.Values; }
 					else if (DE.Key.Equals(TEXT("VeterancyLevels"), ESearchCase::IgnoreCase)) { M.VeterancyMask = ParseVeterancyMask(DE.Values); }
+					else if (DE.Key.Equals(TEXT("ExemptStatus"), ESearchCase::IgnoreCase)) { M.ExemptStatus = DE.Values; }
 					else if (DE.Key.Equals(TEXT("DeathFX"), ESearchCase::IgnoreCase) || DE.Key.Equals(TEXT("FX"), ESearchCase::IgnoreCase)) { M.FX.Append(DE.Values); }
 					else if (DE.Key.Equals(TEXT("CreationList"), ESearchCase::IgnoreCase) || DE.Key.Equals(TEXT("OCL"), ESearchCase::IgnoreCase)) { M.OCL.Append(DE.Values); }
 					else if (DE.Key.Equals(TEXT("TransferPreviousHealth"), ESearchCase::IgnoreCase)) { M.bTransferPreviousHealth = DE.AsBool(); }
@@ -2131,6 +2134,7 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				{
 					if (DE.Key.Equals(TEXT("DeathTypes"), ESearchCase::IgnoreCase)) { M.DeathTypes = DE.Values; }
 					else if (DE.Key.Equals(TEXT("VeterancyLevels"), ESearchCase::IgnoreCase)) { M.VeterancyMask = ParseVeterancyMask(DE.Values); }
+					else if (DE.Key.Equals(TEXT("ExemptStatus"), ESearchCase::IgnoreCase)) { M.ExemptStatus = DE.Values; }
 					else if (DE.Key.Equals(TEXT("CrateData"), ESearchCase::IgnoreCase)) { M.CrateData.Append(DE.Values); }
 				}
 			}
@@ -2242,6 +2246,7 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				D.SinkRate = GenLogic::VelocityPerFrame(E.Block->GetFloat(TEXT("SinkRate"), 0.f));
 				D.ProbabilityModifier = E.Block->GetInt(TEXT("ProbabilityModifier"), 10);
 				if (const FGenIniEntry* DT = E.Block->Find(TEXT("DeathTypes"))) { D.DeathTypes = DT->Values; }
+				if (const FGenIniEntry* ES = E.Block->Find(TEXT("ExemptStatus"))) { D.ExemptStatus = ES->Values; }
 				for (const FGenIniEntry& DE : E.Block->Entries)
 				{
 					// "FX = FINAL FX_Name" / "OCL = INITIAL OCL_Name"
@@ -2267,6 +2272,7 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				M.Type = EGenDieModule::Destroy;
 				if (const FGenIniEntry* DT = E.Block->Find(TEXT("DeathTypes"))) { M.DeathTypes = DT->Values; }
 				if (const FGenIniEntry* VL = E.Block->Find(TEXT("VeterancyLevels"))) { M.VeterancyMask = ParseVeterancyMask(VL->Values); }
+				if (const FGenIniEntry* ES = E.Block->Find(TEXT("ExemptStatus"))) { M.ExemptStatus = ES->Values; }
 			}
 			else if (Type.Equals(TEXT("DumbProjectileBehavior"), ESearchCase::IgnoreCase))
 			{

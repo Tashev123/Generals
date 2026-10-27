@@ -147,6 +147,11 @@ void AGenPlayerController::PlayerTick(float DeltaTime)
 	{
 		GM->ToggleQuitMenu();
 	}
+	// The pause hotkey on its own, with no menu up (while the menu is up it is already standing still).
+	if (GM && !GM->IsShellActive() && !(GenHUD && GenHUD->IsOptionsOpen()) && FGenInput::Get().JustPressed(this, EGenAction::Pause))
+	{
+		GM->TogglePause();
+	}
 	if (GM && GM->IsShellActive())
 	{
 		bLeftDown = bBoxSelecting = bRightDown = bRightScrolling = bMiddleDragging = false;

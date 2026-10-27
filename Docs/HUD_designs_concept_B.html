@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>HUD Design B — Edge HUD (frameless, minimal, translucent)</title>
+<style>
+  body { margin:0; background:#1a1f2e; font-family:'Segoe UI',system-ui,sans-serif; display:flex; flex-direction:column; align-items:center; min-height:100vh; padding:24px; color:#dce3f0; }
+  h1 { font-size:18px; font-weight:600; color:#5b9bf0; margin:0 0 4px; letter-spacing:1px; }
+  .desc { font-size:13px; color:#7a8a9e; margin-bottom:20px; text-align:center; max-width:700px; }
+  .mockup { width:1200px; height:675px; position:relative; background:#1e2436; border-radius:12px; overflow:hidden; box-shadow:0 4px 24px rgba(0,0,0,.5); border:1px solid #2a3444; }
+  .world { position:absolute; inset:0; background:radial-gradient(ellipse at 40% 50%, #2a3830 0%, #1e2822 50%, #141d16 100%); }
+  .world::after { content:'(game view — terrain, units)'; position:absolute; top:35%; left:50%; transform:translate(-50%,-50%); font-size:14px; color:rgba(255,255,255,.15); }
+
+  /* B — frameless translucent glass panels, no borders, subtle glow edges */
+  .glass { background:rgba(14,22,40,.72); backdrop-filter:blur(6px); border-radius:6px; padding:10px 14px; box-shadow:inset 0 0 0 1px rgba(80,140,220,.15), 0 2px 12px rgba(0,0,0,.3); }
+
+  /* command bar as a glass strip at bottom */
+  .bar { position:absolute; bottom:12px; left:50%; transform:translateX(-50%); width:640px; display:flex; align-items:center; gap:10px; padding:10px 14px; }
+  .bar .grid { display:grid; grid-template-columns:repeat(7,40px); grid-template-rows:repeat(2,40px); gap:4px; }
+  .btn { width:40px; height:40px; background:rgba(20,35,60,.6); border-radius:4px; display:flex; align-items:center; justify-content:center; font-size:14px; color:rgba(160,200,255,.8); }
+  .btn.hot { background:rgba(40,70,130,.7); color:#5b9bf0; box-shadow:inset 0 0 0 1px rgba(90,160,240,.3); }
+  .btn.disabled { opacity:.3; }
+
+  /* unit info integrated left of bar */
+  .unit-info { display:flex; align-items:center; gap:8px; }
+  .unit-info .mini { width:36px; height:36px; border-radius:4px; background:rgba(20,35,60,.6); display:flex; align-items:center; justify-content:center; font-size:18px; color:rgba(160,200,255,.7); }
+  .unit-info .meta { font-size:10px; color:rgba(160,180,200,.6); line-height:1.4; }
+  .unit-info .meta strong { color:#dce3f0; }
+
+  /* radar as a rounded rect glass */
+  .radar { position:absolute; bottom:12px; left:12px; width:190px; height:190px; padding:8px; }
+  .radar-face { width:174px; height:174px; background:rgba(10,16,28,.8); border-radius:4px; position:relative; overflow:hidden; }
+  .radar-face::before { content:''; position:absolute; inset:0; background:
+    radial-gradient(circle at 30% 40%, #2a3a30 15%, transparent 15%),
+    radial-gradient(circle at 60% 70%, #303530 10%, transparent 10%),
+    radial-gradient(circle at 50% 30%, #353a35 12%, transparent 12%); }
+  .blip { position:absolute; width:5px; height:5px; border-radius:50%; }
+  .blip.own { background:#4d9f3a; }
+  .blip.enemy { background:#c43025; }
+  .blip.ally { background:#5b9bf0; }
+
+  /* top-right resource ticker */
+  .ticker { position:absolute; top:12px; right:12px; display:flex; gap:14px; padding:8px 16px; }
+  .ticker .item { text-align:center; }
+  .ticker .item .v { font-size:15px; font-weight:600; color:rgba(220,230,240,.85); }
+  .ticker .item .l { font-size:9px; color:rgba(140,160,180,.5); margin-top:2px; }
+
+  /* bottom-left selection hint */
+  .sel-hint { position:absolute; bottom:120px; left:12px; padding:6px 12px; font-size:10px; color:rgba(140,160,180,.6); }
+  .sel-hint strong { color:rgba(200,210,225,.8); }
+
+  /* promotions as tiny dots top-left */
+  .stars { position:absolute; top:12px; left:12px; display:flex; gap:4px; padding:8px 14px; }
+  .star { width:12px; height:12px; border-radius:2px; background:rgba(30,50,80,.4); }
+  .star.earned { background:rgba(200,160,40,.6); box-shadow:0 0 6px rgba(200,160,40,.3); }
+
+  .label { position:absolute; font-size:10px; color:#5b9bf0; font-weight:600; padding:2px 6px; background:rgba(20,40,80,.5); border-radius:3px; }
+  .label.lb { bottom:210px; left:16px; }
+  .label.lc { top:60px; right:16px; }
+  .label.la { bottom:130px; left:45%; }
+  .label.ld { top:60px; left:16px; }
+</style>
+</head>
+<body>
+<h1>Concept B — Edge HUD (frameless, translucent, minimal)</h1>
+<p class="desc">No panel borders, no cut corners. Everything is translucent glass floating over the world: a thin bottom strip for the command bar, a small rounded radar at bottom-left, a top-right resource ticker, minimal unit info inline with the bar. Less visual weight, more game view. Think modern RTS (StarCraft II, Age of Wonders) — the HUD whispers.</p>
+<div class="mockup">
+  <div class="world"></div>
+
+  <!-- command strip -->
+  <div class="glass bar">
+    <div class="unit-info">
+      <div class="mini">▣</div>
+      <div class="meta"><strong>3× Avatar</strong><br>HP 70% · Ready</div>
+    </div>
+    <div class="grid">
+      <div class="btn hot">⚔</div>
+      <div class="btn">🛡</div>
+      <div class="btn">⚙</div>
+      <div class="btn">▲</div>
+      <div class="btn disabled">·</div>
+      <div class="btn">◆</div>
+      <div class="btn disabled">·</div>
+      <div class="btn">◆</div>
+      <div class="btn disabled">·</div>
+      <div class="btn disabled">·</div>
+      <div class="btn">◆</div>
+      <div class="btn disabled">·</div>
+      <div class="btn disabled">·</div>
+      <div class="btn">◆</div>
+    </div>
+  </div>
+
+  <!-- radar -->
+  <div class="glass radar">
+    <div class="radar-face">
+      <div class="blip own" style="top:40%;left:35%"></div>
+      <div class="blip own" style="top:55%;left:50%"></div>
+      <div class="blip enemy" style="top:20%;left:65%"></div>
+      <div class="blip ally" style="top:70%;left:30%"></div>
+    </div>
+  </div>
+
+  <!-- resource ticker -->
+  <div class="glass ticker">
+    <div class="item"><div class="v">$12,400</div><div class="l">CREDITS</div></div>
+    <div class="item"><div class="v">+2.4k</div><div class="l">POWER</div></div>
+    <div class="item"><div class="v">4/8</div><div class="l">SUPPLY</div></div>
+  </div>
+
+  <!-- selection hint -->
+  <div class="glass sel-hint">Selected: <strong>3 Avatar Battalion</strong> · Group 1</div>
+
+  <!-- stars -->
+  <div class="glass stars">
+    <div class="star earned"></div><div class="star earned"></div><div class="star earned"></div>
+    <div class="star"></div><div class="star"></div><div class="star"></div>
+  </div>
+
+  <span class="label la">B1: Glass command strip</span>
+  <span class="label lb">B2: Translucent radar</span>
+  <span class="label lc">B3: Resource ticker</span>
+  <span class="label ld">B4: Minimal promotion dots</span>
+</div>
+</body>
+</html>

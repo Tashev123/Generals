@@ -29,6 +29,7 @@ enum class EGenAction : uint8
 	ScrollDown,
 	CameraReset,
 	JumpToEvent,
+	Pause,
 	Menu,
 	Count
 };

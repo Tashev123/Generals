@@ -98,6 +98,7 @@ const TArray<FGenActionInfo>& FGenInput::GetActions()
 		{ EGenAction::ScrollDown,        TEXT("ScrollDown"),        TEXT("Scroll down"),                  TEXT("Camera"),    FGenKeyChord(EKeys::Down) },
 		{ EGenAction::CameraReset,       TEXT("CameraReset"),       TEXT("Reset the camera"),             TEXT("Camera"),    FGenKeyChord(EKeys::Home) },
 		{ EGenAction::JumpToEvent,       TEXT("JumpToEvent"),       TEXT("Jump to the last radar event"), TEXT("Camera"),    FGenKeyChord(EKeys::SpaceBar) },
+		{ EGenAction::Pause,             TEXT("Pause"),             TEXT("Pause the game"),                   TEXT("Interface"), FGenKeyChord(EKeys::F1) },
 		{ EGenAction::Menu,              TEXT("Menu"),              TEXT("Game menu (also Esc)"),         TEXT("Interface"), FGenKeyChord(EKeys::F10) },
 	};
 	check(Actions.Num() == int32(EGenAction::Count));

@@ -440,15 +440,18 @@ public:
 	 */
 	struct FPendingPath
 	{
-		enum EKind : uint8 { None, Plain, Approach, ApproachPos, FreeGround };
+		enum EKind : uint8 { None, Plain, Approach, ApproachPos, FreeGround, MakeWay };
 		EKind Kind = None;
 		FVector3f Goal = FVector3f::ZeroVector;
 		bool bAroundUnits = false;
 		bool bIntoUnit = false;
 		bool bWaypoint = false;
-		FGenObjectID Target = GenInvalidObjectID;   // Approach: whom, and to within what range (ApproachPos: the spot is Goal)
+		FGenObjectID Target = GenInvalidObjectID;   // Approach: whom, and to within what range (ApproachPos: the spot is Goal; MakeWay: for whom)
 		float Range = 0.f;
 		float MinRange = 0.f;                       // ... and no nearer than this
+		FVector2f Along = FVector2f::ZeroVector;    // MakeWay: the way the other unit goes
+		bool bResume = false;                       // ... and whether we go on to ResumeGoal afterwards
+		FVector3f ResumeGoal = FVector3f::ZeroVector;
 	};
 	bool IsWaitingForPath() const { return PendingPath.Kind != FPendingPath::None; }
 	/** Its turn in the queue. False: there was nothing (left) to work out. */
@@ -581,6 +584,8 @@ public:
 	};
 	/** OBJECT_STATUS_UNDER_CONSTRUCTION: placed, but a dozer still has to finish it. */
 	bool IsUnderConstruction() const { return bUnderConstruction; }
+	/** A state a die module can be exempt from (the data's ExemptStatus names these). */
+	bool IsHijacked() const { return bHijacked; }
 	float GetConstructionPercent() const { return ConstructionPercent; }
 	bool IsBeingSold() const { return SellFrame != 0; }
 	/** The construction percent as the drawing reads it (W3DModelDraw::adjustTransformMtx): below zero unless the
@@ -851,6 +856,8 @@ public:
 	bool IsWeaponOutOfAmmo(int32 Slot) const;
 	/** JetAIUpdate::doLandingCommand: fly to this airfield and park there (it becomes home). */
 	void CommandLandAt(FGenObjectID AirfieldId);
+	/** ChinookAIUpdate::privateGetRepaired: down on open ground beside that airfield, mended there until whole. */
+	void CommandChinookGetRepaired(const FGenObject& Airfield);
 	/** How far the model is lifted so it is never drawn lower than MinHeight above the ground (wheels on the tarmac). */
 	float GetDrawLift(const FVector3f& RenderPos) const;
 
@@ -1131,6 +1138,7 @@ private:
 	float PathExtraDistance = 0.f;     // AIUpdateInterface::m_pathExtraDistance: this much of the way lies beyond the path's end
 	bool bWaypointLeg = false;         // the path under way ends at a point on the way, not where the move ends
 	uint32 FormationID = 0;            // 0: none (NO_FORMATION_ID)
+	uint32 MoveGroup = 0;              // the move order it last went with others on (steering: group mates are eased past, not sent away)
 	FVector2f FormationOffset = FVector2f::ZeroVector;
 	float FormationSpeed = 0.f;        // the formation's speed (its slowest member's) while FormationID is set
 	uint32 NextAIModeFrame = 0;
@@ -1375,7 +1383,9 @@ private:
 	bool bHidden = false;
 	int32 GarrisonPoint = INDEX_NONE;  // the fire point this occupant shoots from
 	EGenChinookFlight ChinookFlight = EGenChinookFlight::Flying;
-	bool bHasExitRally = false;        // units: second leg of the way out of the factory (aiFollowExitProductionPath)
+	FGenObjectID ChinookHealAirfield = GenInvalidObjectID; // m_airfieldForHealing: where it was sent for repairs
+	void SetChinookHealAirfield(FGenObjectID Airfield);
+	bool bHasExitRally = false;       // units: second leg of the way out of the factory (aiFollowExitProductionPath)
 	FVector3f ExitRally = FVector3f::ZeroVector;
 	// --- free physics (PhysicsBehavior for objects without a locomotor: debris, hulks) ---
 	void UpdateFreePhysics(uint32 Frame);
@@ -1594,13 +1604,42 @@ private:
 	void TryCrush(FGenObject& Other);
 	void MoveAwayFromUnit(const FGenObject& Unit);
 	void MoveToFreeGround();
+	/** Separating-axis overlap of the two footprints: how far, and which way, this one has to go to be clear of Other. */
+	bool GeometryPenetration(const FGenObject& Other, FVector2f& OutPush) const;
+
+	// --- steering (GenSteering.cpp; beyond the original, the user's "move like in modern games") ---
+	struct FSteerChoice
+	{
+		FVector2f Dir = FVector2f::ZeroVector; // which way to drive
+		float Speed = 0.f;                     // ... no faster than this
+		bool bSteered = false;                 // something near changed the way or the pace
+		bool bWait = false;                    // no way on for now: stand, turning on the spot if that is free
+	};
+	/** Moves with local steering (a vehicle; infantry around vehicles) rather than the original's stop and wait. */
+	bool UsesSteering() const;
+	/** Whether Other is something our steering keeps clear of (not what we drive over, what we are going for, what steps aside for us). */
+	bool SteersAround(const FGenObject& Other) const;
+	/** The way and the pace for this frame, towards Toward (DistToWaypoint away; DistToGoal left of the whole move) at PreferredSpeed at the most. */
+	FSteerChoice Steer(const FVector2f& Toward, float DistToWaypoint, float DistToGoal, float PreferredSpeed, uint32 Frame);
+	/** Standing idle and free to move: may be asked to make way. */
+	bool CanMakeWay() const;
+	/** Not held to its place (a docking lane, a factory's door, packing up, building, an ability): the collision
+	 *  pass may push it over. */
+	bool CanBePushed() const;
+	/** Pathfinder::moveAllies / getMoveAwayFromPath: go to the nearest free spot off Mover's way (Along). */
+	void MakeWayFor(const FGenObject& Mover, const FVector2f& Along);
+	bool StartMakeWay(FGenObjectID Mover, const FVector2f& Along, bool bResume, const FVector3f& Resume);
+	/** Turning on the spot to NewOrientation runs into nobody. */
+	bool IsPivotClear(float NewOrientation) const;
 
 	// --- Locomotor (Locomotor.cpp) ---
-	void LocoMoveTowardsPosition(const FVector3f& Goal, float OnPathDistToGoal, float DesiredSpeed, uint32 Frame);
+	/** bHeldUp: held up by another unit - Locomotor's *blocked: "stop if we are about to run into the blocking object", turning on the spot. */
+	void LocoMoveTowardsPosition(const FVector3f& Goal, float OnPathDistToGoal, float DesiredSpeed, uint32 Frame, bool bHeldUp = false);
 	void MoveTreads(const FVector3f& Goal, float OnPathDistToGoal, float DesiredSpeed);
 	void MoveWheels(const FVector3f& Goal, float OnPathDistToGoal, float DesiredSpeed, uint32 Frame);
 	void MoveLegs(const FVector3f& Goal, float OnPathDistToGoal, float DesiredSpeed);
 	int32 RotateAroundLocoPivot(const FVector3f& Goal, float MaxTurnRate, float* OutRelAngle = nullptr);
+	float KeepTurningWay(float Amount) const;
 	void ApplyGoalSpeed(float GoalSpeed, float ActualSpeed, float MaxAccel, float BrakingFactor, bool bBackwards = false);
 	float GetBraking() const;
 
@@ -1655,6 +1694,7 @@ private:
 	bool bAllowBounce = false;       // ALLOW_BOUNCE
 	FVector3f PrevAccel = FVector3f::ZeroVector; // m_prevAccel
 	int8 Turning = 0;                // m_turning: TURN_NEGATIVE -1, TURN_NONE 0, TURN_POSITIVE 1
+	int8 PrevTurning = 0;            // ... last frame (a goal straight behind doesn't flip the turn)
 	FGenObjectID CurrentOverlap = GenInvalidObjectID;  // m_currentOverlap: what it is driving over (crushing) this step
 	FGenObjectID PreviousOverlap = GenInvalidObjectID;
 	// DrawableLocoInfo: the body's springs (pitch and roll towards the ground's, and the extra from speeding up,
@@ -1688,7 +1728,11 @@ private:
 	void UpdateLayer();
 	FVector3f Goal = FVector3f::ZeroVector;
 	FVector3f RequestedGoal = FVector3f::ZeroVector; // where the move order asked to go (re-paths aim here)
-	uint32 StuckFrames = 0;
+	uint32 StuckFrames = 0;            // frames without getting anywhere with nothing in the way
+	uint32 WaitFrames = 0;             // ... and spent waiting on other units, since ProgressPos
+	FVector2f ProgressPos = FVector2f::ZeroVector; // where the move last got somewhere
+	float ProgressAngle = 0.f;         // ... and which way it faced then (turning round is progress too)
+	bool bDirectMove = false;          // StartDirectMove: straight through whatever is there (docking lanes, factory doors) - while bMoving
 
 	// Unit collision
 	bool bBlocked = false;             // another unit is in the way (set by the collision pass, consumed next frame)
@@ -1704,6 +1748,11 @@ private:
 	FGenObjectID MoveOutOfWayOf = GenInvalidObjectID;
 	bool bHasResumeGoal = false;       // continue to ResumeGoal after stepping aside
 	FVector3f ResumeGoal = FVector3f::ZeroVector;
+	// Steering (GenSteering.cpp)
+	int8 SteerSide = 0;                // the side the last way round went (+1 left, -1 right, 0 none)
+	float SteerHeading = 0.f;          // ... and its heading (while SteerSide is set)
+	uint8 SteerHold = 0;               // frames of a clear way still to see before heading back to it
+	FGenObjectID SteerBlocker = GenInvalidObjectID; // the unit we are waiting on, while we wait
 
 	// Combat
 	FGenWeaponInstance Weapons[3];

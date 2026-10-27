@@ -15,6 +15,7 @@
 #include "Logic/GenSkirmishAI.h"
 #include "Map/GenMapData.h"
 #include "Core/GenPerf.h"
+#include "Misc/ScopeExit.h"
 #include "Generals1.h"
 
 namespace
@@ -620,6 +621,15 @@ void UGenGameLogic::GroupMoveToPosition(const TArray<FGenObjectID>& Units, const
 	{
 		return;
 	}
+	// (Steering: who went with whom - set once the orders are out, whichever way the group goes.)
+	const uint32 Group = ++LastMoveGroup;
+	ON_SCOPE_EXIT
+	{
+		for (FGenObject* O : Members)
+		{
+			O->MoveGroup = Group;
+		}
+	};
 	FVector3f Goal = InGoal;
 
 	// AIGroup::getMinMaxAndCenter. (As the original has it, the group is a formation if its first member is in one.)

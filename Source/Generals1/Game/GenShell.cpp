@@ -20,6 +20,7 @@
 //   Menu.Open, Menu.Resume, Menu.Options, Menu.Restart, Menu.Exit (to the score screen and the menu),
 //   Menu.Quit, Menu.QuitYes, Menu.QuitNo                the in-game menu, quitting to the desktop
 //   Score.Continue, Score.Watch                         the score screen
+//   Pause.Toggle                                        the pause hotkey (a test run has no keyboard)
 
 #include "Game/GenHUD.h"
 #include "Audio/GenAudioData.h"

@@ -590,6 +590,7 @@ void FGenObject::OnPlayerCommand(bool bDockOrder)
 		EndCombatDrop(); // ... and the flight to a combat drop (once the ropes are out, orders wait)
 	}
 	bHasExitRally = false; // an order replaces the trip to the rally point
+	SetChinookHealAirfield(GenInvalidObjectID); // ... and a helicopter's stay at an airfield (ChinookAIUpdate::aiDoCommand)
 	StopEntering();        // ... and the walk to a transport or a building
 	ExitAbility(false);    // ... and a capture under way
 	HuntButton.Reset();

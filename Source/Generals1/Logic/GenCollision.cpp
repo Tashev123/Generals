@@ -1,14 +1,21 @@
-// Unit-vs-unit collision. As in the original, units are not shoved apart by physics ("AI objects move
+// Unit-vs-unit collision. In the original, units are not shoved apart by physics ("AI objects move
 // under their own initiative, not by getting bounced"): a moving unit that finds another in its way
 // slows down or waits, asks it to step aside, or paths around it, and nobody ends a move on ground
 // another unit holds. Ports AIUpdateInterface::processCollision / blockedBy / hasHigherPathPriority /
 // calculateMaxBlockedSpeed, SquishCollide and the crush test of PhysicsBehavior::checkForOverlapCollision.
+// Beyond the original (the user's "move like in modern games"): vehicles, and soldiers around vehicles,
+// steer clear of each other as they go (GenSteering.cpp) instead of stopping and waiting, and what still
+// overlaps is pushed apart a little every frame - an idle ally more than the unit driving into it, never
+// an enemy that stands its ground. Soldiers among soldiers keep the original's rules.
 
 #include "Logic/GenGameLogic.h"
 #include "Core/GenPerf.h"
 #include "Logic/GenGameData.h"
 #include "Logic/GenObject.h"
 #include "Logic/GenPathfinder.h"
+
+/** gen.Steering (GenSteering.cpp). */
+bool GenSteeringEnabled();
 
 namespace
 {
@@ -244,6 +251,38 @@ bool FGenObject::GeometryOverlaps(const FGenObject& Other, float Shrink) const
 	return true;
 }
 
+bool FGenObject::GeometryPenetration(const FGenObject& Other, FVector2f& OutPush) const
+{
+	// The separating axis the footprints overlap least along: moved that far along it, this one is clear.
+	struct FBox2 { FVector2f C, U, V; float A, B; };
+	auto Make = [](const FGenObject& O)
+	{
+		const FVector2f U = O.GetDirection2D();
+		const float Major = O.Template->GeometryMajorRadius;
+		return FBox2{ FVector2f(O.Position.X, O.Position.Y), U, FVector2f(-U.Y, U.X), Major, O.Template->IsBox() ? O.Template->GeometryMinorRadius : Major };
+	};
+	const FBox2 P = Make(*this), Q = Make(Other);
+	const FVector2f D = Q.C - P.C;
+	float Least = FLT_MAX;
+	for (const FVector2f& L : { P.U, P.V, Q.U, Q.V })
+	{
+		const float RP = P.A * FMath::Abs(FVector2f::DotProduct(P.U, L)) + P.B * FMath::Abs(FVector2f::DotProduct(P.V, L));
+		const float RQ = Q.A * FMath::Abs(FVector2f::DotProduct(Q.U, L)) + Q.B * FMath::Abs(FVector2f::DotProduct(Q.V, L));
+		const float Along = FVector2f::DotProduct(D, L);
+		const float Depth = RP + RQ - FMath::Abs(Along);
+		if (Depth <= 0.f)
+		{
+			return false;
+		}
+		if (Depth < Least)
+		{
+			Least = Depth;
+			OutPush = (Along > 0.f ? -L : L) * Depth;
+		}
+	}
+	return true;
+}
+
 void FGenObject::MoveToFreeGround()
 {
 	// Pathfinder::adjustToPossibleDestination + aiMoveToPosition: shuffle over to the nearest free spot
@@ -282,36 +321,16 @@ void FGenObject::MoveAwayFromUnit(const FGenObject& Unit)
 	const uint32 Frame = Logic->GetFrame();
 	if (bMovingOutOfWay && MoveOutOfWayOf == Unit.ID)
 	{
-		if (bBlocked)
+		// Already on our way: a soldier cheats for 2 seconds. (A vehicle steers clear instead.)
+		if (bBlocked && Template->bKindInfantry)
 		{
-			IgnoreCollisionsUntil = Frame + uint32(GenLogic::GetLogicFPS() * 2); // already on our way: cheat for 2 seconds
+			IgnoreCollisionsUntil = Frame + uint32(GenLogic::GetLogicFPS() * 2);
 		}
 		return;
 	}
-	// Step sideways off the other unit's line of travel, to the side we are already on.
-	const FVector2f Dir = Unit.GetDirection2D();
-	FVector2f Perp(-Dir.Y, Dir.X);
-	const FVector2f FromUnit(Position.X - Unit.Position.X, Position.Y - Unit.Position.Y);
-	if (FVector2f::DotProduct(FromUnit, Perp) < 0.f)
-	{
-		Perp = -Perp;
-	}
-	const float Lateral = FMath::Abs(FVector2f::DotProduct(FromUnit, Perp));
-	const float Step = FMath::Max(GetCollisionRadius() + Unit.GetCollisionRadius() + CellSize - Lateral, CellSize);
-	const FVector3f Dest(Position.X + Perp.X * Step, Position.Y + Perp.Y * Step, Position.Z);
-
-	const bool bResume = bMoving && !bMovingOutOfWay;
-	const FVector3f Resume = RequestedGoal;
-	if (StartPath(Dest, false))
-	{
-		bMovingOutOfWay = true;
-		MoveOutOfWayOf = Unit.ID;
-		if (bResume)
-		{
-			bHasResumeGoal = true;
-			ResumeGoal = Resume;
-		}
-	}
+	// Pathfinder::getMoveAwayFromPath: to free ground clear of the other unit's way (and on afterwards with
+	// what we were doing).
+	MakeWayFor(Unit, Unit.GetDirection2D());
 }
 
 void FGenObject::ProcessCollision(FGenObject& Other)
@@ -323,6 +342,17 @@ void FGenObject::ProcessCollision(FGenObject& Other)
 		return;
 	}
 	const bool bOtherMoving = Other.bMoving;
+	if (bMoving && UsesSteering() && !(Template->bKindInfantry && Other.Template->bKindInfantry))
+	{
+		// Steering keeps us clear, and what still touches is pushed apart (UpdateCollisions). Left from the
+		// original: vehicles don't queue behind infantry - the soldier steps aside, unless he is busy fighting.
+		if (!Template->bKindInfantry && Other.Template->bKindInfantry && !(Other.bMovingOutOfWay && Other.MoveOutOfWayOf == ID)
+			&& Other.TargetID == GenInvalidObjectID && !Other.bUsingAbility)
+		{
+			Other.MoveAwayFromUnit(*this);
+		}
+		return;
+	}
 	if (bMoving)
 	{
 		if (!BlockedBy(Other))
@@ -393,6 +423,46 @@ void UGenGameLogic::UpdateCollisions()
 		Units.Add({ O, Pos, O->GetTemplate()->GetBoundingCircleRadius() });
 	}
 
+	// Beyond the original: what overlaps is pushed apart, half the overlap a frame. Who gives how much: a
+	// soldier all of it to a vehicle; an idle ally most of it to a unit driving into it; an enemy standing
+	// its ground none; otherwise both alike. Not what is held to its place (a docking lane, a factory's door,
+	// packing up, building), not soldiers among soldiers (they pass through each other, as in the original),
+	// not what is being driven over.
+	TArray<FVector2f, TInlineAllocator<256>> Push;
+	Push.SetNumZeroed(Units.Num());
+	const bool bSeparate = GenSteeringEnabled();
+	auto Separate = [&](int32 IA, int32 IB)
+	{
+		if (!bSeparate)
+		{
+			return;
+		}
+		FGenObject& A = *Units[IA].Obj;
+		FGenObject& B = *Units[IB].Obj;
+		const bool bAInfantry = A.Template->bKindInfantry, bBInfantry = B.Template->bKindInfantry;
+		if ((bAInfantry && bBInfantry) || A.IgnoreObstacle == B.ID || B.IgnoreObstacle == A.ID || A.ContactTarget == B.ID || B.ContactTarget == A.ID
+			|| A.EnterTarget == B.ID || B.EnterTarget == A.ID || A.CanCrushOrSquish(B) || B.CanCrushOrSquish(A))
+		{
+			return;
+		}
+		const bool bAPushable = A.CanBePushed(), bBPushable = B.CanBePushed();
+		FVector2f PushA;
+		if ((!bAPushable && !bBPushable) || !A.GeometryPenetration(B, PushA))
+		{
+			return;
+		}
+		float ShareA = 0.5f;
+		if (!bBPushable || !bAPushable) { ShareA = bAPushable ? 1.f : 0.f; }
+		else if (bAInfantry != bBInfantry) { ShareA = bAInfantry ? 1.f : 0.f; }
+		else if (A.bMoving != B.bMoving)
+		{
+			const float ParkedShare = GetRelationship(A.Owner, B.Owner) == EGenRelationship::Allies ? 0.75f : 0.f;
+			ShareA = A.bMoving ? 1.f - ParkedShare : ParkedShare;
+		}
+		Push[IA] += PushA * (0.5f * ShareA);
+		Push[IB] -= PushA * (0.5f * (1.f - ShareA));
+	};
+
 	TMap<FIntPoint, TArray<int32, TInlineAllocator<8>>> Grid;
 	for (int32 i = 0; i < Units.Num(); ++i)
 	{
@@ -435,9 +505,36 @@ void UGenGameLogic::UpdateCollisions()
 					}
 					A.Obj->ProcessCollision(*B.Obj);
 					B.Obj->ProcessCollision(*A.Obj);
+					if (!A.Obj->IsDead() && !B.Obj->IsDead())
+					{
+						Separate(i, j);
+					}
 				}
 			}
 		}
 		Grid.FindOrAdd(Cell).Add(i);
+	}
+
+	// The pushes: 15 units a second at the most, and never onto ground the unit can't stand on.
+	const float MaxPush = 15.f / float(GenLogic::GetLogicFPS());
+	for (int32 i = 0; i < Units.Num(); ++i)
+	{
+		FVector2f P = Push[i];
+		FGenObject& O = *Units[i].Obj;
+		if (P.IsNearlyZero(1e-4f) || O.IsDead())
+		{
+			continue;
+		}
+		if (P.SizeSquared() > FMath::Square(MaxPush))
+		{
+			P *= MaxPush / P.Size();
+		}
+		const FVector2f To = FVector2f(O.Position.X, O.Position.Y) + P;
+		if (Pathfinder.IsPassable(To, O.GetPathSurfaces(), O.Layer))
+		{
+			O.Position.X = To.X;
+			O.Position.Y = To.Y;
+			O.Position.Z = O.GetSurfaceHeight();
+		}
 	}
 }

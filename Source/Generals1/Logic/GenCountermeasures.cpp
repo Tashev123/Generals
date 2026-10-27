@@ -268,7 +268,7 @@ bool FGenObject::CanPilotEnter(const FGenObject& Vehicle) const
 	{
 		if (VT.IsKindOf(*Kind)) { return false; }
 	}
-	// VeterancyCrateCollide::isValidToExecute
+	//	"Note that we only want to do this if the plane is on the ground."
 	if (Vehicle.Position.Z - Logic->GetGroundHeight(Vehicle.Position.X, Vehicle.Position.Y) > AirborneThreshold)
 	{
 		return false;
@@ -279,8 +279,10 @@ bool FGenObject::CanPilotEnter(const FGenObject& Vehicle) const
 		return false; // "If the other unit can't gain experience, then we can't help promote it!"
 	}
 	// "This is a pilot and we are checking to make sure the pilot is entering a vehicle on the same team."
-	// "Can't upgrade a helicopter or plane".
-	return Vehicle.Owner == Owner && !Vehicle.IsUsingAirLoco() && !Vehicle.bFlies;
+	// isUsingAirLoco() is the locomotor in use, not the one in the data: an aircraft that has parked at its
+	// airfield has chosen its taxi locomotor, so a pilot can climb into it there. bFlies comes from the data
+	// and stays true on the ground, so it is not what the original checks here.
+	return Vehicle.Owner == Owner && !Vehicle.IsUsingAirLoco();
 }
 
 void FGenObject::PilotEnterVehicle(FGenObject& Vehicle)

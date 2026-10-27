@@ -60,6 +60,32 @@ namespace
 		return bApplies;
 	}
 
+	/** Object::getStatus() for the states the game's data can name in ExemptStatus. Only the ones this code
+	 *  keeps are answered; a rider slot (STATUS_RIDER1..7) is not modelled, so it never matches. */
+	bool ObjectHasStatus(const FGenObject& Obj, const FString& Name)
+	{
+		if (Name.Equals(TEXT("UNDER_CONSTRUCTION"), ESearchCase::IgnoreCase)) { return Obj.IsUnderConstruction(); }
+		if (Name.Equals(TEXT("HIJACKED"), ESearchCase::IgnoreCase)) { return Obj.IsHijacked(); }
+		return false;
+	}
+
+	/** DieMuxData::isDieApplicable's third check: "if( m_exemptStatus && (object->getStatus() & m_exemptStatus) ) return FALSE" —
+	 *  a die module never runs for an object in a state it is exempt from, so a building site that is given
+	 *  up does not do the death of a finished building. */
+	bool StatusExemptApplies(const FGenObject& Obj, const TArray<FString>& Tokens)
+	{
+		bool bExempt = false;
+		for (const FString& T : Tokens)
+		{
+			if (T.Equals(TEXT("ALL"), ESearchCase::IgnoreCase)) { bExempt = true; }
+			else if (T.Equals(TEXT("NONE"), ESearchCase::IgnoreCase)) { bExempt = false; }
+			else if (T.StartsWith(TEXT("-"))) { if (ObjectHasStatus(Obj, T.Mid(1))) { bExempt = false; } }
+			else if (T.StartsWith(TEXT("+"))) { if (ObjectHasStatus(Obj, T.Mid(1))) { bExempt = true; } }
+			else if (ObjectHasStatus(Obj, T)) { bExempt = true; }
+		}
+		return bExempt;
+	}
+
 	FVector3f Bezier(const FVector3f P[4], float T)
 	{
 		const float U = 1.f - T;
@@ -1793,8 +1819,8 @@ void FGenObject::Die(const FString& DeathType, FGenObjectID Killer)
 	bool bDestroyNow = false;
 	for (const FGenDieModule& M : Template->DieModules)
 	{
-		// DieMuxData::isDieApplicable: "wrong death type? punt", "wrong vet level? punt"
-		if (!DeathTypeApplies(M.DeathTypes, DeathType) || (M.VeterancyMask & (1 << VeterancyLevel)) == 0)
+		// DieMuxData::isDieApplicable: "wrong death type? punt", "wrong vet level? punt", "wrong status? punt"
+		if (!DeathTypeApplies(M.DeathTypes, DeathType) || (M.VeterancyMask & (1 << VeterancyLevel)) == 0 || StatusExemptApplies(*this, M.ExemptStatus))
 		{
 			continue;
 		}
@@ -1864,7 +1890,7 @@ void FGenObject::Die(const FString& DeathType, FGenObjectID Killer)
 	int32 TotalWeight = 0;
 	for (const FGenSlowDeath& D : Template->SlowDeaths)
 	{
-		if (DeathTypeApplies(D.DeathTypes, DeathType))
+		if (DeathTypeApplies(D.DeathTypes, DeathType) && !StatusExemptApplies(*this, D.ExemptStatus))
 		{
 			Candidates.Add(&D);
 			TotalWeight += FMath::Max(1, D.ProbabilityModifier);

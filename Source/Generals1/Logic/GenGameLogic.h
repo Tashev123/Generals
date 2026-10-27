@@ -356,6 +356,9 @@ public:
 	TArray<FGenFallingRope> FallingRopes;
 	/** PartitionManager::findPositionAround, for the objects themselves: free ground near a spot. */
 	FVector3f FindGroundSpotAround(const FVector3f& Center, float MinRadius, float MaxRadius) const { return FindPositionAround(Center, MinRadius, MaxRadius, GenSurface::Ground); }
+	/** PartitionManager::findPositionAround with its default options: the nearest open ground with nothing on it
+	 *  (where a helicopter sent to an airfield for repairs comes down), from a random angle. Center if none. */
+	FVector3f FindFreeGroundAround(const FVector3f& Center, float MaxRadius);
 	/** Where a named bone of the object's model is right now. */
 	bool GetNamedBonePosition(const FGenObject& Obj, const FString& BoneName, FVector3f& OutWorld) const;
 	void AttachParticleSystem(const FString& TemplateName, FGenObjectID Object);
@@ -1085,6 +1088,7 @@ private:
 	void ApplyPendingTerrain();
 	TArray<FGenObjectID> PathQueue;      // units waiting for a path, first come first served
 	int32 PathQueueHead = 0;
+	uint32 LastMoveGroup = 0;   // the last group move order's number (FGenObject::MoveGroup)
 	bool bProcessingPathQueue = false;
 	void ProcessPathQueue();
 

@@ -27,6 +27,7 @@ namespace
 		{ TEXT("gen.PathCliffMargin"), &FGenMatchSettings::PathCliffMargin },
 		{ TEXT("gen.PathWeight"), &FGenMatchSettings::PathWeight },
 		{ TEXT("gen.MissileFlight"), &FGenMatchSettings::MissileFlight },
+		{ TEXT("gen.Steering"), &FGenMatchSettings::Steering },
 	};
 
 	void SerializeBool(FArchive& Ar, bool& B)
@@ -65,7 +66,7 @@ void FGenMatchSettings::Serialize(FArchive& Ar)
 	SerializeBool(Ar, bNoAI);
 	Ar << DefaultDifficulty << RevealedPlayer;
 	SerializeBool(Ar, bPowersReady);
-	Ar << LogicFPS << PathCellsPerStep << PathCliffMargin << PathWeight << MissileFlight;
+	Ar << LogicFPS << PathCellsPerStep << PathCliffMargin << PathWeight << MissileFlight << Steering;
 }
 
 FGenMatchSettings FGenMatchSettings::FromCommandLine()

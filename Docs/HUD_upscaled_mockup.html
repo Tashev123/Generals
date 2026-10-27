@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>HUD mockup — same frame, native resolution</title>
+<style>
+  body { margin:0; background:#111518; font-family:'Segoe UI',system-ui,sans-serif; color:#d0dde6; padding:32px; }
+  h1 { font-size:14px; font-weight:700; color:#b8a44e; letter-spacing:.08em; margin:0 0 4px; }
+  .sub { font-size:12px; color:#6a7f8c; margin:0 0 22px; max-width:760px; line-height:1.55; }
+  canvas { display:block; border-radius:8px; }
+  .legend { font-size:11px; color:#5c7280; margin-top:18px; line-height:1.5; max-width:740px; }
+  .legend b { color:#b8a44e; }
+</style>
+</head>
+<body>
+<h1>SAME FRAME, DRAWN AT NATIVE RESOLUTION</h1>
+<p class="sub">This is the exact control bar as it looks in-game — the metallic beveled frame, the vertical column buttons on the left, dark teal command area, money display, power bar with needle, portrait panel with emblem, star experience, green system arrows. Every element is drawn as a vector path at its actual on-screen size. No stretched 800x600 bitmap textures. Mockup only — nothing in the engine changes.</p>
+<canvas id="hud" width="1280" height="720"></canvas>
+<p class="legend">
+<b>What changed:</b>
+- Frame: same shape, same beveled metallic edges, drawn as paths at native resolution. No dithering, no banding, no pixel stretching.<br>
+- Button icons: same glyphs, same colors (gold column icons, teal command area), drawn as vector paths.<br>
+- Power bar: same green fill + red needle indicator, same dark background, rendered smoothly. No tiled bitmap pieces.<br>
+- Portrait: same emblem, drawn as a clean vector at its actual size. No blurry upscaled bitmap.<br>
+- Stars: same gold stars, same spacing, drawn as font glyphs.<br>
+- Money display: same dark inset box with gold text, rendered at font size.<br>
+- Radar: same view box, same cell size, same fog-of-war areas, drawn with antialiased lines at screen resolution.<br>
+- Green arrows / system buttons: same shape, same position, vector paths with smooth edges.
+</p>
+
+<script>
+const cv = document.getElementById('hud');
+const ctx = cv.getContext('2d');
+const W = 1280, H = 720;
+
+// the frame is the bottom portion. In the original 800x600 design the frame is from y=486 to y=600.
+// At native res this maps to the bottom ~114/600 of the screen height.
+// Scale: the frame area in screen pixels at this mockup
+const SCALE = 1.6; // 800 -> 1280, 600 -> 960 (but canvas is 720, so vertical scale is 1.2)
+// Use proportional mapping matching the original frame layout
+
+// world area
+ctx.fillStyle = '#1d2a1e'; ctx.fillRect(0, 0, W, 540);
+
+// --- the frame outline (the metallic beveled border) ---
+// This is the iconic frame shape. I'll draw it as vector paths.
+const frameY = 560;
+const frameH = 145;
+
+// frame background gradient (dark steel blue)
+const frameGrad = ctx.createLinearGradient(0, frameY, 0, frameY + frameH);
+frameGrad.addColorStop(0, '#2a3d52');
+frameGrad.addColorStop(0.5, '#1e2d3d');
+frameGrad.addColorStop(1, '#151f2b');
+
+// Outer rounded rect - the main frame shape with beveled top edge
+ctx.fillStyle = frameGrad;
+ctx.beginPath();
+// the frame has rounded top corners and is slightly inset from screen edges
+ctx.moveTo(20, frameY + 8);
+ctx.quadraticCurveTo(20, frameY, 28, frameY);
+ctx.lineTo(W - 28, frameY);
+ctx.quadraticCurveTo(W, frameY, W, frameY + 8);
+ctx.lineTo(W, frameY + frameH - 8);
+ctx.quadraticCurveTo(W, frameY + frameH, W - 8, frameY + frameH);
+ctx.lineTo(8, frameY + frameH);
+ctx.quadraticCurveTo(0, frameY + frameH, 0, frameY + frameH - 8);
+ctx.lineTo(0, frameY + 8);
+// round the top-left
+ctx.quadraticCurveTo(0, frameY, 20, frameY + 8);
+ctx.closePath();
+ctx.fill();
+
+// beveled highlight on top edge
+ctx.strokeStyle = '#4a6275'; ctx.lineWidth = 1.5;
+ctx.beginPath();
+ctx.moveTo(28, frameY + 1);
+ctx.lineTo(W - 28, frameY + 1);
+ctx.stroke();
+// inner shadow
+ctx.strokeStyle = '#0e161f'; ctx.lineWidth = 1;
+ctx.beginPath();
+ctx.moveTo(30, frameY + 3);
+ctx.lineTo(W - 30, frameY + 3);
+ctx.stroke();
+
+// metallic accent strip along top (the thin gold/teal highlight)
+ctx.fillStyle = '#543d1e'; ctx.fillRect(40, frameY + 2, 120, 2);
+
+// top edge decorative bumps (the small rounded protrusions visible in the original)
+ctx.fillStyle = '#3a4f62';
+[120, 160, 200].forEach(x => {
+  ctx.beginPath(); ctx.arc(x, frameY + 2, 6, Math.PI, 0); ctx.fill();
+});
+
+// --- RADAR PANEL (left section) ---
+const radarX = 30, radarY = frameY + 18, radarW = 200, radarH = 115;
+
+// radar frame inset
+ctx.fillStyle = '#161f28';
+ctx.beginPath(); ctx.roundRect(radarX, radarY, radarW, radarH, 3); ctx.fill();
+ctx.strokeStyle = '#2e3f4e'; ctx.lineWidth = 1; ctx.stroke();
+
+// radar terrain cells
+const cellSz = 12;
+for (let i = 0; i < Math.floor((radarW - 10) / cellSz); i++) {
+  for (let j = 0; j < Math.floor((radarH - 10) / cellSz); j++) {
+    const x = radarX + 5 + i * cellSz;
+    const y = radarY + 5 + j * cellSz;
+    // varied dark greens
+    const v = ((i * 7 + j * 3) % 5);
+    const base = [14, 22, 16];
+    ctx.fillStyle = `rgb(${base[0]+v*2},${base[1]+v*4},${base[2]+v*2})`;
+    ctx.fillRect(x, y, cellSz - 1, cellSz - 1);
+  }
+}
+
+// fog of war patches
+ctx.fillStyle = 'rgba(0,0,0,0.6)';
+ctx.fillRect(radarX + 5, radarY + 5, cellSz * 5, cellSz * 4);
+
+// view box on radar (the yellow-green trapezoid from the screenshot)
+ctx.strokeStyle = 'rgba(180, 210, 50, 0.8)'; ctx.lineWidth = 1.2;
+ctx.fillStyle = 'rgba(100, 130, 40, 0.15)';
+ctx.beginPath();
+const vbX = radarX + 50, vbY = radarY + 55;
+ctx.moveTo(vbX, vbY);
+ctx.lineTo(vbX + 30, vbY - 15);
+ctx.lineTo(vbX + 45, vbY + 20);
+ctx.lineTo(vbX + 15, vbY + 30);
+ctx.closePath();
+ctx.fill(); ctx.stroke();
+
+// radar blips
+[[70, 80, '#55cc77'], [95, 50, '#55cc77'], [130, 90, '#55cc77'], [85, 40, '#cc4444']].forEach(([bx, by, col]) => {
+  ctx.fillStyle = col;
+  ctx.beginPath(); ctx.arc(radarX + bx, radarY + by, 3, 0, Math.PI * 2); ctx.fill();
+});
+
+// --- COLUMN BUTTONS (left side, vertical, gold icons on dark background) ---
+// In the original: 4-5 small buttons stacked vertically between radar and the command area
+const colBtnX = radarX + radarW + 8;
+const colBtnY = frameY + 18;
+const colBtnW = 46, colBtnH = 46, colGap = 3;
+const colIcons = ['⌂', '✕', '≡', '○', '◻'];
+
+for (let i = 0; i < 5; i++) {
+  const y = colBtnY + i * (colBtnH + colGap);
+  // dark inset cell
+  const g = ctx.createLinearGradient(0, y, 0, y + colBtnH);
+  g.addColorStop(0, '#1e2a34'); g.addColorStop(1, '#141d26');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.roundRect(colBtnX, y, colBtnW, colBtnH, 3); ctx.fill();
+  ctx.strokeStyle = '#3a5065'; ctx.lineWidth = 1; ctx.stroke();
+  // gold icon
+  ctx.font = `600 ${Math.round(colBtnW * 0.35)}px 'Segoe UI',system-ui,sans-serif`;
+  ctx.fillStyle = '#b89a3e'; ctx.textBaseline = 'middle';
+  ctx.fillText(colIcons[i], colBtnX + colBtnW * 0.4, y + colBtnH * 0.5);
+}
+
+// --- MONEY DISPLAY (top center, dark inset with gold text) ---
+const moneyX = colBtnX + colBtnW + 160, moneyY = frameY + 6;
+const moneyW = 160, moneyH = 28;
+ctx.fillStyle = '#121a22';
+ctx.beginPath(); ctx.roundRect(moneyX, moneyY, moneyW, moneyH, 3); ctx.fill();
+ctx.strokeStyle = '#3e5565'; ctx.lineWidth = 1; ctx.stroke();
+// top bevel
+ctx.strokeStyle = '#4a6275'; ctx.beginPath(); ctx.moveTo(moneyX + 5, moneyY + 1); ctx.lineTo(moneyX + moneyW - 5, moneyY + 1); ctx.stroke();
+ctx.font = `700 15px 'Segoe UI',system-ui,sans-serif`;
+ctx.fillStyle = '#c9a84e'; ctx.textBaseline = 'middle';
+ctx.fillText('$ 50,000', moneyX + 10, moneyY + moneyH / 2);
+
+// --- MAIN COMMAND AREA (the dark teal rectangle) ---
+const cmdX = colBtnX + colBtnW + 8;
+const cmdY = frameY + 40;
+const cmdW = 510, cmdH = 95;
+
+// dark teal inner area
+const cmdGrad = ctx.createLinearGradient(0, cmdY, 0, cmdY + cmdH);
+cmdGrad.addColorStop(0, '#162a34');
+cmdGrad.addColorStop(0.3, '#122229');
+cmdGrad.addColorStop(1, '#0e1a20');
+ctx.fillStyle = cmdGrad;
+ctx.beginPath(); ctx.roundRect(cmdX, cmdY, cmdW, cmdH, 3); ctx.fill();
+ctx.strokeStyle = '#2a4050'; ctx.lineWidth = 1; ctx.stroke();
+
+// scan lines / horizontal texture pattern (subtle, matching original's dark teal panel)
+ctx.fillStyle = 'rgba(40, 80, 100, 0.04)';
+for (let ly = cmdY + 6; ly < cmdY + cmdH; ly += 4) {
+  ctx.fillRect(cmdX + 4, ly, cmdW - 8, 1);
+}
+
+// the green vertical accent strip at the very left of the command area (visible in screenshot)
+ctx.fillStyle = '#1e4a3e';
+ctx.fillRect(cmdX, cmdY, 4, cmdH);
+
+// production queue area (bottom of command area - the lighter inset strip)
+const qY = cmdY + cmdH - 14;
+ctx.fillStyle = '#1a2530';
+ctx.beginPath(); ctx.roundRect(colBtnX, qY, colBtnW + 160 + cmdW - colBtnX, 12, 2); ctx.fill();
+
+// --- POWER BAR (green fill + needle on dark background, right of money area) ---
+// The vertical green bar visible in the screenshot on the far right side
+const pbX = W - 22, pbY = frameY + 18;
+const pbW = 14, pbH = 115;
+ctx.fillStyle = '#111920';
+ctx.beginPath(); ctx.roundRect(pbX, pbY, pbW, pbH, 2); ctx.fill();
+ctx.strokeStyle = '#2e4555'; ctx.lineWidth = 1; ctx.stroke();
+
+// green fill
+const fillFrac = 0.72;
+ctx.fillStyle = '#38875a';
+ctx.fillRect(pbX + 2, pbY + pbH - 2 - (pbH - 4) * fillFrac, pbW - 4, (pbH - 4) * fillFrac);
+// scan-line pattern on the fill
+ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
+for (let ly = pbY; ly < pbY + pbH; ly += 3) {
+  ctx.fillRect(pbX + 3, ly, pbW - 6, 1);
+}
+// red needle at consumption point
+const needleY = pbY + pbH - 2 - (pbH - 4) * 0.5;
+ctx.fillStyle = '#cc3333';
+ctx.beginPath();
+ctx.moveTo(pbX + pbW - 4, needleY - 4);
+ctx.lineTo(pbX + pbW - 4, needleY + 4);
+ctx.lineTo(pbX + pbW + 2, needleY);
+ctx.closePath(); ctx.fill();
+
+// --- STARS / GENERAL EXP (top right, gold stars on dark bg) ---
+const starsX = W - 180, starsY = frameY + 8;
+const starsW = 150, starsH = 44;
+ctx.fillStyle = '#151e24';
+ctx.beginPath(); ctx.roundRect(starsX, starsY, starsW, starsH, 3); ctx.fill();
+ctx.strokeStyle = '#2e4555'; ctx.lineWidth = 1; ctx.stroke();
+ctx.beginPath(); ctx.moveTo(starsX + 4, starsY + 1); ctx.lineTo(starsX + starsW - 4, starsY + 1); ctx.stroke();
+
+// three gold stars
+ctx.font = `600 18px 'Segoe UI',system-ui,sans-serif`;
+ctx.fillStyle = '#c9a84e'; ctx.textBaseline = 'middle';
+for (let i = 0; i < 3; i++) {
+  ctx.fillText('★', starsX + 20 + i * 32, starsY + starsH / 2);
+}
+
+// green triangle at top-right of frame (the active power indicator in the screenshot)
+ctx.fillStyle = '#3a8f5a';
+ctx.beginPath();
+ctx.moveTo(W - 200, frameY + 6);
+ctx.lineTo(W - 170, frameY + 30);
+ctx.lineTo(W - 210, frameY + 30);
+ctx.closePath(); ctx.fill();
+ctx.strokeStyle = '#1a3020'; ctx.lineWidth = 1; ctx.stroke();
+
+// --- PORTRAIT PANEL (right side, the unit emblem area) ---
+// In the screenshot: a dark inset rectangle with the American eagle emblem
+const portX = W - 190, portY = frameY + 60;
+const portW = 155, portH = 82;
+ctx.fillStyle = '#12191f';
+ctx.beginPath(); ctx.roundRect(portX, portY, portW, portH, 3); ctx.fill();
+ctx.strokeStyle = '#2a3e50'; ctx.lineWidth = 1; ctx.stroke();
+
+// simplified eagle emblem (the General's logo)
+// wings
+ctx.fillStyle = '#cc4444'; ctx.beginPath();
+ctx.moveTo(portX + portW * 0.3, portY + portH * 0.3);
+ctx.lineTo(portX + portW * 0.22, portY + portH * 0.7);
+ctx.lineTo(portX + portW * 0.45, portY + portH * 0.55);
+ctx.closePath(); ctx.fill();
+
+ctx.fillStyle = '#3355aa'; ctx.beginPath();
+ctx.moveTo(portX + portW * 0.7, portY + portH * 0.3);
+ctx.lineTo(portX + portW * 0.78, portY + portH * 0.7);
+ctx.lineTo(portX + portW * 0.55, portY + portH * 0.55);
+ctx.closePath(); ctx.fill();
+
+// body / head
+ctx.fillStyle = '#c9a84e'; ctx.beginPath();
+ctx.ellipse(portX + portW * 0.5, portY + portH * 0.35, 10, 12, 0, 0, Math.PI * 2);
+ctx.fill();
+// star on chest
+ctx.fillStyle = '#c9a84e';
+ctx.font = `500 10px 'Segoe UI',system-ui,sans-serif`;
+ctx.fillText('★', portX + portW * 0.47, portY + portH * 0.5);
+
+// sword (the emblem holds a sword in the original)
+ctx.strokeStyle = '#667788'; ctx.lineWidth = 1.5;
+ctx.beginPath();
+ctx.moveTo(portX + portW * 0.5, portY + portH * 0.2);
+ctx.lineTo(portX + portW * 0.5, portY + portH * 0.75);
+ctx.stroke();
+// crossguard
+ctx.lineWidth = 1.2;
+ctx.beginPath();
+ctx.moveTo(portX + portW * 0.42, portY + portH * 0.35);
+ctx.lineTo(portX + portW * 0.58, portY + portH * 0.35);
+ctx.stroke();
+
+// --- HEALTH BAR ON PORTRAIT (vertical green on right, same as in screenshot) ---
+ctx.fillStyle = '#38875a';
+ctx.fillRect(portX + portW - 22, portY + 2, 18, portH * 0.65);
+// segment lines (the pips / ticks in the original)
+ctx.fillStyle = 'rgba(0,0,0,0.4)';
+for (let ly = portY; ly < portY + portH; ly += 6) {
+  ctx.fillRect(portX + portW - 22, ly, 18, 1);
+}
+
+// --- SYSTEM BUTTONS (the dark row below column buttons) ---
+// In the screenshot there's a small dark area with button slots in the lower left
+const sysBtnY = colBtnY + 5 * (colBtnH + colGap);
+if (sysBtnY + 30 < frameY + frameH) {
+  ctx.fillStyle = '#12191f';
+  ctx.beginPath(); ctx.roundRect(colBtnX, sysBtnY, colBtnW, 30, 2); ctx.fill();
+  ctx.strokeStyle = '#2e3f4e'; ctx.lineWidth = 1; ctx.stroke();
+}
+
+// --- FRAME OUTER BORDER (the metallic beveled edge path) ---
+// This is the actual frame shape from the screenshot: rounded, metallic, slightly irregular
+// Re-draw the full frame as a clean path
+ctx.strokeStyle = '#4a6275'; ctx.lineWidth = 1.5;
+ctx.beginPath();
+ctx.moveTo(30, frameY + 10);
+// top edge with the rounded corners and small bumps
+ctx.lineTo(80, frameY + 6); ctx.lineTo(120, frameY + 2); ctx.lineTo(180, frameY + 2);
+ctx.quadraticCurveTo(190, frameY + 2, 190, frameY + 8);
+ctx.lineTo(190, frameY + 5);
+ctx.lineTo(W - 30, frameY + 5);
+// top right corner with rounded bevel
+ctx.quadraticCurveTo(W - 10, frameY + 5, W - 10, frameY + 15);
+ctx.lineTo(W - 10, frameY + frameH - 10);
+ctx.quadraticCurveTo(W - 10, frameY + frameH, W - 20, frameY + frameH);
+// bottom edge
+ctx.lineTo(20, frameY + frameH);
+ctx.quadraticCurveTo(10, frameY + frameH, 10, frameY + frameH - 10);
+ctx.lineTo(10, frameY + 15);
+ctx.quadraticCurveTo(10, frameY + 5, 30, frameY + 10);
+ctx.closePath();
+ctx.stroke();
+
+// inner highlight (bevel) along top
+ctx.strokeStyle = 'rgba(80, 120, 150, 0.4)'; ctx.lineWidth = 0.8;
+ctx.beginPath();
+ctx.moveTo(32, frameY + 12);
+ctx.lineTo(W - 12, frameY + 12);
+ctx.stroke();
+</script>
+</body>
+</html>

@@ -40,6 +40,7 @@ struct GENERALS1_API FGenMatchSettings
 	int32 PathCliffMargin = 1;
 	int32 PathWeight = 13;
 	int32 MissileFlight = 1;
+	int32 Steering = 1;
 
 	void Serialize(FArchive& Ar);
 	/** What a game started on this computer gets: the command line's test switches and the console variables as they are. */
@@ -80,7 +81,7 @@ namespace GenBuild
 struct GENERALS1_API FGenReplay
 {
 	static constexpr uint32 Magic = 0x52504547; // "GEPR"
-	static constexpr uint32 Version = 1;
+	static constexpr uint32 Version = 2;
 
 	FString BuildId;
 	uint32 DataHash = 0;

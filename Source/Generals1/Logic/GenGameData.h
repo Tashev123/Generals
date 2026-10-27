@@ -373,6 +373,7 @@ struct GENERALS1_API FGenSlowDeath
 	float SinkRate = 0.f;               // units per frame
 	int32 ProbabilityModifier = 10;
 	TArray<FString> DeathTypes;         // raw DeathTypes tokens
+	TArray<FString> ExemptStatus;       // ... and the raw DieMuxData ExemptStatus tokens
 	TArray<FString> FX[NumPhases];      // "FX = INITIAL name": one is picked at random per phase
 	TArray<FString> OCL[NumPhases];
 	TArray<FString> Weapons[NumPhases]; // "Weapon = FINAL name": fired where the object is
@@ -443,6 +444,7 @@ struct GENERALS1_API FGenDieModule
 	EGenDieModule Type = EGenDieModule::Destroy;
 	TArray<FString> DeathTypes;
 	uint8 VeterancyMask = 0xF;          // DieMuxData VeterancyLevels: bit per level it applies at (regular .. heroic)
+	TArray<FString> ExemptStatus;       // ... and ExemptStatus: the raw tokens, e.g. "ALL -UNDER_CONSTRUCTION"
 	FString GroundOCL;                  // EjectPilotDie: what comes out of a wreck on the ground ...
 	FString AirOCL;                     // ... and out of one in the air
 	TArray<FString> FX;                 // FXListDie DeathFX / InstantDeathBehavior FX (random pick)
@@ -893,6 +895,7 @@ struct GENERALS1_API FGenThingTemplate
 	FString Name;
 	TSharedPtr<FGenIniBlock> Block;  // merged entries (base + overrides)
 	TSet<FString> KindOf;            // upper case
+	bool bKindInfantry = false;      // KindOf INFANTRY (asked about every neighbour every frame by the steering)
 	FString Side;
 	FString EditorSorting;
 	TArray<FGenDrawModule> Draws;

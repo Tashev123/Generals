@@ -784,9 +784,8 @@ void FGenObject::CommandLandAt(FGenObjectID AirfieldId)
 	const bool bHelipad = IsHelipadUnit(*Template);
 	if (bHelipad)
 	{
-		float Unused = 0.f;
-		JetHelipadLanding = A->Position;
-		A->Parking->GetHeliPark(JetHelipadLanding, Unused);
+		// A helicopter comes down on open ground beside the airfield (not all on the one helipad).
+		JetHelipadLanding = Logic->FindFreeGroundAround(A->Position, A->Template->GetBoundingCircleRadius() * 10.f);
 	}
 	if (bHelipad || A->Parking->ReserveSpace(ID, Template->JetParkingOffset, nullptr))
 	{
@@ -990,8 +989,10 @@ bool FGenObject::JetFollowPath(uint32 Frame, float DesiredSpeed)
 	}
 
 	// In the air a leg is done once the aircraft is abeam of its end (Path::computeFlightDistToGoal);
-	// a helicopter, which can stop, has to get there.
+	// a helicopter, which can stop, has to get there: over the spot on a flight home (AIInternalMoveToState,
+	// at its own height), within 3 units in all three axes on its way straight up or down.
 	const bool bPlane = HasMinSpeed();
+	const bool bHeliUpOrDown = JetState == EGenJetState::TakingOff || JetState == EGenJetState::Landing;
 	float Ahead = 0.f;
 	bool bAdvanced = false;
 	while (JetPathIndex < JetPath.Num())
@@ -1009,10 +1010,20 @@ bool FGenObject::JetFollowPath(uint32 Frame, float DesiredSpeed)
 				break;
 			}
 		}
+		else if (bHeliUpOrDown)
+		{
+			// (setLocomotorGoalPositionExplicit: the locomotor is told no distance along a path, so it brakes
+			// and slides onto the point instead of circling it.)
+			Ahead = 0.f;
+			if ((To - Position).SizeSquared() > 9.f) // HeliTakeoffOrLandingState: within 3 units, in all three axes
+			{
+				break;
+			}
+		}
 		else
 		{
 			Ahead = Direct;
-			if ((To - Position).SizeSquared() > 9.f) // HeliTakeoffOrLandingState: within 3 units, in all three axes
+			if (Direct > FMath::Max(Locomotor->CloseEnoughDist, 1.f))
 			{
 				break;
 			}

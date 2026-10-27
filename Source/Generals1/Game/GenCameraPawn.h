@@ -63,11 +63,17 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Generals")
 	float ZoomSmoothing = 12.f;
 
+	/** Mouse-wheel notches from full zoom out at match start. */
+	UPROPERTY(EditAnywhere, Category = "Generals")
+	int32 InitialZoomNotchesFromFullZoomOut = 2;
+
 	/** Generals units per second at full scroll. */
 	UPROPERTY(EditAnywhere, Category = "Generals")
 	float ScrollSpeed = 1200.f;
 
 private:
+	/** The height the camera should start a match at, given the zoom-out notch count. */
+	float GetInitialHeight() const;
 	void UpdateCamera();
 	class AGenMapActor* FindMap() const;
 

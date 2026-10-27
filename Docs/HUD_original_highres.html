@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Original control bar — same layout, drawn at native resolution</title>
+<style>
+  body { margin:0; background:#12161f; font-family:'Segoe UI',system-ui,sans-serif; color:#dbe5ff; padding:24px; }
+  h1 { font-size:17px; font-weight:600; color:#c79e28; margin:0 0 6px; letter-spacing:.06em; }
+  h2 { font-size:12px; color:#7887a8; font-weight:600; margin:18px 0 10px; }
+  .desc { font-size:12.5px; color:#7887a8; line-height:1.6; max-width:820px; }
+  .row { display:flex; gap:20px; align-items:flex-start; margin-top:10px; }
+  .col { display:flex; flex-direction:column; gap:8px; }
+  .tag { font-size:11px; letter-spacing:.05em; }
+  .tag.bad { color:#ff5245; } .tag.good { color:#c79e28; }
+  canvas { background:#141d16; border:1px solid #2a3444; border-radius:6px; }
+  .note { font-size:12px; color:#7887a8; line-height:1.65; margin-top:14px; max-width:900px; }
+  .note b { color:#c79e28; }
+  ul { font-size:12.5px; color:#7887a8; line-height:1.6; }
+  li b { color:#dbe5ff; }
+  code { color:#5c9efe; }
+</style>
+</head>
+<body>
+<h1>THE SAME HUD — JUST NOT UPSCALED</h1>
+<p class="desc">Nothing here is a redesign. Same layout, same proportions, same button grid, same per-side colours from <code>ControlBarScheme.ini</code>, same hotkey letters, same queue clock, same radar. The only change is that the frame and its buttons are drawn at the size they are actually shown at, instead of an 800×600 picture stretched to the screen height. Below is the identical drawing at 1/4 scale blitted up nearest-neighbour (what happens today), and the identical drawing at native resolution.</p>
+
+<div class="row">
+  <div class="col"><span class="tag bad">TODAY — 800×600 layout scaled up ×1.25</span><canvas id="before" width="1000" height="750"></canvas></div>
+  <div class="col"><span class="tag good">THE SAME THING AT NATIVE RESOLUTION</span><canvas id="after" width="1000" height="750"></canvas></div>
+</div>
+
+<h2>THE SAME BUTTON, BLOWN UP</h2>
+<div class="row">
+  <div class="col"><span class="tag bad">a mapped image, stretched</span><canvas id="btnBefore" width="300" height="240"></canvas></div>
+  <div class="col"><span class="tag good">the same button as paths</span><canvas id="btnAfter" width="300" height="240"></canvas></div>
+</div>
+
+<p class="note"><b>Positions are approximate.</b> <code>ControlBar.wnd</code> is read from the installed game data, not from this repo, so the rects above follow the structure the code lays out (<code>LeftHUD</code> for the radar, <code>RightHUD</code> for the queue, <code>MoneyDisplay</code>, <code>PowerWindow</code>, <code>GeneralsExp</code>, the <code>ButtonCommand01–14</code> grid sorted into 2 rows × 7 columns by [GenControlBar.cpp:114](Source/Generals1/Game/GenControlBar.cpp:114)) — not the original pixel coordinates. A real implementation would keep reading the real <code>.wnd</code> for positions, so the layout you see in game stays exactly as it is.</p>
+
+<p class="note"><b>What drawing at native resolution actually fixes:</b></p>
+<ul>
+  <li><b>Button images.</b> <code>DrawMappedImage</code> stretches textures made for 800×600 — at any other size they are resampled. Drawn as paths, edges stay hard at any resolution.</li>
+  <li><b>Text.</b> <code>DrawBarText</code> uses a bitmap font sized for one size; other sizes fall back to the canvas font. One font rendered at the target size is readable at 1080p, 1440p and 4K.</li>
+  <li><b>The build-up clock.</b> <code>DrawRemainingClock</code> sweeps from twelve o'clock; at the sizes it is drawn at today the sweep reads as chunky steps. Same sweep, antialiased.</li>
+  <li><b>The radar.</b> It is redrawn every other logic frame at one texel per radar cell, so its resolution is fixed by the map, not the screen. Drawing at the panel's real size keeps blips and fog edges clean.</li>
+  <li><b>Colours.</b> The scheme values are 0–255 sRGB handled as linear (the code converts them at [GenHUD.cpp:208](Source/Generals1/Game/GenHUD.cpp:208)); a redraw would use them as light, which is where the muddiness comes from.</li>
+</ul>
+<p class="note"><b>What does not change:</b> the layout, the sizes, the per-side scheme, the hotkey letters, the queue, the clock, the radar contents, health bars and selection rings, tooltips, the general's promotions. Nothing about how it behaves — only how it is drawn.</p>
+
+<script>
+const P = {
+  frameTop:[26,32,40], frameBot:[14,18,24],
+  cellTop:[18,24,32], cellBot:[10,14,20],
+  edge:[70,86,104], gold:[200,158,44],
+  text:[219,229,255], dim:[120,135,168],
+  green:[102,230,115], red:[255,82,69], blue:[92,158,254],
+  panelTop:[6,10,22], panelBot:[2,3,8]
+};
+const B = {
+  frameTop:[32,48,48], frameBot:[16,24,32],
+  cellTop:[24,32,40], cellBot:[12,18,26],
+  edge:[64,80,112], gold:[194,146,43],
+  text:[203,217,236], dim:[118,134,160],
+  green:[102,230,115], red:[255,82,69], blue:[92,158,254],
+  panelTop:[10,18,40], panelBot:[3,5,12]
+};
+
+function rgb(c,a){ return a===undefined ? `rgb(${c[0]},${c[1]},${c[2]})` : `rgba(${c[0]},${c[1]},${c[2]},${a})`; }
+function quantize(c,n){ return c.map(v=>Math.round(v/n)*n); }
+
+// layout in the original 800×600 design space (screen coords, y down)
+const L = {
+  radar:   [24,486,168,138],
+  bar:     [204,486,572,138],
+  portrait:[212,494,86,86],
+  grid:    { x:302, y:494, cols:7, rows:2, cw:34, ch:34, gap:2 },
+  queue:   { x:554, y:494, w:96, h:86, slots:3 },
+  sys:     { x:302, y:598, w:34, h:34 },
+  money:   [656,494,110,26],
+  power:   [656,524,110,40],
+  exp:     [212,608,340,14]
+};
+function gridCells(){
+  const out=[]; const g=L.grid;
+  for(let r=0;r<g.rows;r++) for(let c=0;c<g.cols;c++)
+    out.push([g.x+c*(g.cw+g.gap), g.y+r*(g.ch+g.gap), g.cw, g.ch]);
+  return out;
+}
+
+function drawBar(ctx, C, fontPx, sharp){
+  // world above the bar
+  ctx.fillStyle = rgb([20,29,22]); ctx.fillRect(0,0,800,486);
+  ctx.fillStyle = rgb([38,50,40]); ctx.beginPath();
+  ctx.moveTo(120,300); ctx.lineTo(300,190); ctx.lineTo(470,268); ctx.lineTo(640,150); ctx.lineTo(770,235); ctx.lineTo(770,486); ctx.lineTo(120,486); ctx.closePath(); ctx.fill();
+
+  // bar frame
+  const frame = (x,y,w,h)=>{
+    const g=ctx.createLinearGradient(0,y,0,y+h);
+    g.addColorStop(0,rgb(C.frameTop)); g.addColorStop(1,rgb(C.frameBot));
+    ctx.fillStyle=g; ctx.fillRect(x,y,w,h);
+    ctx.strokeStyle=rgb(C.edge); ctx.lineWidth=sharp?1.4:2; ctx.strokeRect(x+.5,y+.5,w-1,h-1);
+    // gold accent along the top
+    ctx.fillStyle=rgb(C.gold); ctx.fillRect(x+6,y,w*0.25,sharp?1.5:2);
+  };
+  frame(L.bar[0],L.bar[1],L.bar[2],L.bar[3]);
+  frame(L.radar[0],L.radar[1],L.radar[2],L.radar[3]);
+
+  // radar content
+  const R=L.radar;
+  ctx.fillStyle=rgb([10,16,26]); ctx.fillRect(R[0]+6,R[1]+20,R[2]-12,R[3]-26);
+  const cells=sharp?16:14;
+  for(let i=0;i<9;i++) for(let j=0;j<7;j++){
+    if((i*j)%5===0){ ctx.fillStyle=rgb(quantize([40,52,42],sharp?32:64),0.7); ctx.fillRect(R[0]+6+i*cells,R[1]+20+j*cells,cells,cells); }
+  }
+  const blips=[[40,70,C.green],[70,95,C.green],[120,45,C.red]];
+  blips.forEach(([bx,by,col])=>{
+    if(sharp){ ctx.beginPath(); ctx.arc(R[0]+6+bx,R[1]+20+by,3,0,7); ctx.fillStyle=rgb(col); ctx.fill(); }
+    else { ctx.fillStyle=rgb(col); ctx.fillRect(R[0]+6+bx-3,R[1]+20+by-3,7,7); }
+  });
+
+  // portrait inset
+  const P0=L.portrait;
+  ctx.fillStyle=rgb([3,5,13]); ctx.fillRect(P0[0],P0[1],P0[2],P0[3]);
+  ctx.strokeStyle=rgb(C.edge); ctx.lineWidth=sharp?1:2; ctx.strokeRect(P0[0]+.5,P0[1]+.5,P0[2]-1,P0[3]-1);
+  ctx.fillStyle=rgb(C.blue,.45); ctx.beginPath();
+  ctx.moveTo(P0[0]+43,P0[1]+22); ctx.lineTo(P0[0]+62,P0[1]+52); ctx.lineTo(P0[0]+24,P0[1]+52); ctx.closePath(); ctx.fill();
+  ctx.font=`700 ${fontPx}px 'Segoe UI',system-ui,sans-serif`;
+  ctx.fillStyle=rgb(C.gold); ctx.fillText('AVATAR',P0[0]+4,P0[1]+80);
+  ctx.fillStyle=rgb([0,0,0]); ctx.fillRect(P0[0]+4,P0[1]+90,P0[2]-8,6);
+  ctx.fillStyle=rgb(C.green); ctx.fillRect(P0[0]+5,P0[1]+91,(P0[2]-10)*0.7,5);
+
+  // command buttons
+  const labels=['⌂','⛊','⚒','◆','◇','⌗','⌘','⌞','⌈','⌋','⌇','⌏','⌌','⌍'];
+  const keys=['Q','W','E','R','T','Y','A','S','D','F','G','H','Z','X'];
+  gridCells().forEach(([x,y,w,h],i)=>{
+    const g=ctx.createLinearGradient(0,y,0,y+h);
+    g.addColorStop(0,rgb(C.cellTop)); g.addColorStop(1,rgb(C.cellBot));
+    ctx.fillStyle=g; ctx.fillRect(x,y,w,h);
+    const border = [3,4,7,8,10,13].includes(i) ? rgb(C.dim,.4) : (i===0 ? rgb(C.gold) : rgb(C.edge));
+    ctx.strokeStyle=border; ctx.lineWidth=sharp?1:2; ctx.strokeRect(x+.5,y+.5,w-1,h-1);
+    if(i===0){ ctx.fillStyle=rgb(C.gold,.8); ctx.fillRect(x,y,sharp?2:3,h); }
+    ctx.font=`700 ${fontPx}px 'Segoe UI',system-ui,sans-serif`;
+    ctx.fillStyle=[3,4,7,8,10,13].includes(i)?rgb(C.dim):rgb(C.text);
+    ctx.fillText(labels[i],x+4,y+Math.round(h*0.45));
+    ctx.fillStyle=rgb(C.dim,.7); ctx.font=`400 ${Math.max(6,fontPx-2)}px 'Segoe UI',system-ui,sans-serif`;
+    ctx.fillText(keys[i],x+4,y+h-3);
+    if(i===1){ // build-up clock: remaining swept from twelve
+      const done=0.65, cx=x+w/2, cy=y+h/2, r=Math.min(w,h)/2-2;
+      if(sharp){
+        ctx.fillStyle=rgb([0,0,0],.55); ctx.beginPath(); ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,-Math.PI/2,-Math.PI/2+Math.PI*2*done); ctx.closePath(); ctx.fill();
+      } else {
+        for(let a=0;a<24;a++){ const t=a/24; if(t>=done) continue;
+          ctx.fillStyle=rgb([0,0,0],.55);
+          ctx.fillRect(cx+Math.cos(-Math.PI/2+t*6.283)*r*0.4, cy+Math.sin(-Math.PI/2+t*6.283)*r*0.4, 4,4); }
+      }
+    }
+  });
+
+  // production queue
+  const Q=L.queue;
+  ctx.fillStyle=rgb([3,5,13]); ctx.fillRect(Q.x,Q.y,Q.w,Q.h);
+  ctx.strokeStyle=rgb(C.edge); ctx.lineWidth=sharp?1:2; ctx.strokeRect(Q.x+.5,Q.y+.5,Q.w-1,Q.h-1);
+  for(let i=0;i<Q.slots;i++){
+    const sy=Q.y+4+i*26;
+    ctx.strokeStyle=rgb(C.dim,.4); ctx.lineWidth=sharp?1:2; ctx.strokeRect(Q.x+4.5,sy+.5,Q.w-9,22);
+    const done=i===0?0.7:(i===1?0.35:0);
+    if(done){ ctx.fillStyle=rgb(C.gold,.3); ctx.fillRect(Q.x+5,sy+1,(Q.w-10)*done,20); }
+    ctx.font=`400 ${Math.max(6,fontPx-1)}px 'Segoe UI',system-ui,sans-serif`;
+    ctx.fillStyle=done?rgb(C.text):rgb(C.dim);
+    ctx.fillText(i===2?'—':'DEPOT',Q.x+7,sy+14);
+  }
+
+  // money / power
+  ctx.font=`700 ${fontPx+2}px 'Segoe UI',system-ui,sans-serif`;
+  ctx.fillStyle=rgb(C.gold); ctx.fillText('$12,400',L.money[0],L.money[1]+18);
+  ctx.fillStyle=rgb(C.blue); ctx.font=`700 ${fontPx}px 'Segoe UI',system-ui,sans-serif`;
+  ctx.fillText('+2,400',L.power[0],L.power[1]+18);
+  ctx.fillStyle=rgb([0,0,0],.7); ctx.fillRect(L.power[0],L.power[1]+24,L.power[2],8);
+  ctx.fillStyle=rgb(C.blue,.7); ctx.fillRect(L.power[0]+1,L.power[1]+25,(L.power[2]-2)*0.65,7);
+
+  // generals exp bar
+  ctx.fillStyle=rgb([0,0,0],.7); ctx.fillRect(L.exp[0],L.exp[1],L.exp[2],L.exp[3]);
+  ctx.fillStyle=rgb(C.gold,.5); ctx.fillRect(L.exp[0]+1,L.exp[1]+1,L.exp[2]*0.45,L.exp[3]-2);
+  for(let i=0;i<6;i++){
+    const earned=i<3;
+    ctx.fillStyle=earned?rgb(C.gold):rgb(C.dim,.5);
+    if(sharp){ ctx.beginPath(); ctx.arc(L.exp[0]+8+i*20,L.exp[1]+7,5,0,7); ctx.fill(); }
+    else ctx.fillRect(L.exp[0]+4+i*20,L.exp[1]+2,8,10);
+  }
+}
+
+// BEFORE: draw at 1/4 scale, blit up nearest-neighbour
+{
+  const small=document.createElement('canvas'); small.width=200; small.height=150;
+  const sc=small.getContext('2d'); sc.save(); sc.scale(200/800,150/600);
+  drawBar(sc, quantizeColors(B,8), 7, false); sc.restore();
+  const out=document.getElementById('before').getContext('2d');
+  out.imageSmoothingEnabled=false;
+  out.clearRect(0,0,1000,750);
+  out.drawImage(small,0,0,1000,750);
+}
+// AFTER: same drawing, at the size it is shown
+{
+  const out=document.getElementById('after').getContext('2d');
+  out.save(); out.scale(1000/800,750/600);
+  drawBar(out, B, 12, true); out.restore();
+}
+function quantizeColors(o,n){ const r={}; for(const k in o) r[k]=o[k].map(v=>Math.round(v/n)*n); return r; }
+
+// zoomed button
+function drawBtnButton(ctx, C, fontPx, sharp){
+  ctx.clearRect(0,0,300,240); ctx.fillStyle=rgb([14,18,24]); ctx.fillRect(0,0,300,240);
+  const x=40,y=40,w=200,h=160;
+  if(sharp){
+    const g=ctx.createLinearGradient(0,y,0,y+h); g.addColorStop(0,rgb(C.cellTop)); g.addColorStop(1,rgb(C.cellBot));
+    ctx.fillStyle=g; ctx.fillRect(x,y,w,h);
+    ctx.strokeStyle=rgb(C.gold); ctx.lineWidth=1.5; ctx.strokeRect(x+.5,y+.5,w-1,h-1);
+    ctx.fillStyle=rgb(C.gold,.8); ctx.fillRect(x,y,2,h);
+    ctx.font=`700 ${fontPx}px 'Segoe UI',system-ui,sans-serif`; ctx.fillStyle=rgb(C.text);
+    ctx.fillText('⌂',x+10,y+60); ctx.fillStyle=rgb(C.dim,.8); ctx.font=`400 14px 'Segoe UI',system-ui,sans-serif`; ctx.fillText('Q',x+10,y+h-10);
+  } else {
+    const g=ctx.createLinearGradient(0,y,0,y+h); g.addColorStop(0,rgb(quantize(C.cellTop,16))); g.addColorStop(1,rgb(quantize(C.cellBot,16)));
+    ctx.fillStyle=g; ctx.fillRect(x,y,w,h);
+    ctx.strokeStyle=rgb(quantize(C.gold,16)); ctx.lineWidth=4; ctx.strokeRect(x,y,w,h);
+    ctx.fillStyle=rgb(quantize(C.gold,16)); ctx.fillRect(x,y,6,h);
+    ctx.font=`700 ${fontPx}px 'Segoe UI',system-ui,sans-serif`; ctx.fillStyle=rgb(quantize(C.text,32));
+    ctx.fillText('⌂',x+10,y+60); ctx.fillStyle=rgb(quantize(C.dim,32)); ctx.font=`400 14px 'Segoe UI',system-ui,sans-serif`; ctx.fillText('Q',x+10,y+h-10);
+  }
+}
+{
+  const s=document.createElement('canvas'); s.width=60; s.height=48;
+  const sc=s.getContext('2d'); sc.save(); sc.scale(60/300,48/240); drawBtnButton(sc,B,10,false); sc.restore();
+  const o=document.getElementById('btnBefore').getContext('2d'); o.imageSmoothingEnabled=false; o.drawImage(s,0,0,300,240);
+  drawBtnButton(document.getElementById('btnAfter').getContext('2d'),B,34,true);
+}
+</script>
+</body>
+</html>

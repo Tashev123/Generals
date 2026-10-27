@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>HUD Design C — Military Frame HUD (physical, structured, modern)</title>
+<style>
+  body { margin:0; background:#1a1f2e; font-family:'Segoe UI',system-ui,sans-serif; display:flex; flex-direction:column; align-items:center; min-height:100vh; padding:24px; color:#dce3f0; }
+  h1 { font-size:18px; font-weight:600; color:#c79e28; margin:0 0 4px; letter-spacing:1px; }
+  .desc { font-size:13px; color:#7a8a9e; margin-bottom:20px; text-align:center; max-width:700px; }
+  .mockup { width:1200px; height:675px; position:relative; background:#1e2436; border-radius:12px; overflow:hidden; box-shadow:0 4px 24px rgba(0,0,0,.5); border:1px solid #2a3444; }
+  .world { position:absolute; inset:0; background:radial-gradient(ellipse at 40% 50%, #2a3830 0%, #1e2822 50%, #141d16 100%); }
+  .world::after { content:'(game view — terrain, units)'; position:absolute; top:35%; left:50%; transform:translate(-50%,-50%); font-size:14px; color:rgba(255,255,255,.15); }
+
+  /* C: structured frame — dark brushed steel + gold trim, chamfered corners, subtle inner shadow */
+  .frame { background:linear-gradient(160deg, #1c2734 0%, #0e1520 100%); border:1px solid #3a4a5e; box-shadow:inset 0 1px 0 rgba(200,220,255,.06), inset 0 0 0 1px rgba(10,15,25,.4), 0 3px 14px rgba(0,0,0,.4); clip-path:polygon(10px 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%, 0 10px); }
+  .gold-trim { border-top:2px solid rgba(199,158,40,.5); }
+  .inner-shadow { box-shadow:inset 0 1px 3px rgba(0,0,0,.5); }
+
+  /* command bar — a wide frame at bottom, grid of cells */
+  .bar { position:absolute; bottom:14px; left:50%; transform:translateX(-50%); width:640px; height:118px; padding:10px 14px; display:flex; gap:12px; }
+  .bar .grid { display:grid; grid-template-columns:repeat(7,40px); grid-template-rows:repeat(2,40px); gap:4px; }
+  .cell { width:40px; height:40px; background:#111b28; border:1px solid #2e3d52; border-radius:3px; display:flex; align-items:center; justify-content:center; font-size:12px; color:#5e7a96; }
+  .cell.hot { border-color:#3a6a9e; background:#1a2d42; color:#5b9bf0; }
+  .cell.build { border-color:#6a7a3a; background:#1a261a; color:#7a9a4a; }
+  .cell.disabled { opacity:.3; border-color:#2a3444; }
+
+  /* portrait column inside the bar */
+  .portrait-col { display:flex; flex-direction:column; gap:6px; width:56px; }
+  .portrait { width:56px; height:56px; background:#111b28; border:1px solid #2e3d52; border-radius:3px; display:flex; align-items:center; justify-content:center; }
+  .portrait .icon { font-size:22px; color:#3a5a7e; }
+  .hp-strip { width:56px; height:8px; background:#111b28; border:1px solid #2e3d52; border-radius:2px; overflow:hidden; }
+  .hp-strip .fill { height:100%; background:#4d7f3a; width:70%; }
+  .unit-name { font-size:10px; color:#c79e28; font-weight:600; white-space:nowrap; overflow:hidden; }
+
+  /* radar — square, embedded in frame, with status readout */
+  .radar { position:absolute; bottom:14px; left:14px; width:210px; height:214px; padding:10px; }
+  .radar-face { width:190px; height:170px; background:#0c1420; border:1px solid #223345; border-radius:3px; position:relative; }
+  .radar-face::before { content:''; position:absolute; inset:0; background:
+    radial-gradient(circle at 30% 40%, #253328 15%, transparent 15%),
+    radial-gradient(circle at 60% 70%, #2a3025 10%, transparent 10%),
+    radial-gradient(circle at 50% 30%, #2e3330 12%, transparent 12%),
+    repeating-linear-gradient(0deg, transparent 0, rgba(255,255,255,.02) 1px, transparent 2px),
+    repeating-linear-gradient(90deg, transparent 0, rgba(255,255,255,.02) 1px, transparent 2px); }
+  .blip { position:absolute; width:6px; height:6px; border-radius:50%; }
+  .blip.own { background:#4d9f3a; }
+  .blip.enemy { background:#c43025; }
+  .blip.ally { background:#5b9bf0; }
+  .radar-header { font-size:9px; color:#5a7a96; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:4px; }
+
+  /* resources as structured frame top-right */
+  .resources { position:absolute; top:14px; right:14px; width:190px; padding:10px 14px; display:flex; flex-direction:column; gap:5px; }
+  .res-row { display:flex; align-items:center; gap:8px; }
+  .res-icon { width:18px; height:18px; border-radius:3px; background:#1a2630; border:1px solid #2e3d52; display:flex; align-items:center; justify-content:center; font-size:10px; }
+  .res-label { font-size:10px; color:#5a7a96; flex:1; }
+  .res-value { font-size:12px; font-weight:600; color:#c79e28; }
+  .power-meter { height:8px; background:#111b28; border:1px solid #2e3d52; border-radius:2px; overflow:hidden; }
+  .power-meter .fill { height:100%; background:#5b9bf0; width:65%; }
+
+  /* promotions as a small frame top-left, rank plate look */
+  .promotions { position:absolute; top:14px; left:14px; width:200px; padding:10px 14px; }
+  .prom-header { font-size:9px; color:#5a7a96; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:6px; }
+  .rank-plate { display:flex; align-items:center; gap:6px; margin-bottom:6px; }
+  .rank-plate .rank { width:20px; height:20px; background:#1a2630; border:1px solid #3a4a5e; border-radius:3px; display:flex; align-items:center; justify-content:center; font-size:9px; color:#c79e28; font-weight:700; }
+  .rank-plate .rank-text { font-size:11px; color:#dce3f0; }
+  .stars { display:flex; gap:4px; }
+  .star { width:12px; height:12px; background:#111b28; border:1px solid #2e3d52; border-radius:2px; }
+  .star.earned { background:rgba(199,158,40,.15); border-color:rgba(199,158,40,.5); }
+
+  /* in-world health bar + selection ring (as a HUD overlay) */
+  .sel-box { position:absolute; top:38%; left:42%; }
+  .sel-unit { width:48px; height:48px; border:1.5px solid #5b9bf0; border-radius:50%; background:rgba(90,155,240,.08); display:flex; align-items:center; justify-content:center; font-size:10px; color:#5b9bf0; }
+  .sel-hp { margin-top:4px; width:60px; height:4px; background:#111; border-radius:2px; overflow:hidden; }
+  .sel-hp .fill { height:100%; background:#4d7f3a; width:75%; }
+
+  .label { position:absolute; font-size:10px; color:#c79e28; font-weight:600; padding:2px 6px; background:rgba(25,40,60,.6); border-radius:3px; }
+  .label.la { bottom:140px; left:45%; }
+  .label.lb { bottom:230px; left:18px; }
+  .label.lc { top:100px; right:18px; }
+  .label.ld { top:90px; left:18px; }
+</style>
+</head>
+<body>
+<h1>Concept C — Military Frame HUD (structured, physical feel)</h1>
+<p class="desc">The layout familiar to Zero Hour players (bottom control bar, corner radar, top resource display) kept as-is structurally, but rendered as dark brushed-steel frames with chamfered corners, gold accent lines, subtle inner shadows, and gold text for important values. Reads as "military console" — solid and structured, not glassy. Still matches the shell menus through shared corner treatment and the gold-on-dark palette.</p>
+<div class="mockup">
+  <div class="world"></div>
+
+  <!-- in-world selection -->
+  <div class="sel-box">
+    <div class="sel-unit">▣</div>
+    <div class="sel-hp"><div class="fill"></div></div>
+  </div>
+
+  <!-- command bar -->
+  <div class="frame gold-trim bar">
+    <div class="portrait-col">
+      <div class="portrait"><div class="icon">▣</div></div>
+      <div class="hp-strip"><div class="fill"></div></div>
+      <div class="unit-name">AVATAR</div>
+    </div>
+    <div class="grid">
+      <div class="cell hot">⚔</div>
+      <div class="cell build">▲</div>
+      <div class="cell build">▲</div>
+      <div class="cell">◆</div>
+      <div class="cell disabled">·</div>
+      <div class="cell">◆</div>
+      <div class="cell disabled">·</div>
+      <div class="cell build">▲</div>
+      <div class="cell">◆</div>
+      <div class="cell disabled">·</div>
+      <div class="cell disabled">·</div>
+      <div class="cell">◆</div>
+      <div class="cell disabled">·</div>
+      <div class="cell">◆</div>
+    </div>
+  </div>
+
+  <!-- radar -->
+  <div class="frame gold-trim radar">
+    <div class="radar-header">Radar</div>
+    <div class="radar-face">
+      <div class="blip own" style="top:40%;left:35%"></div>
+      <div class="blip own" style="top:55%;left:50%"></div>
+      <div class="blip enemy" style="top:20%;left:65%"></div>
+      <div class="blip ally" style="top:70%;left:30%"></div>
+    </div>
+  </div>
+
+  <!-- resources -->
+  <div class="frame gold-trim resources">
+    <div class="res-row">
+      <div class="res-icon">$</div>
+      <span class="res-label">Credits</span>
+      <span class="res-value">12,400</span>
+    </div>
+    <div class="res-row">
+      <div class="res-icon">⚡</div>
+      <span class="res-label">Power</span>
+      <span class="res-value">+2,400</span>
+    </div>
+    <div class="power-meter"><div class="fill"></div></div>
+    <div class="res-row">
+      <div class="res-icon">☰</div>
+      <span class="res-label">Supply</span>
+      <span class="res-value">4/8</span>
+    </div>
+  </div>
+
+  <!-- promotions -->
+  <div class="frame gold-trim promotions">
+    <div class="prom-header">General</div>
+    <div class="rank-plate">
+      <div class="rank">3</div>
+      <div class="rank-text">Major General</div>
+    </div>
+    <div class="stars">
+      <div class="star earned"></div><div class="star earned"></div><div class="star earned"></div>
+      <div class="star"></div><div class="star"></div><div class="star"></div>
+    </div>
+  </div>
+
+  <span class="label la">C1: Control bar frame</span>
+  <span class="label lb">C2: Radar with gold trim</span>
+  <span class="label lc">C3: Resources frame</span>
+  <span class="label ld">C4: General rank plate</span>
+</div>
+</body>
+</html>

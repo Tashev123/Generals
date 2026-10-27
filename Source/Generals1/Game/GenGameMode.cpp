@@ -291,6 +291,7 @@ bool AGenGameMode::BeginMatch(const FGenMatchSettings& Settings, bool bFromMenu,
 	}
 	Phase = EGenGamePhase::Playing;
 	bQuitMenuOpen = false;
+	bPauseRequested = false;
 	bWatching = false;
 	DecidedSeconds = 0.f;
 
@@ -825,7 +826,7 @@ void AGenGameMode::ToggleQuitMenu()
 		return;
 	}
 	bQuitMenuOpen = !bQuitMenuOpen;
-	Logic->SetPaused(bQuitMenuOpen);
+	ApplyPause();
 	if (bQuitMenuOpen && GEngine)
 	{
 		// The game stands still behind the menu: the moment for the engine to collect its garbage, which
@@ -833,6 +834,27 @@ void AGenGameMode::ToggleQuitMenu()
 		// gc.TimeBetweenPurgingPendingKillObjects in DefaultEngine.ini).
 		GEngine->ForceGarbageCollection(false);
 	}
+}
+
+void AGenGameMode::ApplyPause()
+{
+	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	if (Logic)
+	{
+		// SetPaused refuses where an order source drives the clock (a network game): the host keeps going.
+		Logic->SetPaused(bQuitMenuOpen || bPauseRequested);
+	}
+}
+
+void AGenGameMode::TogglePause()
+{
+	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	if (Phase != EGenGamePhase::Playing || !Logic || !Logic->IsRunning())
+	{
+		return;
+	}
+	bPauseRequested = !bPauseRequested;
+	ApplyPause();
 }
 
 void AGenGameMode::ReloadLevel()
@@ -861,6 +883,7 @@ void AGenGameMode::EndGame()
 	if (Phase == EGenGamePhase::Playing)
 	{
 		bQuitMenuOpen = false;
+		bPauseRequested = false;
 		Phase = EGenGamePhase::Score; // (the game stays as it stands, behind the score)
 		if (GEngine)
 		{
@@ -922,6 +945,7 @@ void AGenGameMode::KeepWatching()
 	bWatching = true;
 	DecidedSeconds = 0.f;
 	Phase = EGenGamePhase::Playing;
+	bPauseRequested = false;
 	Logic->SetPaused(false);
 }
 
@@ -1046,6 +1070,7 @@ void AGenGameMode::Tick(float DeltaSeconds)
 			if (DecidedSeconds >= ScoreScreenDelay)
 			{
 				bQuitMenuOpen = false;
+				bPauseRequested = false;
 				Logic->SetPaused(false);
 				Phase = EGenGamePhase::Score;
 				if (GEngine)

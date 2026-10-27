@@ -64,6 +64,8 @@ private:
 	TMap<uint64, bool> SuperweaponEvaPlayed;   // SuperweaponInfo::m_evaReadyPlayed, by object and power module
 	void DrawVeterancy(AGenPlayerController* PC, UGenGameLogic* Logic);
 	void DrawGameOver(UGenGameLogic* Logic);
+	/** The pause the hotkey asked for, with no menu up: the message in the middle of the screen. */
+	void DrawPause(AGenGameMode* GM, UGenGameLogic* Logic);
 	void DrawBarButton(const FGenBarButton& B, bool bHovered, float Scale, UGenGameLogic* Logic, const struct FGenControlBarScheme* Scheme);
 	void DrawTooltip(const FGenBarButton& B, const FVector2D& Mouse, float Scale, UGenGameLogic* Logic);
 	void DrawRadar(AGenPlayerController* PC, UGenGameLogic* Logic);

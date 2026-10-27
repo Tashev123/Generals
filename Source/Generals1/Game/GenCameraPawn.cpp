@@ -15,7 +15,13 @@ AGenCameraPawn::AGenCameraPawn()
 	// An RTS camera scrolls constantly: motion blur just smears the battlefield.
 	Camera->PostProcessSettings.bOverride_MotionBlurAmount = true;
 	Camera->PostProcessSettings.MotionBlurAmount = 0.f;
-	Height = TargetHeight = CameraHeight;
+	Height = TargetHeight = GetInitialHeight();
+}
+
+float AGenCameraPawn::GetInitialHeight() const
+{
+	// Start near full zoom out: N wheel notches inward from MaxCameraHeight.
+	return FMath::Clamp(MaxCameraHeight * FMath::Pow(1.f - ZoomStepFraction, InitialZoomNotchesFromFullZoomOut), MinCameraHeight, MaxCameraHeight);
 }
 
 AGenMapActor* AGenCameraPawn::FindMap() const
@@ -63,7 +69,7 @@ void AGenCameraPawn::Zoom(float Steps)
 void AGenCameraPawn::ResetView()
 {
 	Yaw = 0.f;
-	Height = TargetHeight = CameraHeight;
+	Height = TargetHeight = GetInitialHeight();
 	UpdateCamera();
 }
 

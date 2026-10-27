@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>HUD Design A — Panel HUD (extends the shell language)</title>
+<style>
+  body { margin:0; background:#1a1f2e; font-family:'Segoe UI',system-ui,sans-serif; display:flex; flex-direction:column; align-items:center; min-height:100vh; padding:24px; color:#dce3f0; }
+  h1 { font-size:18px; font-weight:600; color:#c79e28; margin:0 0 4px; letter-spacing:1px; }
+  .desc { font-size:13px; color:#7a8a9e; margin-bottom:20px; text-align:center; max-width:700px; }
+  .mockup { width:1200px; height:675px; position:relative; background:#1e2436; border-radius:12px; overflow:hidden; box-shadow:0 4px 24px rgba(0,0,0,.5); border:1px solid #2a3444; }
+  /* faux world */
+  .world { position:absolute; inset:0; background:radial-gradient(ellipse at 40% 50%, #2a3830 0%, #1e2822 50%, #141d16 100%); }
+  .world::after { content:'(game view — terrain, units)'; position:absolute; top:40%; left:50%; transform:translate(-50%,-50%); font-size:14px; color:rgba(255,255,255,.15); }
+
+  /* shared panel style — matches GenShellStyle */
+  .panel { background:linear-gradient(180deg, rgba(22,40,80,.92) 0%, rgba(6,12,26,.94) 100%); border:1px solid rgba(57,102,187,.45); clip-path:polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px); }
+  .accent { color:#c79e28; font-size:11px; font-weight:600; letter-spacing:.5px; }
+
+  /* A) Bottom command bar */
+  .bar { position:absolute; bottom:16px; left:50%; transform:translateX(-50%); width:620px; height:120px; padding:10px 14px; display:flex; gap:10px; }
+  .bar .grid { display:grid; grid-template-columns:repeat(7,42px); grid-template-rows:repeat(2,42px); gap:5px; }
+  .btn { width:42px; height:42px; background:rgba(10,20,45,.85); border:1px solid rgba(57,102,187,.5); border-radius:4px; display:flex; align-items:center; justify-content:center; font-size:9px; color:#7fb3f0; cursor:pointer; }
+  .btn:hover { background:rgba(25,60,120,.7); border-color:#5b9bf0; }
+  .btn.hot { background:rgba(25,60,120,.7); border-color:#5b9bf0; }
+  .btn.disabled { opacity:.35; border-color:rgba(57,102,187,.2); color:#444; }
+  .portrait { width:52px; height:94px; background:rgba(6,12,26,.9); border:1px solid rgba(57,102,187,.5); border-radius:4px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:4px; font-size:9px; }
+  .portrait .face { width:36px; height:36px; border-radius:50%; background:radial-gradient(circle at 40% 30%, #3a5570, #1a2a3f); }
+  .portrait .name { font-size:10px; color:#c79e28; font-weight:600; }
+  .portrait .hp { width:36px; height:5px; background:#111; border-radius:2px; }
+  .portrait .hp-fill { height:100%; width:70%; background:#4d7f3a; border-radius:2px; }
+
+  /* B) Radar / minimap */
+  .radar { position:absolute; bottom:16px; left:16px; width:200px; height:200px; padding:10px; }
+  .radar-inner { width:180px; height:180px; background:#111a28; border-radius:4px; position:relative; overflow:hidden; }
+  .radar-inner::before { content:''; position:absolute; inset:0; background:
+    radial-gradient(circle at 30% 40%, #2a3a30 15%, transparent 15%),
+    radial-gradient(circle at 60% 70%, #303530 10%, transparent 10%),
+    radial-gradient(circle at 50% 30%, #353a35 12%, transparent 12%); }
+  .blip { position:absolute; width:6px; height:6px; border-radius:50%; }
+  .blip.own { background:#4d9f3a; box-shadow:0 0 4px #4d9f3a; }
+  .blip.enemy { background:#d4372e; box-shadow:0 0 4px #d4372e; }
+  .blip ally { background:#5b9bf0; }
+  .radar-label { font-size:9px; color:#5f7896; margin-bottom:4px; text-transform:uppercase; letter-spacing:1px; }
+
+  /* C) Resources */
+  .resources { position:absolute; top:16px; right:16px; width:180px; padding:10px 12px; display:flex; flex-direction:column; gap:6px; }
+  .res-row { display:flex; justify-content:space-between; align-items:center; font-size:12px; }
+  .res-label { color:#7a8a9e; font-size:10px; }
+  .res-value { color:#c79e28; font-weight:600; }
+  .power-bar { height:6px; background:#111822; border-radius:3px; overflow:hidden; }
+  .power-bar-fill { height:100%; background:#5b9bf0; width:65%; }
+
+  /* D) General promotions */
+  .promotions { position:absolute; top:16px; left:16px; width:180px; padding:10px 12px; }
+  .prom-title { font-size:10px; color:#5f7896; text-transform:uppercase; letter-spacing:1px; margin-bottom:6px; }
+  .star { width:14px; height:14px; display:inline-block; background:rgba(10,20,40,.7); border:1px solid rgba(57,102,187,.3); border-radius:2px; margin:2px; font-size:8px; text-align:center; line-height:14px; color:#7fb3f0; }
+  .star.earned { background:rgba(199,158,40,.15); border-color:rgba(199,158,40,.5); color:#c79e28; }
+
+  /* E) Info line */
+  .infobar { position:absolute; bottom:148px; left:50%; transform:translateX(-50%); width:620px; padding:8px 14px; display:flex; align-items:center; gap:12px; }
+  .infobar .sel { font-size:10px; color:#7a8a9e; }
+  .infobar .sel strong { color:#c79e28; }
+
+  /* F) Tooltip example */
+  .tooltip { position:absolute; top:30%; right:25%; width:200px; padding:8px 12px; font-size:11px; line-height:1.4; pointer-events:none; }
+  .tooltip .tt-name { color:#c79e28; font-weight:600; margin-bottom:4px; }
+  .tooltip .tt-body { color:#7a8a9e; }
+
+  .label { position:absolute; font-size:10px; color:#5b9bf0; font-weight:600; padding:2px 6px; background:rgba(20,40,80,.5); border-radius:3px; }
+  .label.la { bottom:142px; left:48%; }
+  .label.lb { bottom:220px; left:20px; }
+  .label.lc { top:120px; right:20px; }
+  .label.ld { top:130px; left:20px; }
+</style>
+</head>
+<body>
+<h1>Concept A — Panel HUD (shell language extended to gameplay)</h1>
+<p class="desc">Same dark-blue panels with cut corners, thin borders, gold accents as the modernized menus. The control bar becomes a floating panel strip at bottom-center, the radar a standalone panel, resources a top-right panel. Everything reads as one design system.</p>
+<div class="mockup">
+  <div class="world"></div>
+
+  <!-- Control bar panel -->
+  <div class="panel bar">
+    <div class="portrait">
+      <div class="face"></div>
+      <div class="name">Select</div>
+      <div class="hp"><div class="hp-fill"></div></div>
+    </div>
+    <div class="grid">
+      <div class="btn hot">⚔</div>
+      <div class="btn">🛡</div>
+      <div class="btn">⚙</div>
+      <div class="btn">▲</div>
+      <div class="btn disabled">·</div>
+      <div class="btn">◆</div>
+      <div class="btn disabled">·</div>
+      <div class="btn">◆</div>
+      <div class="btn disabled">·</div>
+      <div class="btn disabled">·</div>
+      <div class="btn">◆</div>
+      <div class="btn disabled">·</div>
+      <div class="btn disabled">·</div>
+      <div class="btn">◆</div>
+    </div>
+  </div>
+
+  <!-- Radar panel -->
+  <div class="panel radar">
+    <div class="radar-label">Radar</div>
+    <div class="radar-inner">
+      <div class="blip own" style="top:40%;left:35%"></div>
+      <div class="blip own" style="top:55%;left:50%"></div>
+      <div class="blip enemy" style="top:20%;left:65%"></div>
+      <div class="blip ally" style="top:70%;left:30%"></div>
+    </div>
+  </div>
+
+  <!-- Resources panel -->
+  <div class="panel resources">
+    <div class="res-row"><span class="res-label">Credits</span><span class="res-value">$12,400</span></div>
+    <div class="res-row"><span class="res-label">Power</span><span class="res-value">+2,400</span></div>
+    <div class="power-bar"><div class="power-bar-fill"></div></div>
+    <div class="res-row"><span class="res-label">Supply</span><span class="res-value">4 / 8</span></div>
+  </div>
+
+  <!-- Promotions panel -->
+  <div class="panel promotions">
+    <div class="prom-title">General</div>
+    <div>
+      <span class="star earned">★</span><span class="star earned">★</span><span class="star earned">★</span><span class="star">★</span><span class="star">★</span><span class="star">★</span>
+    </div>
+    <div style="margin-top:6px;font-size:10px;color:#5f7896;">2 pts to spend</div>
+  </div>
+
+  <!-- Info bar -->
+  <div class="panel infobar">
+    <span class="sel">Selected: <strong>3 Avatar Battalion</strong> · Group 1 · Ready</span>
+  </div>
+
+  <!-- Tooltip -->
+  <div class="panel tooltip">
+    <div class="tt-name">Supply Drop Zone</div>
+    <div class="tt-body">$1,200 remaining<br>Click to rally workers here.</div>
+  </div>
+
+  <span class="label la">A1: Command bar panel</span>
+  <span class="label lb">A2: Radar panel</span>
+  <span class="label lc">A3: Resources panel</span>
+  <span class="label ld">A4: General panel</span>
+</div>
+</body>
+</html>

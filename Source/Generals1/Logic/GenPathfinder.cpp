@@ -1000,8 +1000,15 @@ bool FGenPathfinder::FindPathAroundUnits(FGenObjectID Id, float Radius, const FV
 	GEN_PERF_SCOPE("Path.AroundUnits");
 	FDetachedSearch Detached(*this);
 	AvoidSelf = Id;
-	AvoidRadius = 0;
-	const bool bFound = FindPath(Start, Goal, Surfaces, OutPath, StartLayer, GoalLayer, OutLayers);
+	// A vehicle keeps a cell clear of the parked units, so that its body gets past them too; where that finds
+	// no way (or none that gets near the goal), it tries again hard by them.
+	AvoidRadius = Radius > CellSize ? 1 : 0;
+	bool bFound = FindPath(Start, Goal, Surfaces, OutPath, StartLayer, GoalLayer, OutLayers);
+	if (AvoidRadius > 0 && (!bFound || OutPath.Num() == 0 || FVector2f::DistSquared(OutPath.Last(), Goal) > FMath::Square(2.f * CellSize)))
+	{
+		AvoidRadius = 0;
+		bFound = FindPath(Start, Goal, Surfaces, OutPath, StartLayer, GoalLayer, OutLayers);
+	}
 	AvoidSelf = GenInvalidObjectID;
 	AvoidRadius = -1;
 	return bFound;

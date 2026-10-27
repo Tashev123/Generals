@@ -667,6 +667,68 @@ FVector3f UGenGameLogic::FindPositionAround(const FVector3f& Center, float MinRa
 	return Center;
 }
 
+FVector3f UGenGameLogic::FindFreeGroundAround(const FVector3f& Center, float MaxRadius)
+{
+	// PartitionManager::findPositionAround / tryPosition: rings 5 apart from the centre outwards, each tried from
+	// a random angle to one side and the other in turn, for passable dry ground (no cliff, no building) where a
+	// small sphere (5) touches nothing.
+	constexpr float RingSpacing = 5.f;
+	constexpr float Clearance = 5.f;
+	auto IsFree = [this](const FVector2f& P)
+	{
+		if (!Pathfinder.IsPassable(P, GenSurface::Ground))
+		{
+			return false;
+		}
+		bool bHit = false;
+		Partition.ForEachInRange(P, Clearance, [&](const FGenObject& O)
+		{
+			if (bHit || O.IsDestroyed() || O.GetContainedBy() != GenInvalidObjectID)
+			{
+				return;
+			}
+			// (iteratePotentialCollisions in 2D: the sphere against the other's footprint.)
+			const FGenThingTemplate* T = O.GetTemplate();
+			const FVector2f D = P - FVector2f(O.GetPosition().X, O.GetPosition().Y);
+			if (T->IsBox())
+			{
+				const FVector2f U = O.GetDirection2D();
+				const float DX = FMath::Max(0.f, FMath::Abs(FVector2f::DotProduct(D, U)) - T->GeometryMajorRadius);
+				const float DY = FMath::Max(0.f, FMath::Abs(FVector2f::DotProduct(D, FVector2f(-U.Y, U.X))) - T->GeometryMinorRadius);
+				bHit = DX * DX + DY * DY < Clearance * Clearance;
+			}
+			else
+			{
+				bHit = D.Size() < T->GeometryMajorRadius + Clearance;
+			}
+		});
+		return !bHit;
+	};
+	const float StartAngle = Random.FRandRange(0.f, 2.f * PI);
+	for (float Dist = 0.f; Dist <= MaxRadius; Dist += RingSpacing)
+	{
+		const float Spacing = Dist == 0.f ? 2.f * PI : (RingSpacing / (Dist + 1.f)) * (2.f * PI / 6.f);
+		const int32 Samples = FMath::CeilToInt32((2.f * PI / Spacing) / 2.f);
+		for (int32 i = 0; i < Samples; ++i)
+		{
+			for (const float Sign : { 1.f, -1.f })
+			{
+				if (i == 0 && Sign < 0.f)
+				{
+					continue; // (the same spot)
+				}
+				const float A = StartAngle + Sign * Spacing * float(i);
+				const FVector2f P(Center.X + Dist * FMath::Cos(A), Center.Y + Dist * FMath::Sin(A));
+				if (IsFree(P))
+				{
+					return FVector3f(P.X, P.Y, GetGroundHeight(P.X, P.Y));
+				}
+			}
+		}
+	}
+	return Center;
+}
+
 void UGenGameLogic::PlaceStartingObjects(const FGenPlayer& Player)
 {
 	// GameLogic.cpp placeNetworkBuildingsForPlayer

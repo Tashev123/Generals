@@ -932,8 +932,9 @@ bool UGenGameLogic::CanRepairObject(const FGenObject& Dozer, const FGenObject& T
 
 bool UGenGameLogic::CanGetRepairedAt(const FGenObject& Unit, const FGenObject& RepairDest) const
 {
-	// ActionManager::canGetRepairedAt: damaged ground vehicles at a repair pad of their own side.
-	// (Aircraft are mended at their airfield: see the land order.)
+	// ActionManager::canGetRepairedAt: damaged ground vehicles at a repair pad of an ally, damaged aircraft in
+	// the air at an airfield of an ally (whichever side built it: a captured Chinese Helix is mended at an
+	// American airfield too).
 	if (Unit.IsDead() || RepairDest.IsDead() || GetRelationship(Unit.GetOwner(), RepairDest.GetOwner()) != EGenRelationship::Allies)
 	{
 		return false;
@@ -942,7 +943,21 @@ bool UGenGameLogic::CanGetRepairedAt(const FGenObject& Unit, const FGenObject& R
 	{
 		return false;
 	}
-	if (!Unit.IsKindOf(TEXT("VEHICLE")) || Unit.IsKindOf(TEXT("AIRCRAFT")) || !RepairDest.IsKindOf(TEXT("REPAIR_PAD")) || !RepairDest.GetTemplate()->bRepairDock)
+	if (!Unit.IsKindOf(TEXT("VEHICLE")))
+	{
+		return false;
+	}
+	if (Unit.IsKindOf(TEXT("AIRCRAFT")))
+	{
+		// (Only JetAIUpdate and ChinookAIUpdate know how to come down at an airfield.)
+		const FVector3f& P = Unit.GetPosition();
+		if ((!Unit.GetTemplate()->bJetAI && !Unit.GetTemplate()->bChinookAI) || P.Z - GetGroundHeight(P.X, P.Y) <= 0.f
+			|| !RepairDest.IsKindOf(TEXT("FS_AIRFIELD")) || !RepairDest.GetParking())
+		{
+			return false;
+		}
+	}
+	else if (!RepairDest.IsKindOf(TEXT("REPAIR_PAD")) || !RepairDest.GetTemplate()->bRepairDock)
 	{
 		return false;
 	}
@@ -989,7 +1004,25 @@ void UGenGameLogic::ExecGetRepaired(const FGenCommand& C)
 	for (FGenObjectID Id : C.Units)
 	{
 		FGenObject* U = FindObject(Id);
-		if (D && U && D->GetDock() && CanGetRepairedAt(*U, *D))
+		if (!D || !U || !CanGetRepairedAt(*U, *D))
+		{
+			continue;
+		}
+		if (U->IsKindOf(TEXT("AIRCRAFT")))
+		{
+			// JetAIUpdate::privateGetRepaired lands as if told to land there; ChinookAIUpdate::privateGetRepaired
+			// flies to open ground beside the airfield and comes down to be mended.
+			U->OnPlayerCommand(false);
+			if (U->bJetAI)
+			{
+				U->CommandLandAt(D->GetID());
+			}
+			else
+			{
+				U->CommandChinookGetRepaired(*D);
+			}
+		}
+		else if (D->GetDock())
 		{
 			U->OnPlayerCommand(true);
 			U->StopConstructing();

@@ -90,6 +90,9 @@ public:
 	/** Esc / F10 during a game: the in-game menu, with the game standing still. */
 	void ToggleQuitMenu();
 	bool IsQuitMenuOpen() const { return bQuitMenuOpen; }
+	/** The pause hotkey: the game stands still with no menu up. A network game can't be stopped - the host
+	 *  keeps the clock - so this does nothing there. */
+	void TogglePause();
 	/** The in-game menu's "restart": the same game again from the beginning. */
 	void RestartGame();
 	/** The in-game menu's "exit": to the score screen. */
@@ -105,6 +108,8 @@ public:
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 private:
+	/** Put the pause as it stands (the menu is up, or the hotkey is on) onto the logic. */
+	void ApplyPause();
 	/** Loads the map and starts the game with these players (and the command line's test switches). False (and
 	 *  the error set) if that fails. */
 	bool BeginGame(const FString& MapName, const TArray<FGenSkirmishSlot>& Slots, int32 StartingCash, bool bFromMenu);
@@ -153,6 +158,7 @@ public:
 	int32 LoadingTicks = 0;
 	bool bStartedFromMenu = false;
 	bool bQuitMenuOpen = false;
+	bool bPauseRequested = false;             // the pause hotkey, on its own (the HUD says it on screen)
 	bool bWatching = false;                  // defeated, looking on: no score screen until the game is over
 	float DecidedSeconds = 0.f;
 
