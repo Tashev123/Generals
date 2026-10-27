@@ -12,7 +12,8 @@ class FGenObject;
  *
  * One cell per height map cell (PATHFIND_CELL_SIZE == MAP_XY_FACTOR). Cells are classified like
  * Pathfinder::classifyMapCell (cliff flags, water polygons) plus structure footprints
- * (classifyObjectFootprint: immobile, non-small structures). Paths are 8-connected A* without
+ * (classifyObjectFootprint: immobile, non-small structures), and a footprint cell remembers which
+ * object put it there (PathfindCellInfo's obstacle id). Paths are 8-connected A* without
  * corner cutting, then smoothed with line-of-sight checks.
  *
  * Bridges are layers, as in the original (PathfindLayer): every bridge has cells of its own over the
@@ -65,7 +66,8 @@ public:
 	/** The first bridge deck a ray meets (its layer and the spot), or 0. */
 	int32 PickBridge(const FVector3f& Start, const FVector3f& Dir, FVector3f& OutHit) const;
 
-	/** Adds/removes a structure footprint (reference counted per cell). */
+	/** Adds/removes a structure footprint (reference counted per cell, and the cell records which object
+	 *  it belongs to). */
 	void AddObstacle(const FGenObject& Obj);
 	void RemoveObstacle(const FGenObject& Obj);
 	/** Pathfinder::classifyFence: the cells under a fence, which only what can crush drives through. */
@@ -74,9 +76,13 @@ public:
 
 	/** Finds a path in world units. Returns false if the start is invalid; if the goal is unreachable the
 	 *  path leads to the closest reachable cell. OutPath excludes the start, ends at the (adjusted) goal.
-	 *  OutLayers gets the layer of every point of the path. */
+	 *  OutLayers gets the layer of every point of the path.
+	 *  IgnoreObstacleID: the object whose footprint this search may walk onto - the one it is going into
+	 *  (Pathfinder::validMovementPosition: "if (toCell->isObstaclePresent( m_ignoreObstacleID )) return true").
+	 *  A unit pathing into a building, or into an aircraft parked at its airfield, gets a path across it. */
 	bool FindPath(const FVector2f& Start, const FVector2f& Goal, uint32 Surfaces, TArray<FVector2f>& OutPath,
-		int32 StartLayer = 0, int32 GoalLayer = 0, TArray<uint8>* OutLayers = nullptr) const;
+		int32 StartLayer = 0, int32 GoalLayer = 0, TArray<uint8>* OutLayers = nullptr,
+		FGenObjectID IgnoreObstacleID = GenInvalidObjectID) const;
 
 	/** Nearest passable position to Pos for the given surfaces (spiral search). */
 	bool AdjustDestination(const FVector2f& Pos, uint32 Surfaces, FVector2f& OutPos, int32 MaxRadiusCells = 30) const;
@@ -111,17 +117,29 @@ public:
 	void RemoveUnit(FGenObjectID Id);
 	/** Pathfinder::removeGoal: gives up the ground a unit had reserved to end its move on. */
 	void RemoveUnitGoal(FGenObjectID Id);
-	/** True if a unit of that size can end a move at Pos: passable ground, no other unit's goal, nobody parked there. */
-	bool IsDestinationFree(FGenObjectID Id, const FVector2f& Pos, float Radius, uint32 Surfaces, int32 Layer = 0) const;
+	/** True if a unit of that size can end a move at Pos: passable ground, no other unit's goal, nobody parked there.
+	 *  Cells that belong to IgnoreObstacleID, and the ones that unit holds, are free for us (checkDestination:
+	 *  "if (cell->isObstaclePresent( ignoreId )) continue" / "if (goalUnitID == ignoreId) continue"). */
+	bool IsDestinationFree(FGenObjectID Id, const FVector2f& Pos, float Radius, uint32 Surfaces, int32 Layer = 0,
+		FGenObjectID IgnoreObstacleID = GenInvalidObjectID) const;
 	/** Moves InOutPos to the nearest free destination (outward square spiral, 400 cells as in the original). */
-	bool AdjustUnitDestination(FGenObjectID Id, float Radius, uint32 Surfaces, FVector2f& InOutPos, int32 Layer = 0) const;
+	bool AdjustUnitDestination(FGenObjectID Id, float Radius, uint32 Surfaces, FVector2f& InOutPos, int32 Layer = 0,
+		FGenObjectID IgnoreObstacleID = GenInvalidObjectID) const;
 	/** Same, with an extra condition on the spot (adjustTargetDestination: e.g. "within weapon range of the target"). */
-	bool AdjustUnitDestination(FGenObjectID Id, float Radius, uint32 Surfaces, FVector2f& InOutPos, TFunctionRef<bool(const FVector2f&)> Accept, int32 Layer = 0) const;
+	bool AdjustUnitDestination(FGenObjectID Id, float Radius, uint32 Surfaces, FVector2f& InOutPos, TFunctionRef<bool(const FVector2f&)> Accept, int32 Layer = 0,
+		FGenObjectID IgnoreObstacleID = GenInvalidObjectID) const;
 	/** FindPath that treats cells held by other stationary units (widened by this unit's size) as blocked. */
 	bool FindPathAroundUnits(FGenObjectID Id, float Radius, const FVector2f& Start, const FVector2f& Goal, uint32 Surfaces, TArray<FVector2f>& OutPath,
-		int32 StartLayer = 0, int32 GoalLayer = 0, TArray<uint8>* OutLayers = nullptr) const;
+		int32 StartLayer = 0, int32 GoalLayer = 0, TArray<uint8>* OutLayers = nullptr,
+		FGenObjectID IgnoreObstacleID = GenInvalidObjectID) const;
 	/** Pathfinder::getRadiusAndCenter: half-size in cells of a unit's footprint, and whether it is centered in a cell. */
 	static void GetRadiusAndCenter(float BoundingCircleRadius, int32& OutRadius, bool& bOutCenter);
+
+	/** Which object put the footprint cell at that spot there (-1: none). PathfindCellInfo's obstacle id, which
+	 *  findPath compares with m_ignoreObstacleID. */
+	FGenObjectID GetFootprintOwner(int32 X, int32 Y) const;
+	/** ... and the one under a world position. */
+	FGenObjectID GetFootprintOwnerAt(const FVector2f& WorldPos) const { return GetFootprintOwner(WorldToCell(WorldPos).X, WorldToCell(WorldPos).Y); }
 
 	ECell GetCell(int32 X, int32 Y) const;
 	int32 GetWidth() const { return Width; }
@@ -175,6 +193,15 @@ private:
 		explicit FDetachedSearch(const FGenPathfinder& In) : Owner(In), bLeft(In.BeginSearchFn ? In.BeginSearchFn(In.SearchContext) : false) {}
 		~FDetachedSearch() { if (bLeft && Owner.EndSearchFn) { Owner.EndSearchFn(Owner.SearchContext); } }
 	};
+	/** Holds the object whose footprint one search or destination test may cross, and gives back what was
+	 *  held before it. */
+	struct FIgnoreObstacle
+	{
+		const FGenPathfinder& Owner;
+		FGenObjectID Saved;
+		FIgnoreObstacle(const FGenPathfinder& In, FGenObjectID Id) : Owner(In), Saved(In.ObstacleToIgnore) { In.ObstacleToIgnore = Id; }
+		~FIgnoreObstacle() { Owner.ObstacleToIgnore = Saved; }
+	};
 
 	int32 Width = 0;
 	int32 Height = 0;
@@ -182,6 +209,8 @@ private:
 	TArray<ECell> Terrain;     // static classification
 	TArray<uint16> Obstacles;  // footprint reference counts
 	TArray<uint8> Fences;      // fences across the cell
+	/** Which object put a footprint cell there (-1: none). PathfindCellInfo's obstacle id. */
+	TArray<FGenObjectID> ObstacleOwner;
 	enum : uint8
 	{
 		FlagGrownCliff = 1,    // open ground at a cliff's foot or edge, counted as cliff
@@ -203,6 +232,10 @@ private:
 	// Set only for the duration of FindPathAroundUnits.
 	mutable FGenObjectID AvoidSelf = GenInvalidObjectID;
 	mutable int32 AvoidRadius = -1;  // < 0: units are ignored
+
+	// Set only for the duration of one search or destination test: Pathfinder's m_ignoreObstacleID, the
+	// object whose footprint may be crossed - the one the unit is going into.
+	mutable FGenObjectID ObstacleToIgnore = GenInvalidObjectID;
 
 	// --- what a search works with; kept from one search to the next ---
 	// Nothing is cleared between searches: a node's cost and parent count only if it carries the stamp

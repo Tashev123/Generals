@@ -790,6 +790,23 @@ when a tank is done, three layers of scaffolding.
       pilot standing beside it and a Raptor produced there - the plane keeps its parking space with the taxi
       locomotor, the pilot is told to enter and walks over, and the Raptor becomes Veteran; a Crusader takes
       the same pilot as before. The computer player's pilot uses the same check when he scans for a vehicle.
+- [x] A pilot sent from far away can walk over the airfield to the plane (the original's
+      m_ignoreObstacleID, which was not ported): a footprint cell remembers which object put it there
+      (PathfindCellInfo's obstacle id), and a search or a destination test may cross the cells of the object
+      it is going into - or of the airfield that object is parked on - as
+      Pathfinder::validMovementPosition does ("if (toCell->isObstaclePresent( m_ignoreObstacleID ))
+      return true") and checkDestination ("if (cell->isObstaclePresent( ignoreId )) continue").
+      AIEnterState::onEnter holds it for the container the unit is walking to and onExit gives it up;
+      findPath's airfield case takes the airfield itself when the goal is something parked there, and only
+      then - the original's note is that this is for things parked on the airfield, not for anything
+      hovering over an obstacle (a Chinook over a supply dock). The cached region labels are not changed by
+      it, so a search still knows what it cannot reach: the exception lasts for that search only, and a goal
+      on the footprint it is allowed to cross counts as reachable. Tried on Tournament Desert with an
+      airfield at (1000,900) and a veteran pilot at (1000,1400): his path ends on the airfield's own cells
+      and he walks over the compound to the Raptor produced there, which becomes Veteran at frame 1962
+      (before this he stopped outside and never got in). The same pilot ordered into a Crusader at
+      (1200,600) still goes round the airfield (through (1070,1234) and (1163,1013)) and ranks it up, so
+      nothing else may walk over a building's cells for him.
 - [ ] Not done yet: CombatDropKillFX (units have no per-unit effects yet); a soldier shot on the rope
       dies where he hangs; a helicopter shot down during a drop leaves the soldiers on the ropes
       sliding on (the original drops them); nothing shows a jet being locked on to (LockonCursor);

@@ -28,7 +28,9 @@ void FGenPathfinder::Build(const FGenMapData& Map, const TArray<FGenBridgeInfo>&
 	Border = Map.Border;
 	Terrain.Init(ECell::Clear, Width * Height);
 	Obstacles.Init(0, Width * Height);
+	ObstacleOwner.Init(GenInvalidObjectID, Width * Height);
 	Fences.Init(0, Width * Height);
+	ObstacleToIgnore = GenInvalidObjectID;
 	ConnectLayer.Init(0, Width * Height);
 	Layers.Reset();
 	NumNodes = Width * Height;
@@ -376,6 +378,15 @@ FGenPathfinder::ECell FGenPathfinder::GetCell(int32 X, int32 Y) const
 	return Terrain[I];
 }
 
+FGenObjectID FGenPathfinder::GetFootprintOwner(int32 X, int32 Y) const
+{
+	if (X < 0 || Y < 0 || X >= Width || Y >= Height)
+	{
+		return GenInvalidObjectID;
+	}
+	return ObstacleOwner[Y * Width + X];
+}
+
 bool FGenPathfinder::IsPinched(int32 X, int32 Y) const
 {
 	if (X < 0 || Y < 0 || X >= Width || Y >= Height)
@@ -432,6 +443,12 @@ bool FGenPathfinder::CanPass(int32 X, int32 Y, uint32 Surfaces, int32 Layer) con
 	{
 		return true;
 	}
+	// "if (toCell->isObstaclePresent( m_ignoreObstacleID )) return true": the object we are going into is
+	// not in the way. Its own cells, and the airfield it is parked on, are ground to us.
+	if (C == ECell::Obstacle && ObstacleToIgnore != GenInvalidObjectID && GetFootprintOwner(X, Y) == ObstacleToIgnore)
+	{
+		return true;
+	}
 	switch (C)
 	{
 	case ECell::Clear: return (Surfaces & GenSurface::Ground) != 0;
@@ -485,8 +502,21 @@ FIntRect FGenPathfinder::RasterizeFootprint(const FGenObject& Obj, int32 Delta)
 			}
 			if (bInside)
 			{
-				uint16& Count = Obstacles[Y * Width + X];
+				const int32 I = Y * Width + X;
+				uint16& Count = Obstacles[I];
+				const bool bWasObstacle = Count > 0;
 				Count = uint16(FMath::Max(0, int32(Count) + Delta));
+				// PathfindCellInfo keeps the object a cell belongs to: it is remembered from the first
+				// footprint that covered the cell and given up when the last one over it goes away.
+				// (Footprints hardly ever overlap: a building cannot be put on top of another one.)
+				if (!bWasObstacle)
+				{
+					ObstacleOwner[I] = Obj.GetID();
+				}
+				if (Count == 0)
+				{
+					ObstacleOwner[I] = GenInvalidObjectID;
+				}
 				Touched.Min.X = FMath::Min(Touched.Min.X, X);
 				Touched.Min.Y = FMath::Min(Touched.Min.Y, Y);
 				Touched.Max.X = FMath::Max(Touched.Max.X, X);
@@ -672,6 +702,9 @@ const TArray<int32>& FGenPathfinder::GetRegions(uint32 Surfaces) const
 	// (Units don't count: they come and go. A way that only units close is found, or given up on, by the search.)
 	const int32 SavedAvoid = AvoidRadius;
 	AvoidRadius = -1;
+	// A footprint stays closed here for everyone as it is to everyone else: that one unit may cross it because
+	// it is going into that building is not what the regions are labelled for.
+	FIgnoreObstacle Ignore(*this, GenInvalidObjectID);
 	const int32 Ground = Width * Height;
 	R.Label.SetNumUninitialized(NumNodes);
 	// -2: open, not yet labelled; -1: closed.
@@ -921,9 +954,10 @@ void FGenPathfinder::RemoveUnit(FGenObjectID Id)
 	GoalRects.Remove(Id);
 }
 
-bool FGenPathfinder::IsDestinationFree(FGenObjectID Id, const FVector2f& Pos, float Radius, uint32 Surfaces, int32 Layer) const
+bool FGenPathfinder::IsDestinationFree(FGenObjectID Id, const FVector2f& Pos, float Radius, uint32 Surfaces, int32 Layer, FGenObjectID IgnoreObstacleID) const
 {
 	// Pathfinder::checkDestination
+	FIgnoreObstacle Ignore(*this, IgnoreObstacleID);
 	const FIntRect Rect = UnitRect(Pos, Radius);
 	for (int32 Y = Rect.Min.Y; Y < Rect.Max.Y; ++Y)
 	{
@@ -933,6 +967,14 @@ bool FGenPathfinder::IsDestinationFree(FGenObjectID Id, const FVector2f& Pos, fl
 			if (Node < 0 || !CanPass(X, Y, Surfaces, Layer))
 			{
 				return false;
+			}
+			// "if (cell->isObstaclePresent( ignoreId )) continue": ending on the ground the thing we are going
+			// into stands on is allowed, and so is ending where it holds the cell itself
+			// ("if (goalUnitID == ignoreId ) continue").
+			if (IgnoreObstacleID != GenInvalidObjectID && (GetFootprintOwner(X, Y) == IgnoreObstacleID
+				|| GoalUnit[Node] == IgnoreObstacleID || FixedUnit[Node] == IgnoreObstacleID))
+			{
+				continue;
 			}
 			const FGenObjectID Goal = GoalUnit[Node];
 			const FGenObjectID Fixed = FixedUnit[Node];
@@ -945,16 +987,16 @@ bool FGenPathfinder::IsDestinationFree(FGenObjectID Id, const FVector2f& Pos, fl
 	return true;
 }
 
-bool FGenPathfinder::AdjustUnitDestination(FGenObjectID Id, float Radius, uint32 Surfaces, FVector2f& InOutPos, int32 Layer) const
+bool FGenPathfinder::AdjustUnitDestination(FGenObjectID Id, float Radius, uint32 Surfaces, FVector2f& InOutPos, int32 Layer, FGenObjectID IgnoreObstacleID) const
 {
-	return AdjustUnitDestination(Id, Radius, Surfaces, InOutPos, [](const FVector2f&) { return true; }, Layer);
+	return AdjustUnitDestination(Id, Radius, Surfaces, InOutPos, [](const FVector2f&) { return true; }, Layer, IgnoreObstacleID);
 }
 
-bool FGenPathfinder::AdjustUnitDestination(FGenObjectID Id, float Radius, uint32 Surfaces, FVector2f& InOutPos, TFunctionRef<bool(const FVector2f&)> Accept, int32 Layer) const
+bool FGenPathfinder::AdjustUnitDestination(FGenObjectID Id, float Radius, uint32 Surfaces, FVector2f& InOutPos, TFunctionRef<bool(const FVector2f&)> Accept, int32 Layer, FGenObjectID IgnoreObstacleID) const
 {
 	GEN_PERF_SCOPE("Path.AdjustDest");
 	// Pathfinder::adjustDestination / adjustTargetDestination
-	if (Width == 0 || (Accept(InOutPos) && IsDestinationFree(Id, InOutPos, Radius, Surfaces, Layer)))
+	if (Width == 0 || (Accept(InOutPos) && IsDestinationFree(Id, InOutPos, Radius, Surfaces, Layer, IgnoreObstacleID)))
 	{
 		return Width != 0;
 	}
@@ -968,7 +1010,7 @@ bool FGenPathfinder::AdjustUnitDestination(FGenObjectID Id, float Radius, uint32
 	{
 		const float Offset = bCenter ? 0.5f : 0.f;
 		const FVector2f P((float(CX) + Offset) * CellSize, (float(CY) + Offset) * CellSize);
-		if (Accept(P) && IsDestinationFree(Id, P, Radius, Surfaces, Layer))
+		if (Accept(P) && IsDestinationFree(Id, P, Radius, Surfaces, Layer, IgnoreObstacleID))
 		{
 			InOutPos = P;
 			return true;
@@ -995,19 +1037,20 @@ bool FGenPathfinder::AdjustUnitDestination(FGenObjectID Id, float Radius, uint32
 }
 
 bool FGenPathfinder::FindPathAroundUnits(FGenObjectID Id, float Radius, const FVector2f& Start, const FVector2f& Goal, uint32 Surfaces,
-	TArray<FVector2f>& OutPath, int32 StartLayer, int32 GoalLayer, TArray<uint8>* OutLayers) const
+	TArray<FVector2f>& OutPath, int32 StartLayer, int32 GoalLayer, TArray<uint8>* OutLayers, FGenObjectID IgnoreObstacleID) const
 {
 	GEN_PERF_SCOPE("Path.AroundUnits");
 	FDetachedSearch Detached(*this);
+	FIgnoreObstacle Ignore(*this, IgnoreObstacleID);
 	AvoidSelf = Id;
 	// A vehicle keeps a cell clear of the parked units, so that its body gets past them too; where that finds
 	// no way (or none that gets near the goal), it tries again hard by them.
 	AvoidRadius = Radius > CellSize ? 1 : 0;
-	bool bFound = FindPath(Start, Goal, Surfaces, OutPath, StartLayer, GoalLayer, OutLayers);
+	bool bFound = FindPath(Start, Goal, Surfaces, OutPath, StartLayer, GoalLayer, OutLayers, IgnoreObstacleID);
 	if (AvoidRadius > 0 && (!bFound || OutPath.Num() == 0 || FVector2f::DistSquared(OutPath.Last(), Goal) > FMath::Square(2.f * CellSize)))
 	{
 		AvoidRadius = 0;
-		bFound = FindPath(Start, Goal, Surfaces, OutPath, StartLayer, GoalLayer, OutLayers);
+		bFound = FindPath(Start, Goal, Surfaces, OutPath, StartLayer, GoalLayer, OutLayers, IgnoreObstacleID);
 	}
 	AvoidSelf = GenInvalidObjectID;
 	AvoidRadius = -1;
@@ -1015,10 +1058,11 @@ bool FGenPathfinder::FindPathAroundUnits(FGenObjectID Id, float Radius, const FV
 }
 
 bool FGenPathfinder::FindPath(const FVector2f& Start, const FVector2f& Goal, uint32 Surfaces, TArray<FVector2f>& OutPath,
-	int32 StartLayer, int32 GoalLayer, TArray<uint8>* OutLayers) const
+	int32 StartLayer, int32 GoalLayer, TArray<uint8>* OutLayers, FGenObjectID IgnoreObstacleID) const
 {
 	GEN_PERF_SCOPE("Path.FindPath");
 	FDetachedSearch Detached(*this);
+	FIgnoreObstacle Ignore(*this, IgnoreObstacleID);
 	OutPath.Reset();
 	if (OutLayers)
 	{
@@ -1076,10 +1120,17 @@ bool FGenPathfinder::FindPath(const FVector2f& Start, const FVector2f& Goal, uin
 	// Can the goal be reached at all? If not (it lies on ground cut off from where we are), make for the
 	// place nearest to it that can be - instead of searching the whole map to find that there is no way.
 	bool bReachable = false;
+	// Pathfinder::findPath's goalOnObstacle: a goal on the footprint we are allowed to cross - the object we
+	// are going into, or the airfield it is parked on - is a destination, not ground to move off.
+	const bool bGoalOnAllowedFootprint = IgnoreObstacleID != GenInvalidObjectID && GetFootprintOwner(G.X, G.Y) == IgnoreObstacleID;
 	{
 		const TArray<int32>& Region = GetRegions(Surfaces);
 		const int32 StartRegion = Region[StartIdx];
-		if (StartRegion >= 0 && GoalIdx >= 0 && Region[GoalIdx] == StartRegion)
+		if (bGoalOnAllowedFootprint)
+		{
+			bReachable = true;
+		}
+		else if (StartRegion >= 0 && GoalIdx >= 0 && Region[GoalIdx] == StartRegion)
 		{
 			bReachable = true;
 		}

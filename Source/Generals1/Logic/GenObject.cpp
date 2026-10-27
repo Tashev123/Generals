@@ -218,21 +218,23 @@ bool FGenObject::StartPath(const FVector3f& InGoal, bool bAroundUnits, const TFu
 		// (setAdjustsDestination(false): "We want to run into the target"; "We are in the middle of a
 		// path, so don't set the final goal location yet.")
 	}
-	else if (!Accept || !PF.AdjustUnitDestination(ID, Footprint, GetPathSurfaces(), Dest, *Accept, WantLayer))
+	else if (!Accept || !PF.AdjustUnitDestination(ID, Footprint, GetPathSurfaces(), Dest, *Accept, WantLayer, IgnoreObstacle))
 	{
 		Dest = FVector2f(InGoal.X, InGoal.Y);
-		PF.AdjustUnitDestination(ID, Footprint, GetPathSurfaces(), Dest, WantLayer);
+		PF.AdjustUnitDestination(ID, Footprint, GetPathSurfaces(), Dest, WantLayer, IgnoreObstacle);
 	}
 
+	// (Pathfinder::queueForPath takes the id we are allowed to cross with the request: "setIgnoreObstacleID(
+	// getIgnoredObstacleID() )" - the object we are going into, or the airfield it is parked on.)
 	TArray<FVector2f> NewPath;
 	TArray<uint8> NewLayers;
 	if (bAroundUnits)
 	{
-		PF.FindPathAroundUnits(ID, Footprint, From, Dest, GetPathSurfaces(), NewPath, Layer, WantLayer, &NewLayers);
+		PF.FindPathAroundUnits(ID, Footprint, From, Dest, GetPathSurfaces(), NewPath, Layer, WantLayer, &NewLayers, IgnoreObstacle);
 	}
 	if (NewPath.Num() == 0)
 	{
-		PF.FindPath(From, Dest, GetPathSurfaces(), NewPath, Layer, WantLayer, &NewLayers);
+		PF.FindPath(From, Dest, GetPathSurfaces(), NewPath, Layer, WantLayer, &NewLayers, IgnoreObstacle);
 	}
 	if (NewPath.Num() == 0)
 	{

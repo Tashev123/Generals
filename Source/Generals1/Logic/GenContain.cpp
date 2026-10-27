@@ -7,6 +7,7 @@
 #include "Core/GenPerf.h"
 #include "Logic/GenGameData.h"
 #include "Logic/GenObject.h"
+#include "Logic/GenPathfinder.h"
 #include "W3D/GenAssets.h"
 #include "Generals1.h"
 
@@ -1088,6 +1089,15 @@ void FGenObject::CommandEnter(FGenObject& Container)
 	}
 	NextRepathFrame = 0;
 	CommandStop();
+
+	// AIEnterState::onEnter: "tell the pathfinder to ignore the enterable object" - the path to it may cross
+	// the cells it stands on. Pathfinder::findPath's airfield case makes that the airfield when the target is
+	// parked there ("only want to do this for things that are 'parked' on the airfield, but not for things
+	// hovering over an obstacle (eg, a chinook over a supply dock)"): a plane stands on its airfield's cells,
+	// so it is the airfield, not the plane, that a unit coming from afar has to be allowed to walk over.
+	// Without this a pilot sent to a plane at the airfield has no way onto the runway at all.
+	FGenObject* Ground = Logic->FindObject(Logic->GetPathfinder().GetFootprintOwnerAt(FVector2f(Container.Position.X, Container.Position.Y)));
+	IgnoreObstacle = Ground && Ground->IsKindOf(TEXT("FS_AIRFIELD")) ? Ground->ID : Container.ID;
 }
 
 void FGenObject::StopEntering()
@@ -1103,6 +1113,8 @@ void FGenObject::StopEntering()
 			C->Contain->Wanters.Remove(ID);
 		}
 	}
+	// AIEnterState::onExit: "tell the pathfinder to stop ignoring the object".
+	IgnoreObstacle = GenInvalidObjectID;
 	EnterTarget = GenInvalidObjectID;
 }
 
