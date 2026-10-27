@@ -1692,6 +1692,51 @@ the same settings and orders; the server is the clock and the record.
       instant; battle groups in network games; chat in the game; the original's network screens (with M8b);
       a different CPU tested; a test over the internet with a friend
 
+## Done (M8d: options, main menu, hotkeys - and the user's notes of 2026-10-25)
+The user asked for settings (resolution, frame rate, quality; hotkeys; scroll and mouse speed; the mouse
+buttons swapped) and a well designed menu, modern rather than the original's 2003 look (M8b stays open for
+the original's window files). Built on one foundation, then seven parts in parallel and merged.
+Taken here from galapchevd/Generals-private on 2026-10-27: only the options, menus and hotkeys - not that
+branch's stealth while firing, forgiving picks (exact picking stays, 2026-10-13), moves onto unreachable
+ground, USA power balance, add-ons, Macedonia, online browser or control bar.
+- [x] The player's settings: `UGenUserSettings` (Game/GenSettings.h, GameUserSettingsClassName) - the
+      engine's own (resolution, window mode, frame rate limit, VSync, scalability) and the game's: controls,
+      keys, volumes, video extras. Saved in GameUserSettings.ini (a test run's under Saved/Config/WindowsEditor)
+- [x] Every key the game reads goes through one table of commands (Game/GenInput.h, the original's
+      CommandMap.ini commands, each on a key the player may change); Esc always opens the menu
+- [x] The options screen (Game/GenOptions.cpp) over the main menu or the in-game menu: Video, Controls,
+      Hotkeys, Audio pages (a file each), Apply / Cancel / Reset to defaults, Esc cancels. New shell widgets:
+      tabs, slider, key button and key capture, scrolling area, tooltip
+- [x] Video (GenOptionsVideo.cpp): fullscreen / borderless / windowed, the display's resolutions, VSync,
+      frame rate limit (default 60 - the laptop ran hot uncapped), preset Low..Epic or Custom over eight
+      scalability groups, resolution scale 50-100% (TSR), ray-traced lighting (off by default: r.RayTracing was
+      on but GenMapActor's post-process had Lumen off - it only cost; on, it switches the map's post-process to
+      Lumen GI and reflections; not yet looked at in game), a frame rate read-out, and a 15 s "keep these
+      settings?" countdown after a display change. The game's defaults are put in once (DefaultsVersion): the
+      engine's first start otherwise took Epic without VSync from the console variables. No display change in
+      the editor or a test run (saved only)
+- [x] Controls (GenOptionsControls.cpp, GenPlayerController's UpdateCamera / WorldLeftClick / RightClick):
+      edge, key, drag, zoom and rotate speeds (25-300%), edge scrolling (and in a window), inverted drag, the
+      mouse kept in the window, an experimental pointer speed; the Modern button layout - left selects (the
+      ground deselects), right gives the order a classic left click would (Ctrl / Alt as ever), right drag
+      still scrolls; placing and aiming are left / right in both. Test step `mouse,scheme|left|right|camera,...`
+- [x] Hotkeys (GenBarHotkeys.cpp, GenOptionsHotkeys.cpp): the command bar's buttons by their keys - Classic
+      (the '&' letter of the button's name in the CSF, as the original; '&' is no longer dropped from other
+      text, "C&C" reads right now), Grid (ControlBar.wnd's 2 x 7 cells: QWERTYU / ASDFGHJ) or Custom per
+      button; a bar key is the button's while it is shown, with exactly its modifiers (Ctrl + a number stays a
+      group). The key is shown in the button's corner and its tooltip. The page rebinds every command, offers
+      a swap on a clash, and lists an army's buttons (or the selection's) for custom keys. Test step `key,<chord>`
+- [x] The menus (GenShell.cpp, GenShellStyle.h): a new look for every widget and screen (layered panels,
+      gold for the main action, eased hover); a main menu at the start (skirmish, online, options, exit); the
+      host / join controls on their own online screen; BACK and Esc between screens; the in-game menu with
+      options and quit to desktop (asked first). A -GenTestMenu script starts on the skirmish setup unless it
+      uses Main. ids
+- [x] Volumes (GenOptionsAudio.cpp, GenAudioManager): master, music, sound, voices, speech - heard while
+      dragged, undone by Cancel; culling still goes by the game's own volumes
+- Workflow: Tools/gen_build.ps1 builds a checkout; gen_lock.ps1 lets one build or test run at a time across
+  worktrees. A build in one worktree rewrites the engine's UnrealEditor.modules BuildId: another worktree's
+  DLL then doesn't load until it is built again
+
 ## Next
 (Performance: no profiling between milestones - one review at the very end, the user's word of
 2026-10-12. Things to look at then are noted where they are made: FindGroundPath asks for the
