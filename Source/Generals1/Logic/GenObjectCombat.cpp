@@ -429,9 +429,12 @@ int32 FGenObject::ChooseWeapon(const FGenObject& Target) const
 	{
 		Best = Backup; // "No ready weapon was found, so return the most suitable unready one."
 	}
-	// (Not the original: while a helicopter's preferred weapon reloads, another that is ready and in reach fires
-	// meanwhile - the user wanted the Comanche's cannon at work on vehicles too, between its missile volleys.)
-	if (Best != INDEX_NONE && FillIn != INDEX_NONE && FillIn != Best && Now < Weapons[Best].ReadyFrame && IsKindOf(TEXT("AIRCRAFT")))
+	// (Not the original: while a helicopter's preferred weapon is reloading its clip, another that is ready and in
+	// reach fires meanwhile - the user wanted the Comanche's cannon at work on vehicles too, between its missile
+	// volleys. Only an empty clip steps a preferred weapon aside, not its time between shots: a weapon stays what
+	// the data says it is preferred against, so the Comanche's cannon keeps infantry and its missiles keep
+	// vehicles and buildings.)
+	if (Best != INDEX_NONE && FillIn != INDEX_NONE && FillIn != Best && IsKindOf(TEXT("AIRCRAFT")) && Weapons[Best].bReloading)
 	{
 		Best = FillIn;
 	}
