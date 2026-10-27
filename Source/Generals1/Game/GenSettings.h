@@ -87,7 +87,7 @@ struct FGenVideoDraft
 	FIntPoint Resolution = FIntPoint(1920, 1080);
 	int32 WindowMode = 0;              // EWindowMode: 0 fullscreen, 1 borderless (windowed fullscreen), 2 windowed
 	bool bVSync = true;
-	float FrameRateLimit = 60.f;       // 0: none
+	float FrameRateLimit = 0.f;        // 0: none
 	int32 Preset = 2;                  // 0 low .. 3 epic, 4 custom
 	int32 Shadows = 2, Textures = 2, Effects = 2, ViewDistance = 2, AntiAliasing = 2, PostProcess = 2, Foliage = 2, Shading = 2;
 	float ResolutionScale = 100.f;     // percent

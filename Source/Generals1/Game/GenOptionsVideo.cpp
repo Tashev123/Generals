@@ -402,15 +402,29 @@ void UGenUserSettings::ApplyVideoExtras()
 	// The game's defaults, once. On a first start the engine does call SetToDefaults, but then takes VSync and
 	// the quality levels back from the console variables (ValidateSettings, LoadSettings): Epic, no VSync, which
 	// is what overheated the laptop. So they are put in effect here, over whatever the engine settled on.
-	constexpr int32 GameDefaultsVersion = 1;
-	if (VideoExtras.DefaultsVersion < GameDefaultsVersion)
+	// Version 2: no frame rate limit (VSync paces it) instead of 60 fps.
+	constexpr int32 GameDefaultsVersion = 2;
+	if (VideoExtras.DefaultsVersion < 1)
 	{
 		VideoExtras.DefaultsVersion = GameDefaultsVersion;
 		SetVideoDefaults();
 		UGameUserSettings::ApplyNonResolutionSettings(); // (the engine's part only: this function is called from ours)
 		Scalability::SetQualityLevels(ScalabilityQuality); // (which the engine skips while it starts)
 		SaveSettings();
-		UE_LOG(LogGenerals, Log, TEXT("Video: the game's defaults put in effect (High, 60 fps, VSync, full resolution)"));
+		UE_LOG(LogGenerals, Log, TEXT("Video: the game's defaults put in effect (High, VSync, no frame rate limit, full resolution)"));
+	}
+	else if (VideoExtras.DefaultsVersion < GameDefaultsVersion)
+	{
+		// Settings from version 1 keep everything but its 60 fps default (a limit the player picked stays).
+		VideoExtras.DefaultsVersion = GameDefaultsVersion;
+		if (FMath::IsNearlyEqual(GetFrameRateLimit(), 60.f))
+		{
+			SetFrameRateLimit(0.f);
+			SetVSyncEnabled(true);
+			UGameUserSettings::ApplyNonResolutionSettings();
+			UE_LOG(LogGenerals, Log, TEXT("Video: the old 60 fps default became no limit, with VSync"));
+		}
+		SaveSettings();
 	}
 
 	const bool bRayTraced = VideoExtras.bRayTracing;
@@ -450,8 +464,9 @@ void UGenUserSettings::ApplyVideoExtras()
 
 void UGenUserSettings::SetVideoDefaults()
 {
-	// A laptop runs hot at an unlimited frame rate: the game's default is 60 with VSync, at High.
-	FrameRateLimit = 60.f;
+	// No frame rate limit but VSync, at High: the display's refresh rate sets the pace - 240 on a 240 Hz screen,
+	// 60 on a 60 Hz laptop (which an unlimited frame rate without VSync ran hot).
+	FrameRateLimit = 0.f;
 	bUseVSync = true;
 	SetOverallScalabilityLevel(DefaultPreset);
 	// (The overall level picks a screen percentage of its own; the game draws at the full resolution.)
@@ -567,7 +582,7 @@ void AGenHUD::DrawOptionsVideo(const FBox2D& Body)
 	{
 		RateIndex = FrameRates().Num() - 1;
 	}
-	Label(TEXT("Frame rate limit"), LeftX, Y, TEXT("The most pictures drawn in a second. The game itself runs at 30 logic frames a second whatever this is: a higher limit only makes the view smoother, and the computer hotter. 60 is the default."), true);
+	Label(TEXT("Frame rate limit"), LeftX, Y, TEXT("The most pictures drawn in a second. The game itself runs at 30 logic frames a second whatever this is: a higher limit only makes the view smoother, and the computer hotter. Unlimited is the default: with VSync on, the display's refresh rate is the limit."), true);
 	if (ShellDropdown(TEXT("Video.FrameRate"), Control(LeftX, Y), RateNames, NoColors, RateIndex, Picked))
 	{
 		D.FrameRateLimit = FrameRates()[Picked];
@@ -692,7 +707,7 @@ void AGenHUD::OptionsApplyVideo()
 
 void AGenHUD::OptionsDefaultsVideo()
 {
-	// The game's defaults (SetVideoDefaults): High at 60 fps with VSync, at the full resolution - and borderless
+	// The game's defaults (SetVideoDefaults): High with VSync and no frame rate limit, at the full resolution - and borderless
 	// at the desktop's resolution, the one mode every display shows.
 	FGenVideoDraft& D = Options.Video;
 	D = FGenVideoDraft();
@@ -706,7 +721,7 @@ void AGenHUD::OptionsDefaultsVideo()
 	{
 		D.*(Row.Field) = DefaultPreset;
 	}
-	D.FrameRateLimit = 60.f;
+	D.FrameRateLimit = 0.f;
 	D.bVSync = true;
 	D.ResolutionScale = 100.f;
 	D.Extras = FGenVideoExtras();

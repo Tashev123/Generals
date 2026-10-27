@@ -1708,7 +1708,9 @@ ground, USA power balance, add-ons, Macedonia, online browser or control bar.
       Hotkeys, Audio pages (a file each), Apply / Cancel / Reset to defaults, Esc cancels. New shell widgets:
       tabs, slider, key button and key capture, scrolling area, tooltip
 - [x] Video (GenOptionsVideo.cpp): fullscreen / borderless / windowed, the display's resolutions, VSync,
-      frame rate limit (default 60 - the laptop ran hot uncapped), preset Low..Epic or Custom over eight
+      frame rate limit (default none with VSync, so the display's refresh rate paces it: 240 on the user's
+      240 Hz screen, 60 on the laptop that ran hot uncapped - was 60 fps until 2026-10-27, DefaultsVersion 2
+      moves a stored 60 to none), preset Low..Epic or Custom over eight
       scalability groups, resolution scale 50-100% (TSR), ray-traced lighting (off by default: r.RayTracing was
       on but GenMapActor's post-process had Lumen off - it only cost; on, it switches the map's post-process to
       Lumen GI and reflections; not yet looked at in game), a frame rate read-out, and a 15 s "keep these
