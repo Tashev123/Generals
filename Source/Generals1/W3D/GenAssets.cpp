@@ -699,6 +699,13 @@ UMaterialInterface* UGenAssetSubsystem::GetSectionMaterial(const FGenSectionMate
 	MID->SetVectorParameterValue(TEXT("Emissive"), S.Emissive);
 	MID->SetVectorParameterValue(TEXT("HouseColor"), HouseColor);
 	MID->SetScalarParameterValue(TEXT("HouseColorMode"), float(S.HouseColorMode));
+	// A house-coloured section drawn with alpha blending is the general's logo painted on the ground in front
+	// of a command center: for it, the house-colour mask is the shape, so the ground shows through the rest.
+	// Anywhere else the original forces a house-coloured texture opaque (remapAlphaTexture16Bit).
+	MID->SetScalarParameterValue(TEXT("HouseColorShape"), (S.HouseColorMode == 2 && S.Blend == EGenW3DBlend::Alpha) ? 1.f : 0.f);
+	// A house-coloured texture drawn with alpha blending is a logo painted on the ground (the one in front of
+	// a command center's door): its house-colour mask is the shape, so the ground shows through the rest.
+	MID->SetScalarParameterValue(TEXT("HouseColorShape"), (S.HouseColorMode == 2 && S.Blend == EGenW3DBlend::Alpha) ? 1.f : 0.f);
 	if (S.ScrollMode != 0)
 	{
 		MID->SetScalarParameterValue(TEXT("ScrollMode"), float(S.ScrollMode));

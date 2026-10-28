@@ -804,6 +804,52 @@ void UGenFXManager::RenderParticles()
 			}
 		}
 	}
+
+	// W3DProjectileStreamDraw: the toxin truck's spray, the ambulance's hose, the Dragon tank's flame - a strip of
+	// texture through the shots in flight, added onto what is behind it (_PresetAdditiveSpriteShader).
+	// TILED_TEXTURE_MAP: the texture TileFactor times along each segment, across the width once, and flowing
+	// outwards at ScrollRate lengths a second ("UVOffsetDeltaPerMS = rate * 0.001").
+	TArray<UGenGameLogic::FStreamLine> Streams;
+	if (Logic)
+	{
+		Logic->GetVisibleStreams(Streams);
+	}
+	if (Streams.Num() > 0)
+	{
+		FVector2D ViewSize(1920.0, 1080.0);
+		if (GEngine && GEngine->GameViewport)
+		{
+			GEngine->GameViewport->GetViewportSize(ViewSize);
+		}
+		const double PixelAngle = 2.0 * FMath::Tan(FMath::DegreesToRadians(double(PC->PlayerCameraManager->GetFOVAngle())) * 0.5) / FMath::Max(1.0, ViewSize.X);
+		TArray<FVector, TInlineAllocator<24>> P, Side;
+		for (const UGenGameLogic::FStreamLine& S : Streams)
+		{
+			const FGenStreamDraw& D = *S.Draw;
+			UTexture2D* Tex = D.Texture.IsEmpty() ? nullptr : UGenAssetSubsystem::Get()->GetTexture(D.Texture);
+			FBatch& B = Batches[GetBatch(Tex ? D.Texture : FString(), EGenParticleShader::Additive, false, false)];
+			const double Scroll = FMath::Fmod(double(D.ScrollRate) * ClientTime / ClientFPS, 1.0);
+			const int32 N = S.Points.Num();
+			P.SetNum(N);
+			Side.SetNum(N);
+			for (int32 i = 0; i < N; ++i)
+			{
+				P[i] = ToUE(S.Points[i]);
+			}
+			// (Each point's side the same for the segment before it and the one after: no gaps at the bends.)
+			for (int32 i = 0; i < N; ++i)
+			{
+				const FVector Along = P[FMath::Min(i + 1, N - 1)] - P[FMath::Max(i - 1, 0)];
+				const double MinWidth = 1.5 * PixelAngle * FVector::Dist(CamPos, P[i]);
+				Side[i] = FVector::CrossProduct(Along, CamPos - P[i]).GetSafeNormal() * (FMath::Max(double(D.Width) * Cm, MinWidth) * 0.5);
+			}
+			for (int32 i = 0; i + 1 < N; ++i)
+			{
+				AddQuadUV(B.Vertices, B.UVs, B.Colors, P[i] - Side[i], P[i] + Side[i], P[i + 1] + Side[i + 1], P[i + 1] - Side[i + 1],
+					double(i) * D.TileFactor + Scroll, double(i + 1) * D.TileFactor + Scroll, FLinearColor::White);
+			}
+		}
+	}
 }
 
 void UGenFXManager::FlushBatches()

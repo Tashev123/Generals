@@ -580,6 +580,11 @@ void FGenObject::UpdateDocking(uint32 Frame)
 
 void FGenObject::OnPlayerCommand(bool bDockOrder)
 {
+	LastPlayerOrderFrame = Logic->GetFrame() + 1;
+	if (Template->AssaultTransport.bValid)
+	{
+		AssaultReset(); // AssaultTransportAIUpdate::aiDoCommand: any order of the player's starts over
+	}
 	if (!bDockOrder)
 	{
 		StopDocking();
@@ -694,7 +699,16 @@ bool UGenGameLogic::CanTransferSuppliesAt(const FGenObject& Truck, const FGenObj
 		return DockObj.GetDock()->Boxes > 0 && GetRelationship(Truck.GetOwner(), DockObj.GetOwner()) != EGenRelationship::Enemies;
 	}
 	// A supply center must be ours, and we must have something to deliver.
-	return Truck.Boxes > 0 && Truck.GetOwner() == DockObj.GetOwner();
+	if (Truck.Boxes <= 0 || Truck.GetOwner() != DockObj.GetOwner())
+	{
+		return false;
+	}
+	// Beyond the original (the user's rule of 2026-10-28): a gatherer delivers only to its own faction's supply
+	// center - a GLA worker to a GLA one, a Chinook to an American one, a Chinese truck to a Chinese one - not to
+	// one captured from another side. (A gatherer of no faction, the civilian truck, keeps the original's rule.)
+	const FGenGameData& Data = FGenGameData::Get();
+	const FString& TruckSide = Data.BaseSideOf(Truck.GetTemplate()->Side);
+	return TruckSide.IsEmpty() || TruckSide.Equals(Data.BaseSideOf(DockT->Side), ESearchCase::IgnoreCase);
 }
 
 FGenObject* UGenGameLogic::FindBestSupplyWarehouse(const FGenObject& Truck) const

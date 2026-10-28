@@ -317,6 +317,17 @@ public:
 	};
 	TArray<FWeaponBeam> WeaponBeams;
 	TArray<FGenObjectID> ParticleCannons;   // the objects with a ParticleUplinkCannonUpdate (their beams are drawn)
+	/** One projectile stream to draw this frame (W3DProjectileStreamDraw): a run of its points, the newest last. */
+	struct FStreamLine
+	{
+		const struct FGenStreamDraw* Draw = nullptr;
+		TArray<FVector3f> Points;
+	};
+	/** The streams the local player can see, cut where they break (ProjectileStreamUpdate::getAllPoints). */
+	void GetVisibleStreams(TArray<FStreamLine>& Out) const;
+	/** Weapon::newProjectileFired: a shot of a weapon with a ProjectileStreamName joins its line. */
+	void AddToProjectileStream(const FGenWeaponTemplate& Weapon, const FGenObject& Shooter, const FGenObject& Projectile, FGenObjectID Victim, const FVector3f& VictimPos);
+	TArray<FGenObjectID> ProjectileStreams; // the stream objects there are (their lines are drawn)
 	/** SpyVisionUpdate by upgrade: the buildings that may grant it, and - each shroud update - who sees through
 	 *  whose eyes (the spying player, and the kinds of the enemy's things; none: all of them). */
 	TArray<FGenObjectID> SpyVisionSources;
@@ -392,8 +403,12 @@ public:
 	void GetEnergy(int32 Player, int32& OutProduction, int32& OutConsumption) const;
 	/** Frames a build takes for this player right now (ThingTemplate::calcTimeToBuild: slower when short on power). */
 	float CalcTimeToBuild(const FGenThingTemplate& Template, int32 Player) const;
-	/** Can the player build this now (prerequisites, money)? If not, OutWhy says what is missing. */
+	/** Can the player build this now (prerequisites, money, the limit on its type)? If not, OutWhy says what is missing. */
 	bool CanMake(int32 Player, const FGenThingTemplate& Template, FString* OutWhy = nullptr, bool bCheckMoney = true) const;
+	/** Player::countExisting, for canBuildMoreOfType: how many of a type a player already has - what stands
+	 *  in the world (with what its allies on the same team have, as the original's team iteration does),
+	 *  plus what its factories are still making. */
+	int32 CountOwnedOrQueued(int32 Player, const FGenThingTemplate& Template) const;
 	/** BuildAssistant::isLocationLegalToBuild: clear, flat enough ground with nothing in the way. */
 	/** BuildAssistant::isLocationLegalToBuild; OutWhy: the message for a refusal ("GUI:CantBuildNotFlatEnough"). */
 	bool IsLocationLegalToBuild(const FGenThingTemplate& Template, const FVector3f& Pos, float Angle, const TCHAR** OutWhy = nullptr) const;
@@ -498,6 +513,11 @@ public:
 	 */
 	void FlattenTerrain(const FGenThingTemplate& Template, const FVector3f& Pos, float Angle);
 	void SpawnProducedUnit(const FGenObject& Factory, const FGenThingTemplate& Unit, int32 ExitDoor = -1);
+	/** DefaultProductionExitUpdate::exitObjectViaDoor: where what a building (without parking) lets out appears,
+	 *  and the point a little beyond its door it heads for. */
+	void GetFactoryExit(const FGenObject& Factory, FVector3f& OutCreate, FVector3f& OutRally);
+	/** ... and aiFollowExitProductionPath: out by the door, then on to the building's rally point. */
+	void FollowExitPath(const FGenObject& Factory, FGenObject& Unit, const FVector3f& Rally);
 	void OnBuildingCompleted(FGenObject& Building);
 	/** Object::setStatus, UNDER_CONSTRUCTION changing: the mines a building stands on - theirs go off, the others are taken away. */
 	void ClearMinesUnder(const FGenObject& Building);
@@ -505,7 +525,8 @@ public:
 	// --- computer players (GenSkirmishAI.cpp); these act at once, they are called from inside the logic step ---
 	/** BuildAssistant::buildObjectNow: pays for and places a building without checking the spot or the
 	 *  prerequisites. With a dozer it is a construction site that dozer raises; without one it stands finished. */
-	FGenObject* ConstructBuilding(FGenObject* Dozer, const FGenThingTemplate& Template, const FVector3f& Pos, float Angle, int32 Player);
+	/** bRebuild: a GLA hole's building going up again - nothing is charged. */
+	FGenObject* ConstructBuilding(FGenObject* Dozer, const FGenThingTemplate& Template, const FVector3f& Pos, float Angle, int32 Player, bool bRebuild = false);
 	void ResumeConstruction(FGenObject& Dozer, FGenObject& Building);
 	/** ProductionUpdate::queueCreateUnit: pays for the unit and adds it to the factory's queue. */
 	bool QueueUnit(FGenObject& Factory, const FGenThingTemplate& Unit);
@@ -649,6 +670,27 @@ public:
 	/** The player has a finished building of that kind. */
 	bool HasFinishedKindOf(int32 Player, const TCHAR* Kind) const;
 	bool IsPassengerAllowedToFireFrom(const FGenObject& Container) const;
+
+	/** RiderChangeContain::onContaining / onRemoving: whoever is selected getting onto a combat cycle (or off it) hands
+	 *  the selection over. Only the player controller reads these; they are kept for a second. */
+	struct FSelectionHandoff
+	{
+		FGenObjectID From = GenInvalidObjectID;
+		FGenObjectID To = GenInvalidObjectID;
+		uint32 Frame = 0;
+	};
+	const TArray<FSelectionHandoff>& GetSelectionHandoffs() const { return SelectionHandoffs; }
+	/** Pathfinder::createAWallFromMyFootprint / removeWallFromMyFootprint: a train at a station is in the way for a while. */
+	void SetTemporaryObstacle(FGenObject& Obj, bool bOn);
+	/** ReplaceObjectUpgrade::upgradeImplementation: the object is swapped for a new one of that template, finished. */
+	void ReplaceWithObject(FGenObject& Obj, const FString& TemplateName);
+	/** Weapon::processRequestAssistance / makeAssistanceRequest: those like the shooter, near it and free, join in. */
+	void RequestAssistance(const FGenObject& Requester, FGenObject& Victim, float Range);
+	/** AssistedTargetingUpdate::makeFeedbackLaser: a beam (an object with W3DLaserDraw) between two objects, for its lifetime. */
+	void CreateFeedbackLaser(const FString& LaserTemplate, const FGenObject& From, const FGenObject& To);
+	/** RebuildHoleExposeDie::onDie: the GLA building leaves a hole that will build it again. */
+	void ExposeRebuildHole(FGenObject& Building, const FGenDieModule& Module);
+	void AddSelectionHandoff(FGenObjectID From, FGenObjectID To);
 
 	// --- supply gathering (GenSupply.cpp) ---
 	/** ActionManager::canTransferSuppliesAt: can this gatherer load at / deliver to that dock right now? */
@@ -835,6 +877,7 @@ private:
 	void ScoreKill(const FGenObject& Victim, const FGenObject& Killer);
 	/** OpenContain's m_loadSoundsEnabled: off while a transport is given the passengers it comes with. */
 	bool bLoadSoundsEnabled = true;
+	TArray<FSelectionHandoff> SelectionHandoffs;
 	TArray<FGenRadarEvent> RadarEvents;
 	bool bHasLastRadarEvent = false;
 	FVector3f LastRadarEventPos = FVector3f::ZeroVector;
@@ -921,6 +964,7 @@ private:
 		bool bStateBusy = false;          // one of its draw modules is in a transition (or has an animation that restarts itself)
 		float AppliedAdjustZ = 0.f;       // ADJUST_HEIGHT_BY_CONSTRUCTION_PERCENT of the first model, as its place has it
 		uint32 AnimDurationVersion = 0;   // the object's last "setAnimationLoopDuration" applied
+		uint32 ManualFrameVersion = 0;    // ... and the last frame the logic put a MANUAL animation at
 		uint32 AppliedVersion = 0;
 		bool bPlaced = false;             // the drawable has been given the object's transform at least once
 		FVector AppliedPos = FVector::ZeroVector; // ... and where that last put it (relative to the map)

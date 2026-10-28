@@ -20,7 +20,13 @@ void FGenObject::InitStealth()
 		// StealthUpdate::StealthUpdate: a unit that disguises itself only "stealths" once disguised, and the
 		// module every object has by default sleeps until the GPS scrambler wakes it.
 		bStealthEnabled = !S.bDisguisesAsTeam && !S.bGrantedBySpecialPower;
-		bCanStealth = S.bInnateStealth;
+		// ("Giving innate stealth units this status bit allows other code to easily check the status bit.") It is
+		// only ever set here, never cleared: a unit built after the research already has it from the upgrade
+		// applied at its creation (Object::initObject -> updateUpgradeModules -> this module), and must keep it.
+		if (S.bInnateStealth)
+		{
+			bCanStealth = true;
+		}
 		StealthAllowedFrame = Frame + uint32(S.StealthDelay);
 	}
 	const FGenStealthDetector& D = Template->Detector;
@@ -46,6 +52,15 @@ bool FGenObject::AllowedToStealth(uint32 Frame)
 	// StealthUpdate::allowedToStealth
 	const FGenStealthData& S = Template->Stealth;
 	const uint32 Flags = S.Forbidden;
+
+	// "With regards to slaves that stealth with us, we need to all be stealthed or not at all. If any of the
+	// slaves can't stealth, then reveal everyone!" A stinger site has no weapon of its own - the soldiers it
+	// keeps are it - so a soldier that gives itself away by firing shows the whole site.
+	if (Template->Spawner.bValid && IsKindOf(TEXT("SPAWNS_ARE_THE_WEAPONS")) && !AllSpawnsAllowedToStealth(Frame))
+	{
+		return false;
+	}
+
 	if ((Flags & GenStealth::Attacking) && IsFiringWeaponStatus())
 	{
 		return false;

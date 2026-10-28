@@ -254,6 +254,12 @@ void FGenObject::ExecuteUpgradeModule(const FGenUpgradeModule& Module)
 	case EGenUpgradeEffect::ObjectCreation:
 		Logic->DoOCL(Module.OCL, *this); // ObjectCreationUpgrade::upgradeImplementation: "spawn everything in the OCL"
 		break;
+	case EGenUpgradeEffect::ReplaceObject:
+		Logic->ReplaceWithObject(*this, Module.ReplaceObject);
+		break;
+	case EGenUpgradeEffect::ExperienceScalar:
+		XPScalar += Module.AddXPScalar; // ExperienceScalarUpgrade::upgradeImplementation
+		break;
 	case EGenUpgradeEffect::PassengersFire:
 		if (Contain)
 		{
@@ -273,6 +279,7 @@ void FGenObject::RefreshArmorSet()
 	if (bArmorUpgraded) { Flags.Add(PlayerUpgradeFlag); }
 	if (CrateArmorLevel == 1) { Flags.Add(TEXT("CRATE_UPGRADE_ONE")); }
 	else if (CrateArmorLevel >= 2) { Flags.Add(TEXT("CRATE_UPGRADE_TWO")); }
+	if (bSecondLife) { Flags.Add(TEXT("SECOND_LIFE")); } // UndeadBody::startSecondLife: setArmorSetFlag( ARMORSET_SECOND_LIFE )
 	if (const FGenArmorSetEntry* AS = Template->FindArmorSet(Flags))
 	{
 		Armor = GD.FindArmor(AS->Armor);
@@ -977,7 +984,8 @@ void UGenGameLogic::OnObjectKilled(const FGenObject& Victim, FGenObjectID Killer
 	FGenObject* Learner = Killer->XPSink != GenInvalidObjectID ? FindObject(Killer->XPSink) : Killer;
 	if (Learner && !Learner->IsDead())
 	{
-		Learner->AddExperience(T->ExperienceValues[Level]);
+		// ("addExperiencePoints( experienceGain * m_experienceScalar )": what goes to a sink is scaled by the killer's too.)
+		Learner->AddExperience(Learner != Killer ? FMath::TruncToInt32(float(T->ExperienceValues[Level]) * Killer->XPScalar) : T->ExperienceValues[Level]);
 	}
 
 	FGenPlayer& P = Players[Killer->GetOwner()];

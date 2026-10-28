@@ -1239,6 +1239,11 @@ void UGenGameLogic::ExecAttackMove(const FGenCommand& C)
 		It.Key->StopConstructing();
 		It.Key->OnPlayerCommand(false);
 		It.Key->CommandAttackMove(It.Value);
+		if (It.Key->GetTemplate()->AssaultTransport.bValid)
+		{
+			It.Key->AssaultMoveGoal = It.Value; // AICMD_ATTACKMOVE_TO_POSITION: "m_isAttackMove = TRUE"
+			It.Key->bAssaultAttackMove = true;
+		}
 		SimYield(TEXT("a group's order"));
 	}
 }
@@ -1282,6 +1287,10 @@ void UGenGameLogic::ExecStop(const FGenCommand& C)
 		if (FGenObject* O = FindObject(Id))
 		{
 			O->StopConstructing();
+			if (O->GetTemplate()->AssaultTransport.bValid)
+			{
+				O->AssaultRetrieveMembers(); // AICMD_IDLE: "retrieveMembers()" - everybody back in
+			}
 			O->OnPlayerCommand(false);
 			O->CommandIdle();
 			for (FGenObjectID SpawnId : O->GetSpawns()) // (SpawnBehavior::orderSlavesToGoIdle)
@@ -1486,6 +1495,7 @@ void UGenGameLogic::ExecAttack(const FGenCommand& C)
 			O->OnPlayerCommand(false);
 			O->CommandStop();
 			O->CommandAttack(C.Target);
+			O->bAssaultAttackObject = O->GetTemplate()->AssaultTransport.bValid; // AICMD_ATTACK_OBJECT
 			if (O->GetContain())
 			{
 				OrderRidersToAttack(*O, C.Target);
@@ -1494,7 +1504,7 @@ void UGenGameLogic::ExecAttack(const FGenCommand& C)
 			for (FGenObjectID SpawnId : O->GetSpawns())
 			{
 				FGenObject* Spawn = FindObject(SpawnId);
-				if (Spawn && !Spawn->IsDead() && Spawn->HasWeaponFor(*Victim))
+				if (Spawn && !Spawn->IsDead() && Spawn->HasWeaponFor(*Victim) && !O->GetTemplate()->Spawner.bSlavesHaveFreeWill) // ("!doSlavesHaveFreedom()")
 				{
 					Spawn->OnPlayerCommand(false);
 					Spawn->CommandAttack(C.Target);
@@ -1612,6 +1622,10 @@ FGenObject* UGenGameLogic::SpawnProjectile(const FGenWeaponTemplate& Weapon, con
 		return nullptr;
 	}
 	P->LaunchProjectile(&Weapon, Shooter.GetID(), Victim, TargetPos, LaunchRotation);
+	if (!Weapon.ProjectileStreamName.IsEmpty())
+	{
+		AddToProjectileStream(Weapon, Shooter, *P, Victim, TargetPos);
+	}
 	// WeaponTemplate::fireWeaponTemplate: "If we're launching a missile at a unit with valid countermeasures,
 	// then communicate it" - "Only allow jets not currently supersonic to launch countermeasures".
 	if (ProjectileT->IsKindOf(TEXT("SMALL_MISSILE")))
@@ -2631,6 +2645,17 @@ void UGenGameLogic::UpdateDrawables()
 				for (const FExtraDraw& E : DS.Extras)
 				{
 					if (UGenModelComponent* Extra = E.Model.Get()) { Extra->SetAnimDuration(Seconds); }
+				}
+			}
+			// Drawable::setAnimationFrame (DeployStyleAIUpdate's ManualDeployAnimations): the Nuke Cannon unfolds as
+			// far as its unpacking has got.
+			if (DS.ManualFrameVersion != O->GetDrawManualFrameVersion())
+			{
+				DS.ManualFrameVersion = O->GetDrawManualFrameVersion();
+				MC->SetAnimFrame(O->GetDrawManualFrame());
+				for (const FExtraDraw& E : DS.Extras)
+				{
+					if (UGenModelComponent* Extra = E.Model.Get()) { Extra->SetAnimFrame(O->GetDrawManualFrame()); }
 				}
 			}
 			// W3DModelDraw::setPauseAnimation: nothing moves on what an EMP or a hacker has shut down, nor -

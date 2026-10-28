@@ -759,3 +759,78 @@ void UGenGameLogic::DoOCL(const FString& OCLName, const FGenObject& Source, cons
 		}
 	}
 }
+
+// ---- ReplaceObjectUpgrade, AssistedTargetingUpdate -------------------------------------------------
+
+void UGenGameLogic::ReplaceWithObject(FGenObject& Obj, const FString& TemplateName)
+{
+	// ReplaceObjectUpgrade::upgradeImplementation: the fake building goes, the real one stands in its place, finished.
+	const FGenThingTemplate* T = FGenGameData::Get().FindTemplate(TemplateName);
+	if (!T || Obj.IsDead() || Obj.bPendingDestroy)
+	{
+		return;
+	}
+	FGenObject* New = CreateObject(T, Obj.GetOwner(), Obj.GetPosition(), Obj.GetOrientation());
+	Obj.bPendingDestroy = true;
+	if (New)
+	{
+		OnBuildingCompleted(*New); // (its create modules' onBuildComplete, and Player::onStructureConstructionComplete)
+		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [upgrade f%u] #%u %s is replaced by #%u %s"), Frame, Obj.GetID(), *Obj.GetTemplate()->Name, New->GetID(), *T->Name);
+	}
+}
+
+void UGenGameLogic::RequestAssistance(const FGenObject& Requester, FGenObject& Victim, float Range)
+{
+	// makeAssistanceRequest: our player's things of the requester's kind, this close, with an AssistedTargetingUpdate
+	// and free to (able to attack, the weapon in hand ready) fire a clip from the assisting slot, locked for it.
+	if (Victim.IsDead() || !Players.IsValidIndex(Requester.GetOwner()))
+	{
+		return;
+	}
+	const FVector2f At(Requester.GetPosition().X, Requester.GetPosition().Y);
+	for (FGenObjectID Id : ObjectOrder)
+	{
+		FGenObject* O = Objects[Id].Get();
+		const FGenThingTemplate::FAssistedTargeting& A = O->GetTemplate()->AssistedTargeting;
+		if (O == &Requester || !A.bValid || O->GetOwner() != Requester.GetOwner() || O->IsDead() || O->IsUnderConstruction() || O->IsDisabled()
+			|| O->GetTemplate()->Canonical() != Requester.GetTemplate()->Canonical()
+			|| FVector2f::DistSquared(At, FVector2f(O->GetPosition().X, O->GetPosition().Y)) > FMath::Square(Range))
+		{
+			continue;
+		}
+		const int32 Current = O->GetCurrentWeaponSlot();
+		const FGenWeaponInstance& WI = O->Weapons[Current];
+		if (!WI.Template || WI.bReloading || Frame < WI.ReadyFrame || !O->Weapons[A.Slot].Template)
+		{
+			continue; // "getStatus() == READY_TO_FIRE"
+		}
+		O->CommandAttack(Victim.GetID());
+		O->WeaponLockSlot = A.Slot;               // setWeaponLock( m_weaponSlot, LOCKED_TEMPORARILY )
+		O->AttackShotsLeft = FMath::Max(1, A.ClipSize);
+		if (!A.LaserFromAssisted.IsEmpty())
+		{
+			CreateFeedbackLaser(A.LaserFromAssisted, Requester, *O);
+			CreateFeedbackLaser(A.LaserFromAssisted, *O, Victim); // (sic: "m_laserToTarget = findTemplate( m_laserFromAssistedName )")
+		}
+		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [assist f%u] #%u %s fires %d at #%u %s for #%u"), Frame, O->GetID(), *O->GetTemplate()->Name, O->AttackShotsLeft,
+			Victim.GetID(), *Victim.GetTemplate()->Name, Requester.GetID());
+	}
+}
+
+void UGenGameLogic::CreateFeedbackLaser(const FString& LaserTemplate, const FGenObject& From, const FGenObject& To)
+{
+	const FGenThingTemplate* LaserT = FGenGameData::Get().FindTemplate(LaserTemplate);
+	if (!LaserT || !LaserT->LaserDraw.bValid)
+	{
+		return;
+	}
+	int32 Life = 3;
+	if (LaserT->bHasLifetime) { Life = Random.RandRange(LaserT->MinLifetime, FMath::Max(LaserT->MinLifetime, LaserT->MaxLifetime)); }
+	else if (LaserT->bHasDeletion) { Life = Random.RandRange(LaserT->DeletionMin, FMath::Max(LaserT->DeletionMin, LaserT->DeletionMax)); }
+	FWeaponBeam& B = WeaponBeams.AddDefaulted_GetRef();
+	B.Draw = &LaserT->LaserDraw;
+	B.Shooter = GenInvalidObjectID; // (from one spot to another: no bone)
+	B.ExpireFrame = Frame + uint32(FMath::Max(1, Life));
+	B.Start = From.GetPosition() + FVector3f(0.f, 0.f, From.GetTemplate()->GeometryHeight * 0.5f);
+	B.End = To.GetPosition() + FVector3f(0.f, 0.f, To.IsAirborneTarget() ? 0.f : 10.f);
+}

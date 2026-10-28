@@ -295,7 +295,7 @@ void FGenObject::PilotEnterVehicle(FGenObject& Vehicle)
 		VeterancyLevel, Vehicle.ID, *Vehicle.Template->Name, Vehicle.VeterancyLevel, NewLevel);
 	if (NewLevel > Vehicle.VeterancyLevel)
 	{
-		Vehicle.AddExperience(Vehicle.Template->ExperienceRequired[NewLevel] - Vehicle.Experience);
+		Vehicle.AddExperience(Vehicle.Template->ExperienceRequired[NewLevel] - Vehicle.Experience, false);
 	}
 	StopEntering();
 	CommandStop();

@@ -541,10 +541,12 @@ void FGenObject::ChooseLocomotorSet(const TCHAR* SetName)
 	{
 		if (const TArray<FString>* Set = Template->LocomotorSets.Find(Try))
 		{
-			for (const FString& LocoName : *Set)
+			SetLocomotorSet(*Set);
+			// (chooseLocomotorSet -> chooseGoodLocomotorFromCurrentSet: the one for where the unit is.)
+			New = LocoSet.Num() > 1 ? FindLocomotorForPosition() : nullptr;
+			if (!New && LocoSet.Num() > 0)
 			{
-				New = FGenGameData::Get().FindLocomotor(LocoName);
-				if (New) { break; }
+				New = LocoSet[0];
 			}
 		}
 		if (New)

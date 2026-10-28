@@ -33,6 +33,20 @@ namespace
 		return false;
 	}
 
+	/** RiderChangeContain: the line of Rider1..8 for that soldier ("thing->isEquivalentTo( rider->getTemplate() )"). */
+	const FGenContainData::FRider* FindRiderType(const FGenContainData& D, const FGenThingTemplate& T)
+	{
+		for (const FGenContainData::FRider& R : D.RiderTypes)
+		{
+			const FGenThingTemplate* RT = FGenGameData::Get().FindTemplate(R.Template);
+			if (RT && RT->Canonical() == T.Canonical())
+			{
+				return &R;
+			}
+		}
+		return nullptr;
+	}
+
 	/** Object::isFactionStructure: a base building of one of the sides (KindOf FS_...). */
 	bool IsSideStructure(const FGenThingTemplate& T)
 	{
@@ -156,6 +170,12 @@ bool UGenGameLogic::IsValidContainerFor(const FGenObject& Container, const FGenO
 		if (Rider.GetOwner() != Container.GetOwner() || RT.TransportSlotCount == 0)
 		{
 			return false;
+		}
+		if (D.bRiderChange)
+		{
+			// RiderChangeContain::isValidContainerFor: "Don't check capacity because our rider will kick the other rider
+			// out!" - only the soldiers its Rider lines name, and not once it is being scuttled.
+			return Container.ScuttleFrame == 0 && FindRiderType(D, RT) != nullptr;
 		}
 		return !bCheckCapacity || GetContainCount(Container) + RT.TransportSlotCount <= D.ContainMax;
 	case EGenContainType::Garrison:
@@ -456,6 +476,26 @@ void UGenGameLogic::AddToContain(FGenObject& Container, FGenObject& Rider)
 		return;
 	}
 	TArray<FGenObjectID>& Riders = bTunnel ? Players[Container.GetOwner()].TunnelRiders : Container.Contain->Riders;
+	const FGenContainData::FRider* RiderType = D.bRiderChange ? FindRiderType(D, *Rider.GetTemplate()) : nullptr;
+	if (D.bRiderChange && Container.Contain->bPayloadCreated && Riders.Num() > 0)
+	{
+		// RiderChangeContain::onContaining: "Remove our existing rider" (aiEvacuateInstantly) - it hops off beside the bike.
+		TGuardValue<bool> Swapping(Container.Contain->bRiderSwap, true);
+		const TArray<FGenObjectID> Old = Riders;
+		const float Radius = Container.GetTemplate()->GetBoundingCircleRadius();
+		for (FGenObjectID Id : Old)
+		{
+			if (FGenObject* O = FindObject(Id))
+			{
+				RemoveFromContain(Container, *O);
+				const float Angle = Random.FRandRange(0.f, 2.f * PI);
+				const float Dist = Random.FRandRange(Radius, Radius * 1.5f);
+				FVector3f Pos(Container.GetPosition().X + Dist * FMath::Cos(Angle), Container.GetPosition().Y + Dist * FMath::Sin(Angle), 0.f);
+				Pos.Z = GetGroundHeight(Pos.X, Pos.Y);
+				O->CommandMoveTo(Pos);
+			}
+		}
+	}
 
 	// Whatever the rider was doing ends here.
 	Rider.StopEntering();
@@ -493,6 +533,20 @@ void UGenGameLogic::AddToContain(FGenObject& Container, FGenObject& Rider)
 		break;
 	default:
 		break;
+	}
+	if (RiderType)
+	{
+		// RiderChangeContain::onContaining: the rider makes the bike what it is - how it looks (and who is drawn on
+		// it), its weapon, its status, its buttons and its pace - and brings its rank along.
+		Container.SetModelCondition(GenConditions::Index(RiderType->Condition), true);
+		Container.SetFlags.AddUnique(RiderType->WeaponFlag);
+		Container.RefreshWeaponSet();
+		Container.RiderStatus = RiderType->Status;
+		Container.CommandSetOverride = RiderType->CommandSet;
+		Container.ChooseLocomotorSet(*RiderType->LocomotorSet);
+		Container.SetVeterancyLevel(Rider.GetVeterancyLevel(), false);
+		Rider.SetVeterancyLevel(0, false);
+		AddSelectionHandoff(Rider.GetID(), Container.GetID());
 	}
 	OnContainChanged(Container);
 	if (bLoadSoundsEnabled)
@@ -565,6 +619,34 @@ void UGenGameLogic::RemoveFromContain(FGenObject& Container, FGenObject& Rider)
 	{
 		K.ExtraSlotsInUse = FMath::Max(0, K.ExtraSlotsInUse - (Rider.GetTemplate()->TransportSlotCount - 1));
 		Container.SetModelCondition(LoadedBit(), Riders.Num() > 0);
+	}
+	if (D.bRiderChange && !Container.IsDead())
+	{
+		if (const FGenContainData::FRider* R = FindRiderType(D, *Rider.GetTemplate()))
+		{
+			// RiderChangeContain::onRemoving: what the rider gave the bike goes with it, and so does the rank.
+			Container.SetModelCondition(GenConditions::Index(R->Condition), false);
+			Container.SetFlags.Remove(R->WeaponFlag);
+			Container.RefreshWeaponSet();
+			Container.RiderStatus.Reset();
+			Rider.SetVeterancyLevel(Container.GetVeterancyLevel(), false);
+			Container.SetVeterancyLevel(0, false);
+		}
+		if (!K.bRiderSwap)
+		{
+			// "Finally, scuttle the bike so nobody else can use it! <Design Spec>" - it tips over, can't be selected,
+			// and (if it was standing) can't be moved; ScuttleDelay later it is gone. The selection goes to the rider.
+			Container.ScuttleFrame = FMath::Max(Frame, 1u);
+			Container.bUnselectable = true;
+			Container.SetModelCondition(GenConditions::Index(D.ScuttleCondition), true);
+			if (!Container.bMoving)
+			{
+				Container.bImmobile = true;
+			}
+			AddSelectionHandoff(Container.GetID(), Rider.GetID());
+			UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [contain f%u] #%u %s is scuttled: its rider #%u %s got off"), Frame, Container.GetID(),
+				*Container.GetTemplate()->Name, Rider.GetID(), *Rider.GetTemplate()->Name);
+		}
 	}
 	OnContainChanged(Container);
 	// OpenContain::doUnloadSound: "don't play more than one per frame (we can do meta unload all commands)".
@@ -808,6 +890,16 @@ void UGenGameLogic::UpdateContain(FGenObject& Container)
 	{
 		K.Portable = GenInvalidObjectID;
 	}
+	if (D.bRiderChange && Container.ScuttleFrame != 0 && Frame >= Container.ScuttleFrame + uint32(D.ScuttleFrames))
+	{
+		// RiderChangeContain::update: "kill the bike in a way that will cause it to sink into the ground without any
+		// real destruction ... Sneaky, eh? Toppled heheh."
+		if (!Container.IsDead())
+		{
+			Container.Kill(TEXT("TOPPLED"));
+		}
+		return;
+	}
 	TArray<FGenObjectID>& Riders = bTunnel ? Players[Container.GetOwner()].TunnelRiders : K.Riders;
 	// Riders that died, and units that gave up coming. (OpenContain::removeFromContain on a rider's death:
 	// a building whose last occupant is killed goes back to its owner, and an armed transport's weapons
@@ -957,6 +1049,22 @@ void UGenGameLogic::OnContainerDied(FGenObject& Container)
 		return;
 	}
 
+	if (D.bRiderChange)
+	{
+		// RiderChangeContain::onRemoving: "Note if the bike dies, the rider dies too" - quietly (destroyObject): the
+		// bike's own death throws a body off it (OCL_...FlyingOffBikeDeathStart), and its STATUS_RIDERn stays on the
+		// wreck for the death modules that ask for it.
+		for (FGenObjectID Id : Container.Contain->Riders)
+		{
+			if (FGenObject* R = FindObject(Id))
+			{
+				R->bPendingDestroy = true;
+			}
+		}
+		Container.Contain->Riders.Reset();
+		return;
+	}
+
 	// HelixContain / OverlordContain::onDie: the add-on goes with what carried it (and a bunker's
 	// soldiers tumble out of the bunker as it does).
 	if (FGenObject* AddOn = GetPortableRider(Container))
@@ -997,6 +1105,12 @@ void UGenGameLogic::OnContainerDied(FGenObject& Container)
 			R->CommandMoveTo(Pos);
 		}
 	}
+}
+
+void UGenGameLogic::AddSelectionHandoff(FGenObjectID From, FGenObjectID To)
+{
+	SelectionHandoffs.RemoveAll([this](const FSelectionHandoff& H) { return H.Frame + uint32(GenLogic::GetLogicFPS()) < Frame; });
+	SelectionHandoffs.Add({ From, To, Frame });
 }
 
 // ---- orders -------------------------------------------------------------------------------------

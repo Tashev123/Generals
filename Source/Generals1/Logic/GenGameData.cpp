@@ -114,6 +114,7 @@ namespace
 			else if (Is(TEXT("FrontWheelTurnAngle"))) { L.WheelTurnAngle = FMath::DegreesToRadians(E.AsFloat()); }
 			else if (Is(TEXT("MaximumWheelExtension"))) { L.MaxWheelExtension = E.AsFloat(); }
 			else if (Is(TEXT("CirclingRadius"))) { L.CirclingRadius = E.AsFloat(); }
+			else if (Is(TEXT("SlideIntoPlaceTime"))) { L.SlideIntoPlaceFrames = E.AsFloat() * float(GenLogic::GetLogicFPS()) / 1000.f; }
 			else if (Is(TEXT("AirborneTargetingHeight"))) { L.AirborneTargetingHeight = E.AsInt(); }
 		}
 		// LocomotorTemplate::validate: damaged values default to the normal ones.
@@ -204,6 +205,7 @@ namespace
 			else if (Is(TEXT("WeaponSpeed"))) { W.WeaponSpeed = GenLogic::VelocityPerFrame(E.AsFloat()); }
 			else if (Is(TEXT("WeaponRecoil"))) { W.WeaponRecoil = FMath::DegreesToRadians(E.AsFloat()); }
 			else if (Is(TEXT("ProjectileObject"))) { W.ProjectileObject = E.Value().Equals(TEXT("NONE"), ESearchCase::IgnoreCase) ? FString() : E.Value(); }
+			else if (Is(TEXT("ProjectileStreamName"))) { W.ProjectileStreamName = E.Value(); }
 			else if (Is(TEXT("AllowAttackGarrisonedBldgs"))) { W.bAllowAttackGarrisonedBldgs = E.AsBool(); }
 			else if (Is(TEXT("FireFX"))) { W.FireFX = E.Value(); }
 			else if (Is(TEXT("ProjectileDetonationFX"))) { W.ProjectileDetonationFX = E.Value(); }
@@ -211,6 +213,7 @@ namespace
 			else if (Is(TEXT("ProjectileDetonationOCL"))) { W.ProjectileDetonationOCL = E.Value(); }
 			else if (Is(TEXT("ProjectileExhaust"))) { W.ProjectileExhaust = E.Value(); }
 			else if (Is(TEXT("LaserName"))) { W.LaserName = E.Value(); }
+			else if (Is(TEXT("RequestAssistRange"))) { W.RequestAssistRange = E.AsFloat(); }
 			else if (Is(TEXT("LaserBoneName"))) { W.LaserBoneName = E.Value(); }
 			else if (Is(TEXT("FireSound"))) { W.FireSound = E.Value(); }
 			else if (Is(TEXT("FireSoundLoopTime"))) { W.FireSoundLoopTime = GenLogic::MsecToFrames(E.AsFloat()); }
@@ -653,6 +656,8 @@ bool FGenGameData::Initialize()
 				}
 			}
 			UnitReallyDamagedThreshold = B->GetFloat(TEXT("UnitReallyDamagedThreshold"), UnitReallyDamagedThreshold);
+			if (const FGenIniEntry* R = B->Find(TEXT("BaseRegenHealthPercentPerSecond"))) { BaseRegenHealthPercentPerSecond = ParsePercent(R->Value()); }
+			if (const FGenIniEntry* R = B->Find(TEXT("BaseRegenDelay"))) { BaseRegenDelay = GenLogic::MsecToFrames(R->AsFloat()); }
 			auto Percent = [&B](const TCHAR* Key, float& Out)
 			{
 				if (const FGenIniEntry* E = B->Find(Key)) { Out = ParsePercent(E->Value()); }
@@ -1066,6 +1071,7 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 		{
 			for (const FString& V : E.Values) { T->KindOf.Add(V.ToUpper()); }
 			T->bKindInfantry = T->KindOf.Contains(TEXT("INFANTRY"));
+			T->bKindNoCollide = T->KindOf.Contains(TEXT("NO_COLLIDE"));
 		}
 		else if (E.Key.Equals(TEXT("Side"), ESearchCase::IgnoreCase)) { T->Side = E.Value(0); }
 		else if (E.Key.Equals(TEXT("EditorSorting"), ESearchCase::IgnoreCase)) { T->EditorSorting = E.Value(0); }
@@ -1127,6 +1133,12 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 			T->Buildable = V.Equals(TEXT("No"), ESearchCase::IgnoreCase) ? 1 : V.Equals(TEXT("Only_By_AI"), ESearchCase::IgnoreCase) ? 2
 				: V.Equals(TEXT("Ignore_Prerequisites"), ESearchCase::IgnoreCase) ? 3 : 0;
 		}
+		else if (E.Key.Equals(TEXT("MaxSimultaneousOfType"), ESearchCase::IgnoreCase))
+		{
+			// A number, or the keyword for the lobby option (which this game has no screen for): unlimited.
+			T->MaxSimultaneousOfType = E.Value(0).Equals(TEXT("DeterminedBySuperweaponRestriction"), ESearchCase::IgnoreCase) ? 0 : E.AsInt();
+		}
+		else if (E.Key.Equals(TEXT("MaxSimultaneousLinkKey"), ESearchCase::IgnoreCase)) { T->MaxSimultaneousLinkKey = E.Value(0); }
 		else if (E.Key.Equals(TEXT("ShroudClearingRange"), ESearchCase::IgnoreCase)) { T->ShroudClearingRange = E.AsFloat(); }
 		else if (E.Key.Equals(TEXT("ShroudRevealToAllRange"), ESearchCase::IgnoreCase)) { T->ShroudRevealToAllRange = E.AsFloat(); }
 		else if (E.Key.Equals(TEXT("RadarPriority"), ESearchCase::IgnoreCase))
@@ -1311,6 +1323,7 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				if (const FGenIniEntry* DT = E.Block->Find(TEXT("DeathTypes"))) { M.DeathTypes = DT->Values; }
 				if (const FGenIniEntry* VL = E.Block->Find(TEXT("VeterancyLevels"))) { M.VeterancyMask = ParseVeterancyMask(VL->Values); }
 				if (const FGenIniEntry* ES = E.Block->Find(TEXT("ExemptStatus"))) { M.ExemptStatus = ES->Values; }
+				if (const FGenIniEntry* RS = E.Block->Find(TEXT("RequiredStatus"))) { M.RequiredStatus = RS->Values; }
 			}
 			else if (Type.Equals(TEXT("VeterancyCrateCollide"), ESearchCase::IgnoreCase))
 			{
@@ -1558,7 +1571,14 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				{
 					if (Sub.Key.Equals(TEXT("TriggeredBy"), ESearchCase::IgnoreCase)) { D.TriggeredBy.Append(Sub.Values); }
 					else if (Sub.Key.Equals(TEXT("ConflictsWith"), ESearchCase::IgnoreCase)) { D.ConflictsWith.Append(Sub.Values); }
+					else if (Sub.Key.Equals(TEXT("DeathTypes"), ESearchCase::IgnoreCase)) { D.DeathTypes = Sub.Values; }
+					else if (Sub.Key.Equals(TEXT("ExemptStatus"), ESearchCase::IgnoreCase)) { D.ExemptStatus = Sub.Values; }
+					else if (Sub.Key.Equals(TEXT("RequiredStatus"), ESearchCase::IgnoreCase)) { D.RequiredStatus = Sub.Values; }
 				}
+			}
+			else if (Type.Equals(TEXT("AnimationSteeringUpdate"), ESearchCase::IgnoreCase))
+			{
+				T->AnimationSteeringFrames = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("MinTransitionTime"), 0.f));
 			}
 			else if (Type.Equals(TEXT("StealthUpdate"), ESearchCase::IgnoreCase))
 			{
@@ -1723,6 +1743,16 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				G.RandomJitter = B.GetFloat(TEXT("RandomJitter"), 0.f) / 100.f;
 				if (B.Find(TEXT("SkipIfThisMuchUnderStructure"))) { G.SkipIfThisMuchUnderStructure = B.GetFloat(TEXT("SkipIfThisMuchUnderStructure"), 33.f) / 100.f; }
 			}
+			else if (Type.Equals(TEXT("MobMemberSlavedUpdate"), ESearchCase::IgnoreCase))
+			{
+				FGenThingTemplate::FMobMember& D = T->MobMember;
+				D.bValid = true;
+				D.MustCatchUpRadius = float(E.Block->GetInt(TEXT("MustCatchUpRadius"), 0));
+				D.NoNeedToCatchUpRadius = float(E.Block->GetInt(TEXT("NoNeedToCatchUpRadius"), 0));
+				// onObjectCreated: "MIN(MAX_SQUIRRELLINESS, MAX(0, ...))"
+				D.Squirrelliness = FMath::Clamp(E.Block->GetFloat(TEXT("Squirrelliness"), 0.f), 0.f, 1.f);
+				D.CatchUpCrisisBailTime = E.Block->GetInt(TEXT("CatchUpCrisisBailTime"), 0);
+			}
 			else if (Type.Equals(TEXT("SlavedUpdate"), ESearchCase::IgnoreCase))
 			{
 				FGenThingTemplate::FSlaved& D = T->Slaved;
@@ -1833,6 +1863,169 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				L.Radius = E.Block->GetFloat(TEXT("AffectRadius"), 0.f);
 				L.ParticleSystem = E.Block->GetString(TEXT("LeafletFXParticleSystem"));
 			}
+			else if (Type.Equals(TEXT("PoisonedBehavior"), ESearchCase::IgnoreCase))
+			{
+				T->Poisoned.bValid = true;
+				T->Poisoned.IntervalFrames = FMath::Max(1, GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("PoisonDamageInterval"), 0.f)));
+				T->Poisoned.DurationFrames = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("PoisonDuration"), 0.f));
+			}
+			else if (Type.Equals(TEXT("RailroadBehavior"), ESearchCase::IgnoreCase))
+			{
+				FGenThingTemplate::FRailroad& R = T->Railroad;
+				const FGenIniBlock& B = *E.Block;
+				R.bValid = true;
+				R.bIsLocomotive = B.GetBool(TEXT("IsLocomotive"));
+				R.RunningGarrisonSpeedMax = B.GetFloat(TEXT("RunningGarrisonSpeedMax"), 1.f);
+				R.KillSpeedMin = B.GetFloat(TEXT("KillSpeedMin"), 1.f);
+				R.SpeedMax = B.GetFloat(TEXT("SpeedMax"), 4.f);
+				R.Acceleration = B.GetFloat(TEXT("Acceleration"), 1.01f);
+				R.Braking = B.GetFloat(TEXT("Braking"), 0.99f);
+				R.Friction = B.GetFloat(TEXT("Friction"), 0.97f);
+				R.WaitAtStationFrames = GenLogic::MsecToFrames(B.GetFloat(TEXT("WaitAtStationTime"), 5000.f));
+				R.RunningSound = B.GetString(TEXT("RunningSound"));
+				R.ClicketyClackSound = B.GetString(TEXT("ClicketyClackSound"));
+				R.WhistleSound = B.GetString(TEXT("WhistleSound"));
+				R.BigMetalBounceSound = B.GetString(TEXT("BigMetalBounceSound"));
+				R.SmallMetalBounceSound = B.GetString(TEXT("SmallMetalBounceSound"));
+				R.MeatyBounceSound = B.GetString(TEXT("MeatyBounceSound"));
+				for (const FGenIniEntry& Sub : B.Entries)
+				{
+					if (Sub.Key.Equals(TEXT("CarriageTemplateName"), ESearchCase::IgnoreCase)) { R.CarriageTemplates.Append(Sub.Values); }
+				}
+			}
+			else if (Type.Equals(TEXT("FireOCLAfterWeaponCooldownUpdate"), ESearchCase::IgnoreCase))
+			{
+				FGenThingTemplate::FFireOCLAfterCooldown& F = T->FireOCLAfterCooldown.AddDefaulted_GetRef();
+				const FString SlotName = E.Block->GetString(TEXT("WeaponSlot"), TEXT("PRIMARY"));
+				F.Slot = SlotName.Equals(TEXT("SECONDARY"), ESearchCase::IgnoreCase) ? 1 : SlotName.Equals(TEXT("TERTIARY"), ESearchCase::IgnoreCase) ? 2 : 0;
+				F.OCL = E.Block->GetString(TEXT("OCL"));
+				F.MinShots = E.Block->GetInt(TEXT("MinShotsToCreateOCL"), 1);
+				F.LifetimeMsPerSecond = E.Block->GetFloat(TEXT("OCLLifetimePerSecond"), 1000.f);
+				F.MaxFrames = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("OCLLifetimeMaxCap"), 1000.f * 1000.f / 30.f));
+				F.bRequiresAllTriggers = E.Block->GetBool(TEXT("RequiresAllTriggers"));
+				for (const FGenIniEntry& Sub : E.Block->Entries)
+				{
+					if (Sub.Key.Equals(TEXT("TriggeredBy"), ESearchCase::IgnoreCase)) { F.TriggeredBy.Append(Sub.Values); }
+					else if (Sub.Key.Equals(TEXT("ConflictsWith"), ESearchCase::IgnoreCase)) { F.ConflictsWith.Append(Sub.Values); }
+				}
+			}
+			else if (Type.Equals(TEXT("AssistedTargetingUpdate"), ESearchCase::IgnoreCase))
+			{
+				FGenThingTemplate::FAssistedTargeting& A = T->AssistedTargeting;
+				A.bValid = true;
+				A.ClipSize = E.Block->GetInt(TEXT("AssistingClipSize"), 0);
+				const FString SlotName = E.Block->GetString(TEXT("AssistingWeaponSlot"), TEXT("SECONDARY"));
+				A.Slot = SlotName.Equals(TEXT("SECONDARY"), ESearchCase::IgnoreCase) ? 1 : SlotName.Equals(TEXT("TERTIARY"), ESearchCase::IgnoreCase) ? 2 : 0;
+				A.LaserFromAssisted = E.Block->GetString(TEXT("LaserFromAssisted"));
+				A.LaserToTarget = E.Block->GetString(TEXT("LaserToTarget"));
+			}
+			else if (Type.Equals(TEXT("ProjectileStreamUpdate"), ESearchCase::IgnoreCase))
+			{
+				T->bProjectileStream = true;
+			}
+			else if (Type.Equals(TEXT("BoneFXUpdate"), ESearchCase::IgnoreCase))
+			{
+				// "<BodyDamageState><FXList|OCL|ParticleSystem><index> = Bone:<BoneName> OnlyOnce:<Yes|No> <Min delay>
+				// <Max delay> <FXList|OCL|PSys>:<Name>". (Its DamageFXTypes and the like - "ALL -WATER" wherever they
+				// are given - aren't looked at.)
+				static const TCHAR* const States[] = { TEXT("ReallyDamaged"), TEXT("Damaged"), TEXT("Pristine"), TEXT("Rubble") };
+				static const int32 StateIndex[] = { 2, 1, 0, 3 };
+				for (const FGenIniEntry& BE : E.Block->Entries)
+				{
+					FGenThingTemplate::FBoneFX X;
+					FString Rest;
+					int32 s = 0;
+					for (; s < 4; ++s)
+					{
+						if (BE.Key.StartsWith(States[s], ESearchCase::IgnoreCase))
+						{
+							X.State = StateIndex[s];
+							Rest = BE.Key.Mid(FCString::Strlen(States[s]));
+							break;
+						}
+					}
+					if (s == 4) { continue; }
+					if (Rest.StartsWith(TEXT("FXList"), ESearchCase::IgnoreCase)) { X.Kind = FGenThingTemplate::FBoneFX::FXList; }
+					else if (Rest.StartsWith(TEXT("OCL"), ESearchCase::IgnoreCase)) { X.Kind = FGenThingTemplate::FBoneFX::OCL; }
+					else if (Rest.StartsWith(TEXT("ParticleSystem"), ESearchCase::IgnoreCase)) { X.Kind = FGenThingTemplate::FBoneFX::ParticleSystem; }
+					else { continue; }
+					TArray<FString> Tok;
+					GenIni::Tokenize(BE.Raw, Tok, TEXT(" \t=:"));
+					if (Tok.Num() < 8 || !Tok[0].Equals(TEXT("bone"), ESearchCase::IgnoreCase))
+					{
+						continue;
+					}
+					X.Bone = Tok[1];
+					X.bOnlyOnce = Tok[3].Equals(TEXT("Yes"), ESearchCase::IgnoreCase);
+					X.MinDelay = GenLogic::MsecToFrames(FCString::Atof(*Tok[4]));
+					X.MaxDelay = GenLogic::MsecToFrames(FCString::Atof(*Tok[5]));
+					X.Name = Tok[7];
+					T->BoneFX.Add(MoveTemp(X));
+				}
+			}
+			else if (Type.Equals(TEXT("CleanupHazardUpdate"), ESearchCase::IgnoreCase))
+			{
+				FGenThingTemplate::FCleanupHazard& C = T->CleanupHazard;
+				C.bValid = true;
+				const FString Slot = E.Block->GetString(TEXT("WeaponSlot"), TEXT("PRIMARY"));
+				C.WeaponSlot = Slot.Equals(TEXT("SECONDARY"), ESearchCase::IgnoreCase) ? 1 : Slot.Equals(TEXT("TERTIARY"), ESearchCase::IgnoreCase) ? 2 : 0;
+				C.ScanFrames = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("ScanRate"), 0.f));
+				C.ScanRange = E.Block->GetFloat(TEXT("ScanRange"), 0.f);
+			}
+			else if (Type.Equals(TEXT("AutoFindHealingUpdate"), ESearchCase::IgnoreCase))
+			{
+				FGenThingTemplate::FAutoFindHealing& H = T->AutoFindHealing;
+				H.bValid = true;
+				H.ScanFrames = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("ScanRate"), 0.f));
+				H.ScanRange = E.Block->GetFloat(TEXT("ScanRange"), 0.f);
+				H.NeverHeal = E.Block->GetFloat(TEXT("NeverHeal"), 0.95f);
+				H.AlwaysHeal = E.Block->GetFloat(TEXT("AlwaysHeal"), 0.25f);
+			}
+			else if (Type.Equals(TEXT("LockWeaponCreate"), ESearchCase::IgnoreCase))
+			{
+				const FString SlotName = E.Block->GetString(TEXT("SlotToLock"), TEXT("PRIMARY"));
+				T->LockWeaponSlot = SlotName.Equals(TEXT("SECONDARY"), ESearchCase::IgnoreCase) ? 1 : SlotName.Equals(TEXT("TERTIARY"), ESearchCase::IgnoreCase) ? 2 : 0;
+			}
+			else if (Type.Equals(TEXT("RebuildHoleExposeDie"), ESearchCase::IgnoreCase))
+			{
+				FGenDieModule& M = T->DieModules.AddDefaulted_GetRef();
+				M.Type = EGenDieModule::RebuildHoleExpose;
+				M.HoleName = E.Block->GetString(TEXT("HoleName"));
+				M.HoleMaxHealth = E.Block->GetFloat(TEXT("HoleMaxHealth"), 0.f);
+				M.bTransferAttackers = E.Block->GetBool(TEXT("TransferAttackers"), true);
+				if (const FGenIniEntry* DT = E.Block->Find(TEXT("DeathTypes"))) { M.DeathTypes = DT->Values; }
+				if (const FGenIniEntry* VL = E.Block->Find(TEXT("VeterancyLevels"))) { M.VeterancyMask = ParseVeterancyMask(VL->Values); }
+				if (const FGenIniEntry* ES = E.Block->Find(TEXT("ExemptStatus"))) { M.ExemptStatus = ES->Values; }
+				if (const FGenIniEntry* RS = E.Block->Find(TEXT("RequiredStatus"))) { M.RequiredStatus = RS->Values; }
+			}
+			else if (Type.Equals(TEXT("RebuildHoleBehavior"), ESearchCase::IgnoreCase))
+			{
+				FGenThingTemplate::FRebuildHole& R = T->RebuildHole;
+				R.bValid = true;
+				R.WorkerName = E.Block->GetString(TEXT("WorkerObjectName"));
+				R.WorkerRespawnFrames = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("WorkerRespawnDelay"), 0.f));
+				if (const FGenIniEntry* P = E.Block->Find(TEXT("HoleHealthRegen%PerSecond"))) { R.RegenPercentPerSecond = ParsePercent(P->Value()); }
+			}
+			else if (Type.Equals(TEXT("BaseRegenerateUpdate"), ESearchCase::IgnoreCase))
+			{
+				T->bBaseRegenerate = true;
+			}
+			else if (Type.Equals(TEXT("HordeUpdate"), ESearchCase::IgnoreCase))
+			{
+				FGenThingTemplate::FHorde& H = T->Horde;
+				H.bValid = true;
+				H.UpdateRate = FMath::Max(1, GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("UpdateRate"), 1000.f)));
+				if (const FGenIniEntry* K = E.Block->Find(TEXT("KindOf")))
+				{
+					for (const FString& V : K->Values) { H.KindOf.Add(V.ToUpper()); }
+				}
+				H.Count = E.Block->GetInt(TEXT("Count"), 0);
+				H.Radius = E.Block->GetFloat(TEXT("Radius"), 0.f);
+				H.RubOffRadius = E.Block->GetFloat(TEXT("RubOffRadius"), 20.f);
+				H.bAlliesOnly = E.Block->GetBool(TEXT("AlliesOnly"), true);
+				H.bExactMatch = E.Block->GetBool(TEXT("ExactMatch"));
+				H.bAllowedNationalism = E.Block->GetBool(TEXT("AllowedNationalism"), true);
+			}
 			else if (Type.Equals(TEXT("DeletionUpdate"), ESearchCase::IgnoreCase))
 			{
 				T->bHasDeletion = true;
@@ -1840,7 +2033,7 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				T->DeletionMax = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("MaxLifetime"), 0.f));
 			}
 			else if (Type.Equals(TEXT("TransportContain"), ESearchCase::IgnoreCase) || Type.Equals(TEXT("HelixContain"), ESearchCase::IgnoreCase)
-				|| Type.Equals(TEXT("OverlordContain"), ESearchCase::IgnoreCase)
+				|| Type.Equals(TEXT("OverlordContain"), ESearchCase::IgnoreCase) || Type.Equals(TEXT("RiderChangeContain"), ESearchCase::IgnoreCase)
 				|| Type.Equals(TEXT("GarrisonContain"), ESearchCase::IgnoreCase) || Type.Equals(TEXT("HealContain"), ESearchCase::IgnoreCase)
 				|| Type.Equals(TEXT("TunnelContain"), ESearchCase::IgnoreCase) || Type.Equals(TEXT("InternetHackContain"), ESearchCase::IgnoreCase))
 			{
@@ -1901,6 +2094,21 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				C.bImmuneToClearBuildingAttacks = B.GetBool(TEXT("ImmuneToClearBuildingAttacks"));
 				C.EnterSound = B.GetString(TEXT("EnterSound"));
 				C.ExitSound = B.GetString(TEXT("ExitSound"));
+				if (Type.Equals(TEXT("RiderChangeContain"), ESearchCase::IgnoreCase))
+				{
+					C.bRiderChange = true;
+					C.bShouldDrawPips = false; // getContainerPipsToShow: "always have one rider unless dead"
+					for (int32 i = 1; i <= 8; ++i)
+					{
+						const FGenIniEntry* R = B.Find(*FString::Printf(TEXT("Rider%d"), i));
+						if (R && R->Values.Num() >= 6)
+						{
+							C.RiderTypes.Add({ R->Values[0], R->Values[1], R->Values[2], R->Values[3], R->Values[4], R->Values[5].ToUpper() });
+						}
+					}
+					C.ScuttleFrames = GenLogic::MsecToFrames(B.GetFloat(TEXT("ScuttleDelay"), 0.f));
+					C.ScuttleCondition = B.GetString(TEXT("ScuttleStatus"), TEXT("TOPPLED"));
+				}
 			}
 			else if (Type.Equals(TEXT("OverchargeBehavior"), ESearchCase::IgnoreCase))
 			{
@@ -1937,6 +2145,10 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				T->BodyType = Type;
 				T->MaxHealth = E.Block->GetFloat(TEXT("MaxHealth"), T->MaxHealth);
 				T->InitialHealth = E.Block->GetFloat(TEXT("InitialHealth"), T->MaxHealth);
+				if (Type.Equals(TEXT("UndeadBody"), ESearchCase::IgnoreCase))
+				{
+					T->SecondLifeMaxHealth = E.Block->GetFloat(TEXT("SecondLifeMaxHealth"), 1.f);
+				}
 				if (Type.Equals(TEXT("HiveStructureBody"), ESearchCase::IgnoreCase))
 				{
 					// "NONE +SMALL_ARMS +SNIPER ..."
@@ -2061,11 +2273,22 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				else
 				{
 					FGenThingTemplate::FSpawner& Sp = T->Spawner;
-					Sp.Template = E.Block->GetString(TEXT("SpawnTemplateName"));
+					Sp.Templates.Reset();
+					for (const FGenIniEntry* N : E.Block->FindAll(TEXT("SpawnTemplateName")))
+					{
+						if (!N->Value().IsEmpty())
+						{
+							Sp.Templates.Add(N->Value()); // parseAsciiStringVectorAppend
+						}
+					}
 					Sp.Number = E.Block->GetInt(TEXT("SpawnNumber"), 0);
 					Sp.ReplaceFrames = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("SpawnReplaceDelay"), 0.f));
 					Sp.bRequireSpawner = E.Block->GetBool(TEXT("SpawnedRequireSpawner"));
-					Sp.bValid = !Sp.Template.IsEmpty() && Sp.Number > 0;
+					Sp.InitialBurst = E.Block->GetInt(TEXT("InitialBurst"), 0);
+					Sp.bExitByBudding = E.Block->GetBool(TEXT("ExitByBudding"));
+					Sp.bAggregateHealth = E.Block->GetBool(TEXT("AggregateHealth"));
+					Sp.bSlavesHaveFreeWill = E.Block->GetBool(TEXT("SlavesHaveFreeWill"));
+					Sp.bValid = Sp.Templates.Num() > 0 && Sp.Number > 0;
 				}
 			}
 			else if (Type.Equals(TEXT("TransitionDamageFX"), ESearchCase::IgnoreCase))
@@ -2121,6 +2344,7 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 					if (DE.Key.Equals(TEXT("DeathTypes"), ESearchCase::IgnoreCase)) { M.DeathTypes = DE.Values; }
 					else if (DE.Key.Equals(TEXT("VeterancyLevels"), ESearchCase::IgnoreCase)) { M.VeterancyMask = ParseVeterancyMask(DE.Values); }
 					else if (DE.Key.Equals(TEXT("ExemptStatus"), ESearchCase::IgnoreCase)) { M.ExemptStatus = DE.Values; }
+					else if (DE.Key.Equals(TEXT("RequiredStatus"), ESearchCase::IgnoreCase)) { M.RequiredStatus = DE.Values; }
 					else if (DE.Key.Equals(TEXT("DeathFX"), ESearchCase::IgnoreCase) || DE.Key.Equals(TEXT("FX"), ESearchCase::IgnoreCase)) { M.FX.Append(DE.Values); }
 					else if (DE.Key.Equals(TEXT("CreationList"), ESearchCase::IgnoreCase) || DE.Key.Equals(TEXT("OCL"), ESearchCase::IgnoreCase)) { M.OCL.Append(DE.Values); }
 					else if (DE.Key.Equals(TEXT("TransferPreviousHealth"), ESearchCase::IgnoreCase)) { M.bTransferPreviousHealth = DE.AsBool(); }
@@ -2135,6 +2359,7 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 					if (DE.Key.Equals(TEXT("DeathTypes"), ESearchCase::IgnoreCase)) { M.DeathTypes = DE.Values; }
 					else if (DE.Key.Equals(TEXT("VeterancyLevels"), ESearchCase::IgnoreCase)) { M.VeterancyMask = ParseVeterancyMask(DE.Values); }
 					else if (DE.Key.Equals(TEXT("ExemptStatus"), ESearchCase::IgnoreCase)) { M.ExemptStatus = DE.Values; }
+					else if (DE.Key.Equals(TEXT("RequiredStatus"), ESearchCase::IgnoreCase)) { M.RequiredStatus = DE.Values; }
 					else if (DE.Key.Equals(TEXT("CrateData"), ESearchCase::IgnoreCase)) { M.CrateData.Append(DE.Values); }
 				}
 			}
@@ -2240,6 +2465,17 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 					}
 				}
 				FGenSlowDeath D;
+				if (Type.Equals(TEXT("BattleBusSlowDeathBehavior"), ESearchCase::IgnoreCase))
+				{
+					D.bBattleBus = true;
+					D.FXStartUndeath = E.Block->GetString(TEXT("FXStartUndeath"));
+					D.OCLStartUndeath = E.Block->GetString(TEXT("OCLStartUndeath"));
+					D.FXHitGround = E.Block->GetString(TEXT("FXHitGround"));
+					D.OCLHitGround = E.Block->GetString(TEXT("OCLHitGround"));
+					D.ThrowForce = E.Block->GetFloat(TEXT("ThrowForce"), 1.f);
+					D.PercentDamageToPassengers = ParsePercent(E.Block->GetString(TEXT("PercentDamageToPassengers"), TEXT("0%")));
+					D.EmptyHulkDestructionDelay = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("EmptyHulkDestructionDelay"), 0.f));
+				}
 				D.DestructionDelay = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("DestructionDelay"), 0.f));
 				D.DestructionDelayVariance = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("DestructionDelayVariance"), 0.f));
 				D.SinkDelay = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("SinkDelay"), 0.f));
@@ -2247,6 +2483,7 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				D.ProbabilityModifier = E.Block->GetInt(TEXT("ProbabilityModifier"), 10);
 				if (const FGenIniEntry* DT = E.Block->Find(TEXT("DeathTypes"))) { D.DeathTypes = DT->Values; }
 				if (const FGenIniEntry* ES = E.Block->Find(TEXT("ExemptStatus"))) { D.ExemptStatus = ES->Values; }
+				if (const FGenIniEntry* RS = E.Block->Find(TEXT("RequiredStatus"))) { D.RequiredStatus = RS->Values; }
 				for (const FGenIniEntry& DE : E.Block->Entries)
 				{
 					// "FX = FINAL FX_Name" / "OCL = INITIAL OCL_Name"
@@ -2273,6 +2510,7 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				if (const FGenIniEntry* DT = E.Block->Find(TEXT("DeathTypes"))) { M.DeathTypes = DT->Values; }
 				if (const FGenIniEntry* VL = E.Block->Find(TEXT("VeterancyLevels"))) { M.VeterancyMask = ParseVeterancyMask(VL->Values); }
 				if (const FGenIniEntry* ES = E.Block->Find(TEXT("ExemptStatus"))) { M.ExemptStatus = ES->Values; }
+				if (const FGenIniEntry* RS = E.Block->Find(TEXT("RequiredStatus"))) { M.RequiredStatus = RS->Values; }
 			}
 			else if (Type.Equals(TEXT("DumbProjectileBehavior"), ESearchCase::IgnoreCase))
 			{
@@ -2288,6 +2526,22 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 			{
 				T->bHasAI = true;
 				T->AIUpdateType = Type;
+				T->bWanderAI = Type.Equals(TEXT("WanderAIUpdate"), ESearchCase::IgnoreCase);
+				if (Type.Equals(TEXT("DeployStyleAIUpdate"), ESearchCase::IgnoreCase))
+				{
+					FGenThingTemplate::FDeploy& D = T->Deploy;
+					D.bValid = true;
+					D.UnpackFrames = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("UnpackTime"), 0.f));
+					D.PackFrames = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("PackTime"), 0.f));
+					D.bTurretsOnlyWhenDeployed = E.Block->GetBool(TEXT("TurretsFunctionOnlyWhenDeployed"));
+					D.bTurretsMustCenter = E.Block->GetBool(TEXT("TurretsMustCenterBeforePacking"));
+					D.bManualAnimations = E.Block->GetBool(TEXT("ManualDeployAnimations"));
+				}
+				else if (Type.Equals(TEXT("AssaultTransportAIUpdate"), ESearchCase::IgnoreCase))
+				{
+					T->AssaultTransport.bValid = true;
+					T->AssaultTransport.HealRatio = E.Block->GetFloat(TEXT("MembersGetHealedAtLifeRatio"), 0.f);
+				}
 				if (Type.Equals(TEXT("HackInternetAIUpdate"), ESearchCase::IgnoreCase))
 				{
 					FGenUpgradeData::ParseHackInternet(*E.Block, T->HackInternet);
@@ -2513,6 +2767,16 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 			{
 				FGenUpgradeData::ParseLaserDraw(*E.Block, T->LaserDraw);
 			}
+			if (D.Type.Equals(TEXT("W3DProjectileStreamDraw"), ESearchCase::IgnoreCase))
+			{
+				FGenStreamDraw& S = T->StreamDraw;
+				S.bValid = true;
+				S.Texture = E.Block->GetString(TEXT("Texture"));
+				S.Width = E.Block->GetFloat(TEXT("Width"), 0.f);
+				S.TileFactor = E.Block->GetFloat(TEXT("TileFactor"), 0.f);
+				S.ScrollRate = E.Block->GetFloat(TEXT("ScrollRate"), 0.f);
+				S.MaxSegments = E.Block->GetInt(TEXT("MaxSegments"), 0);
+			}
 			if (D.Type.Equals(TEXT("W3DTreeDraw"), ESearchCase::IgnoreCase) && E.Block->GetBool(TEXT("DoTopple")))
 			{
 				// W3DTreeDrawModuleData: the tree buffer's own toppling, with its own defaults.
@@ -2673,6 +2937,15 @@ const FGenArmorSetEntry* FGenThingTemplate::FindArmorSet(const TArray<FString>& 
 const FGenPlayerTemplate* FGenGameData::FindPlayerTemplate(const FString& Name) const
 {
 	return PlayerTemplates.FindByPredicate([&](const FGenPlayerTemplate& P) { return P.Name.Equals(Name, ESearchCase::IgnoreCase); });
+}
+
+const FString& FGenGameData::BaseSideOf(const FString& Side) const
+{
+	// The faction an object's Side belongs to ("AmericaAirForceGeneral" -> "USA"), by the player template
+	// of that side. Empty for sides no player plays (Civilian).
+	static const FString None;
+	const FGenPlayerTemplate* P = PlayerTemplates.FindByPredicate([&](const FGenPlayerTemplate& T) { return T.Side.Equals(Side, ESearchCase::IgnoreCase); });
+	return P ? P->BaseSide : None;
 }
 
 void FGenGameData::ApplyMapIni(const FString& MapFolder)

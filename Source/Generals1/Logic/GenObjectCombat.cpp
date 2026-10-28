@@ -66,7 +66,21 @@ namespace
 	{
 		if (Name.Equals(TEXT("UNDER_CONSTRUCTION"), ESearchCase::IgnoreCase)) { return Obj.IsUnderConstruction(); }
 		if (Name.Equals(TEXT("HIJACKED"), ESearchCase::IgnoreCase)) { return Obj.IsHijacked(); }
+		if (!Obj.GetRiderStatus().IsEmpty() && Name.Equals(Obj.GetRiderStatus(), ESearchCase::IgnoreCase)) { return true; } // STATUS_RIDERn
 		return false;
+	}
+
+	/** DieMuxData::isDieApplicable: "if( m_requiredStatus.any() && !object->getStatusBits().testForAll( m_requiredStatus ) ) return FALSE". */
+	bool StatusRequiredMet(const FGenObject& Obj, const TArray<FString>& Tokens)
+	{
+		for (const FString& T : Tokens)
+		{
+			if (!T.Equals(TEXT("NONE"), ESearchCase::IgnoreCase) && !ObjectHasStatus(Obj, T))
+			{
+				return false;
+			}
+		}
+		return true;
 	}
 
 	/** DieMuxData::isDieApplicable's third check: "if( m_exemptStatus && (object->getStatus() & m_exemptStatus) ) return FALSE" —
@@ -158,6 +172,10 @@ bool FGenObject::ContainsPoint(const FVector3f& P) const
 
 bool FGenObject::IsTargetable() const
 {
+	if (bMasked || Template->Spawner.bAggregateHealth)
+	{
+		return false; // OBJECT_STATUS_MASKED (computeAggregateStates: "make sure no enemies are shooting at the nexus, since it doesn't 'exist'")
+	}
 	if (bDead || bPendingDestroy || Projectile.bActive || ContainedBy != GenInvalidObjectID || HijackedVehicle != GenInvalidObjectID || IsMineMasked())
 	{
 		return false; // (what is inside a container can only be got at through the container; a hijacker through his car)
@@ -503,6 +521,7 @@ FGenObject* FGenObject::FindAutoTarget() const
 
 void FGenObject::CommandAttack(FGenObjectID Target, bool bForce)
 {
+	AttackShotsLeft = -1;
 	if (bDead || !HasWeapons() || Target == ID)
 	{
 		return;
@@ -605,6 +624,7 @@ bool FGenObject::TurnTurretTowardsPitch(int32 Turret, float Desired, float RateM
 
 void FGenObject::ClearAttack()
 {
+	AttackShotsLeft = -1;
 	// "this can occur if we start a preattack (eg, bayonet) and the target moves out range before we can
 	// actually "fire"... cancel this state to avoid confusion."
 	for (FGenWeaponInstance& WI : Weapons)
@@ -740,6 +760,21 @@ void FGenObject::FireWeapon(int32 Slot, FGenObject& Target, uint32 Frame)
 		Scatter = FMath::Max(Scatter, 99999.f); // (treated like any scattered shot below: it flies to the spot)
 	}
 
+	// Weapon::processRequestAssistance: "tell everyone like us within our assistance range who is free to do so to
+	// assist us on this shot" (the Air Force General's Patriots).
+	if (W.RequestAssistRange > 0.f)
+	{
+		Logic->RequestAssistance(*this, Target, W.RequestAssistRange);
+	}
+	// Weapon::fireWeapon, DAMAGE_DEPLOY: "atInterface->beginAssault( victimObj )" - the Troop Crawler's riders get out at it.
+	if (Template->AssaultTransport.bValid && W.DamageType.Equals(TEXT("DEPLOY"), ESearchCase::IgnoreCase))
+	{
+		if (AssaultTarget != Target.ID)
+		{
+			UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [assault f%u] #%u %s begins an assault on #%u %s"), Frame, ID, *Template->Name, Target.ID, *Target.Template->Name);
+		}
+		AssaultTarget = Target.ID;
+	}
 	// Fire effects play at the weapon's FX bone (muzzle) when the model has one; tracers fly to the victim's center.
 	const FVector3f VictimCenter = Target.Position + FVector3f(0.f, 0.f, Target.Template->GeometryHeight * 0.5f);
 	Logic->DoWeaponFireFX(*this, Slot, W, (Scatter > 0.f || bSneaky) ? Destination : VictimCenter);
@@ -1264,7 +1299,7 @@ void FGenObject::UpdateCombat(uint32 Frame)
 			bAttackingPosition = false;
 			ActiveSlot = INDEX_NONE;
 		}
-		else if ((!bAttackPositionApproach || UpdatePositionApproach(ActiveSlot, Frame)) && bAttackingPosition && Frame >= Firing.ReadyFrame && !IsDisabled())
+		else if ((!bAttackPositionApproach || UpdatePositionApproach(ActiveSlot, Frame)) && bAttackingPosition && Frame >= Firing.ReadyFrame && !IsDisabled() && IsDeployedToFire())
 		{
 			if (Firing.PreAttackDoneFrame == 0)
 			{
@@ -1376,8 +1411,9 @@ void FGenObject::UpdateCombat(uint32 Frame)
 				bStatusBraking = false;
 			}
 			bAiming = true;
-			// A turret can already track and fire on the move; everything else has to stand still to aim.
-			if ((!bMoving || TurretForSlot(ActiveSlot) != INDEX_NONE) && AimAt(*Target, ActiveSlot) && Frame >= WI.ReadyFrame)
+			// A turret can already track and fire on the move; everything else has to stand still to aim. (One that
+			// deploys - the Nuke Cannon - neither aims nor fires until it has unpacked: DeployStyleAIUpdate.)
+			if (IsDeployedToFire() && (!bMoving || TurretForSlot(ActiveSlot) != INDEX_NONE) && AimAt(*Target, ActiveSlot) && Frame >= WI.ReadyFrame)
 			{
 				// Object::preFireCurrentWeapon / AIAttackFireWeaponState: a weapon that winds up first
 				// (PRE_ATTACK) fires when its delay has run; the model shows the winding up, at the pace it takes.
@@ -1394,6 +1430,10 @@ void FGenObject::UpdateCombat(uint32 Frame)
 				if (Firing.PreAttackDoneFrame == 0 || Frame >= Firing.PreAttackDoneFrame)
 				{
 					FireWeapon(ActiveSlot, *Target, Frame);
+					if (AttackShotsLeft > 0 && --AttackShotsLeft == 0)
+					{
+						ClearAttack(); // (an attack of so many shots - an assisting Patriot's clip - is done)
+					}
 				}
 			}
 			else if (Frame < WI.ReadyFrame)
@@ -1455,7 +1495,7 @@ static TAutoConsoleVariable<int32> CVarGenMissileFlight(
 
 // ---- damage and death ---------------------------------------------------------------------------
 
-void FGenObject::AttemptDamage(float Amount, const FString& DamageType, const FString& DeathType, FGenObjectID Source, bool bInFlight)
+void FGenObject::AttemptDamage(float Amount, const FString& DamageType, const FString& DeathType, FGenObjectID Source, bool bInFlight, const TCHAR* DamageFXType)
 {
 	const bool bShotDown = bInFlight && Projectile.bActive && !bDead && !bPendingDestroy;
 	if ((!IsTargetable() && !bShotDown) || Logic->GetFrame() < InvulnerableUntilFrame)
@@ -1479,6 +1519,23 @@ void FGenObject::AttemptDamage(float Amount, const FString& DamageType, const FS
 			}
 		}
 	}
+	// UndeadBody::attemptDamage: the blow that would kill it the first time leaves it one point (before the armor
+	// has its say), and its second life starts.
+	bool bStartSecondLife = false;
+	if (Template->SecondLifeMaxHealth > 0.f && !bSecondLife && !DamageType.Equals(TEXT("UNRESISTABLE"), ESearchCase::IgnoreCase) && Amount >= Health
+		&& !DamageType.Equals(TEXT("STATUS"), ESearchCase::IgnoreCase) && !DamageType.StartsWith(TEXT("SUBDUAL"), ESearchCase::IgnoreCase)
+		&& !DamageType.Equals(TEXT("KILL_PILOT"), ESearchCase::IgnoreCase) && !DamageType.Equals(TEXT("KILL_GARRISONED"), ESearchCase::IgnoreCase)
+		&& !DamageType.Equals(TEXT("DISARM"), ESearchCase::IgnoreCase) && !DamageType.Equals(TEXT("DEPLOY"), ESearchCase::IgnoreCase)
+		&& !DamageType.Equals(TEXT("HEALING"), ESearchCase::IgnoreCase))
+	{
+		Amount = FMath::Max(0.f, FMath::Min(Amount, Health - 1.f));
+		bStartSecondLife = true;
+		if (Amount <= 0.f)
+		{
+			StartSecondLife(DeathType);
+			return;
+		}
+	}
 	if (Armor)
 	{
 		Amount = Armor->AdjustDamage(DamageType, Amount);
@@ -1498,6 +1555,17 @@ void FGenObject::AttemptDamage(float Amount, const FString& DamageType, const FS
 	if (Amount <= 0.f)
 	{
 		return;
+	}
+	// PoisonedBehavior::onDamage: "if( damageInfo->in.m_damageType == DAMAGE_POISON ) startPoisonedEffects".
+	if (Template->Poisoned.bValid && DamageType.Equals(TEXT("POISON"), ESearchCase::IgnoreCase))
+	{
+		StartPoison(Amount, DeathType);
+	}
+	// BaseRegenerateUpdate::onDamage: hurt, it mends itself only once it has been left alone for BaseRegenDelay.
+	if (Template->bBaseRegenerate && !DamageType.Equals(TEXT("HEALING"), ESearchCase::IgnoreCase))
+	{
+		const FGenGameData& RegenData = FGenGameData::Get();
+		BaseRegenFrame = RegenData.BaseRegenHealthPercentPerSecond > 0.f ? Logic->GetFrame() + uint32(RegenData.BaseRegenDelay) : MAX_uint32;
 	}
 	if (DamageType.Equals(TEXT("DISARM"), ESearchCase::IgnoreCase))
 	{
@@ -1534,7 +1602,7 @@ void FGenObject::AttemptDamage(float Amount, const FString& DamageType, const FS
 	Health = FMath::Max(bImmortal ? 1.f : 0.f, Health - Amount);
 	if (DamageFX)
 	{
-		DoDamageFX(DamageType, Amount, Source);
+		DoDamageFX(DamageFXType ? FString(DamageFXType) : DamageType, Amount, Source);
 	}
 	if (Template->Flammable.bValid && (DamageType.Equals(TEXT("FLAME"), ESearchCase::IgnoreCase) || DamageType.Equals(TEXT("PARTICLE_BEAM"), ESearchCase::IgnoreCase)))
 	{
@@ -1592,6 +1660,11 @@ void FGenObject::AttemptDamage(float Amount, const FString& DamageType, const FS
 		Die(DeathType, Source);
 		return;
 	}
+	if (bStartSecondLife)
+	{
+		StartSecondLife(DeathType);
+		return;
+	}
 
 	// Fight back when attacked while idle (parked aircraft and planes without orders don't).
 	const bool bNoRetaliation = bJetAI && (JetState != EGenJetState::None || !bJetAllowAirLoco || !Template->bAutoAcquireEnemiesWhenIdle);
@@ -1618,6 +1691,12 @@ void FGenObject::AttemptHealing(float Amount)
 	{
 		return;
 	}
+	if (PoisonStopFrame != 0)
+	{
+		// PoisonedBehavior::onHealing: being healed cures the poison.
+		PoisonDamageFrame = PoisonStopFrame = 0;
+		PoisonAmount = 0.f;
+	}
 	Health = FMath::Min(MaxHealth, Health + Amount);
 	if (MineState)
 	{
@@ -1632,6 +1711,242 @@ void FGenObject::AttemptHealing(float Amount)
 	SetModelCondition(GenConditions::Damaged(), !bReally && !bUnderConstruction && Ratio <= GD.UnitDamagedThreshold);
 }
 
+void FGenObject::StartSecondLife(const FString& DeathType)
+{
+	// UndeadBody::startSecondLife: a new body (SecondLifeMaxHealth, whole), the SECOND_LIFE armor, and one of its slow
+	// deaths begun - the Battle Bus's, which isn't a death this time (BattleBusSlowDeathBehavior::beginSlowDeath).
+	bSecondLife = true;
+	MaxHealth = Template->SecondLifeMaxHealth;
+	Health = MaxHealth;
+	RefreshArmorSet();
+	SetModelCondition(GenConditions::ReallyDamaged(), false);
+	SetModelCondition(GenConditions::Damaged(), false);
+	TArray<const FGenSlowDeath*> Candidates;
+	int32 TotalWeight = 0;
+	for (const FGenSlowDeath& D : Template->SlowDeaths)
+	{
+		if (DeathTypeApplies(D.DeathTypes, DeathType) && !StatusExemptApplies(*this, D.ExemptStatus) && StatusRequiredMet(*this, D.RequiredStatus))
+		{
+			Candidates.Add(&D);
+			TotalWeight += FMath::Max(1, D.ProbabilityModifier);
+		}
+	}
+	if (Candidates.Num() == 0)
+	{
+		return;
+	}
+	int32 Roll = Logic->GetRandom().RandRange(0, TotalWeight - 1);
+	const FGenSlowDeath* Chosen = Candidates[0];
+	for (const FGenSlowDeath* D : Candidates)
+	{
+		Roll -= FMath::Max(1, D->ProbabilityModifier);
+		if (Roll < 0) { Chosen = D; break; }
+	}
+	if (!Chosen->bBattleBus)
+	{
+		return;
+	}
+	const uint32 Frame = Logic->GetFrame();
+	BusDeath = Chosen;
+	BusState = 1;
+	BusGroundCheckFrame = Frame + 10; // GROUND_CHECK_DELAY: "to prevent hitting on the way up"
+	if (!Chosen->FXStartUndeath.IsEmpty()) { Logic->DoFXObj(Chosen->FXStartUndeath, *this); }
+	if (!Chosen->OCLStartUndeath.IsEmpty()) { Logic->DoOCL(Chosen->OCLStartUndeath, *this); }
+	ClearAttack();
+	CommandStop();
+	// PhysicsBehavior: no more speed along the ground, a shock straight up (applyShock: the force over its mass, once),
+	// and a tumble (applyRandomRotation).
+	Velocity = FVector3f::ZeroVector;
+	Accel = FVector3f::ZeroVector;
+	BusVelZ = Chosen->ThrowForce / FMath::Max(Mass, 0.01f);
+	FRandomStream& Rand = Logic->GetRandom();
+	BodyPitchRate = Rand.FRandRange(-0.03f, 0.03f);
+	BodyRollRate = Rand.FRandRange(-0.03f, 0.03f);
+	// OpenContain::processDamageToContained: everyone inside takes that share of their health.
+	if (Contain && Chosen->PercentDamageToPassengers > 0.f)
+	{
+		const TArray<FGenObjectID> Riders = Logic->GetRiders(*this);
+		for (FGenObjectID RiderId : Riders)
+		{
+			if (FGenObject* R = Logic->FindObject(RiderId))
+			{
+				R->AttemptDamage(R->GetMaxHealth() * Chosen->PercentDamageToPassengers, TEXT("UNRESISTABLE"), TEXT("NORMAL"), ID);
+			}
+		}
+	}
+	UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [bus f%u] #%u %s dies a first death: thrown up at %.2f a frame, %.0f health in its second life"),
+		Frame, ID, *Template->Name, BusVelZ, MaxHealth);
+}
+
+void FGenObject::UpdateBattleBus(uint32 Frame)
+{
+	// BattleBusSlowDeathBehavior::update
+	const FGenSlowDeath& D = *BusDeath;
+	if (BusState == 1)
+	{
+		Position.Z += BusVelZ;
+		BusVelZ += FGenGameData::Get().Gravity;
+		const float Ground = GetSurfaceHeight();
+		if (Position.Z <= Ground)
+		{
+			Position.Z = Ground;
+			BusVelZ = 0.f;
+		}
+		BodyPitch += BodyPitchRate;
+		BodyRoll += BodyRollRate;
+		if (Frame > BusGroundCheckFrame && Position.Z <= Ground + 0.5f)
+		{
+			// "!me->isAboveTerrain()": down - a bunker on the spot from now on (DISABLED_HELD), SECOND_LIFE to look at.
+			BusState = 2;
+			BodyPitch = BodyRoll = BodyPitchRate = BodyRollRate = 0.f;
+			if (!D.FXHitGround.IsEmpty()) { Logic->DoFXObj(D.FXHitGround, *this); }
+			if (!D.OCLHitGround.IsEmpty()) { Logic->DoOCL(D.OCLHitGround, *this); }
+			static const int32 SecondLifeBit = GenConditions::Index(TEXT("SECOND_LIFE"));
+			SetModelCondition(SecondLifeBit, true);
+			ClearAttack();
+			CommandStop();
+			Velocity = FVector3f::ZeroVector;
+			bImmobile = true;
+			BusNextHulkCheck = Frame;
+			UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [bus f%u] #%u %s is down: a hulk with %d inside"), Frame, ID, *Template->Name, Logic->GetRiders(*this).Num());
+		}
+		return;
+	}
+	// The hulk: left empty for EmptyHulkDestructionDelay, it kills itself ("Penalty damage", DEATH_EXTRA_4).
+	if (D.EmptyHulkDestructionDelay <= 0 || !Contain || Frame < BusNextHulkCheck)
+	{
+		return;
+	}
+	BusNextHulkCheck = Frame + 15; // EMPTY_HULK_CHECK_DELAY
+	const int32 Count = Logic->GetRiders(*this).Num();
+	if (BusPenaltyFrame != 0)
+	{
+		if (Count > 0)
+		{
+			BusPenaltyFrame = 0;
+		}
+		else if (Frame > BusPenaltyFrame)
+		{
+			Kill(TEXT("EXTRA_4"));
+		}
+	}
+	else if (Count == 0)
+	{
+		BusPenaltyFrame = Frame + uint32(D.EmptyHulkDestructionDelay);
+	}
+}
+
+void FGenObject::StartPoison(float Amount, const FString& DeathType)
+{
+	// PoisonedBehavior::startPoisonedEffects: every dose sets what the next ones do and starts the clock again.
+	const FGenThingTemplate::FPoisoned& P = Template->Poisoned;
+	const uint32 Now = Logic->GetFrame();
+	PoisonAmount = Amount;
+	PoisonStopFrame = Now + uint32(P.DurationFrames);
+	PoisonDamageFrame = PoisonDamageFrame != 0 ? FMath::Min(PoisonDamageFrame, Now + uint32(P.IntervalFrames)) : Now + uint32(P.IntervalFrames);
+	PoisonDeathType = DeathType;
+}
+
+void FGenObject::UpdatePoison(uint32 Frame)
+{
+	// PoisonedBehavior::update: "Not poison, as that will infect us again" - the dose is unresistable damage
+	// (the poison's own effects are shown), and the poisoning ends once nothing has topped it up for a while.
+	if (PoisonDamageFrame != 0 && Frame >= PoisonDamageFrame)
+	{
+		PoisonDamageFrame = Frame + uint32(Template->Poisoned.IntervalFrames);
+		static const FString Unresistable(TEXT("UNRESISTABLE"));
+		AttemptDamage(PoisonAmount, Unresistable, PoisonDeathType, GenInvalidObjectID, false, TEXT("POISON"));
+	}
+	if (PoisonStopFrame != 0 && Frame >= PoisonStopFrame && !bDead)
+	{
+		PoisonDamageFrame = PoisonStopFrame = 0;
+		PoisonAmount = 0.f;
+	}
+}
+
+void FGenObject::UpdateBaseRegenerate(uint32 Frame)
+{
+	// BaseRegenerateUpdate::update: a base building mends itself, a little every third frame, until whole.
+	const FGenGameData& GD = FGenGameData::Get();
+	if (GD.BaseRegenHealthPercentPerSecond <= 0.f || SellFrame != 0 || Health >= MaxHealth)
+	{
+		BaseRegenFrame = MAX_uint32; // "sleep till we get damaged again"
+		return;
+	}
+	constexpr int32 HealRate = 3;
+	AttemptHealing(float(HealRate) * MaxHealth * GD.BaseRegenHealthPercentPerSecond / float(GenLogic::GetLogicFPS()));
+	BaseRegenFrame = Frame + HealRate;
+}
+
+void FGenObject::UpdateHorde(uint32 Frame)
+{
+	// HordeUpdate::update: enough of its kind close by (Count, itself included, within Radius between bounding
+	// spheres) and it is a true member of a horde; fewer, but close to a true member, and it is in one too.
+	const FGenThingTemplate::FHorde& H = Template->Horde;
+	if (HordeNextFrame == 0)
+	{
+		// ("setWakeFrame(getObject(), UPDATE_SLEEP(GameLogicRandomValue(1, delay)))": not all at once.)
+		HordeNextFrame = Frame + uint32(Logic->GetRandom().RandRange(1, H.UpdateRate));
+		return;
+	}
+	HordeNextFrame = Frame + uint32(H.UpdateRate);
+	int32 Count = 0;
+	bool bRubOff = false;
+	const float MyRadius = Template->GetBoundingCircleRadius();
+	Logic->GetPartition().ForEachInRange(FVector2f(Position.X, Position.Y), H.Radius + MyRadius, [&](FGenObject& O)
+	{
+		// PartitionFilterHordeMember
+		if (&O == this || O.bDead || O.bPendingDestroy || O.IsContained() || !O.Template->Horde.bValid
+			|| (H.bExactMatch && O.Template != Template))
+		{
+			return;
+		}
+		for (const FString& K : H.KindOf)
+		{
+			if (!O.IsKindOf(*K))
+			{
+				return;
+			}
+		}
+		if (H.bAlliesOnly && Logic->GetRelationship(Owner, O.Owner) != EGenRelationship::Allies)
+		{
+			return;
+		}
+		if (FVector3f::Distance(Position, O.Position) - MyRadius - O.Template->GetBoundingCircleRadius() > H.Radius)
+		{
+			return;
+		}
+		++Count;
+		if (O.bTrueHordeMember && FVector2f::DistSquared(FVector2f(Position.X, Position.Y), FVector2f(O.Position.X, O.Position.Y)) <= FMath::Square(H.RubOffRadius))
+		{
+			bRubOff = true;
+		}
+	});
+	bTrueHordeMember = Count >= H.Count - 1;
+	const bool bWas = bInHorde;
+	bInHorde = bTrueHordeMember || bRubOff;
+	UE_CLOG(Logic->IsTracing() && bWas != bInHorde, LogGenerals, Log, TEXT("  [horde f%u] #%u p%d %s %s a horde (%d near)"), Frame, ID, Owner, *Template->Name,
+		bInHorde ? TEXT("joins") : TEXT("leaves"), Count);
+	EvaluateMoraleBonus();
+}
+
+void FGenObject::EvaluateMoraleBonus()
+{
+	// AIUpdateInterface::evaluateMoraleBonus: HORDE in a horde; NATIONALISM (and FANATICISM on top of it) with the
+	// player's upgrade - unless it is in a horde of a kind that isn't "AllowedNationalism".
+	static const FString HordeBonus(TEXT("HORDE")), NationalismBonus(TEXT("NATIONALISM")), FanaticismBonus(TEXT("FANATICISM"));
+	bool bNationalism = Logic->HasUpgradeComplete(Owner, TEXT("Upgrade_Nationalism"));
+	bool bFanaticism = Logic->HasUpgradeComplete(Owner, TEXT("Upgrade_Fanaticism"));
+	if (bInHorde && !Template->Horde.bAllowedNationalism)
+	{
+		bNationalism = bFanaticism = false;
+	}
+	auto Set = [this](const FString& Bonus, bool bOn) { if (bOn) { BonusConditions.AddUnique(Bonus); } else { BonusConditions.Remove(Bonus); } };
+	Set(HordeBonus, bInHorde);
+	Set(NationalismBonus, bNationalism);
+	Set(FanaticismBonus, bNationalism && bFanaticism);
+}
+
 void FGenObject::Die(const FString& DeathType, FGenObjectID Killer)
 {
 	if (bDead)
@@ -1640,6 +1955,19 @@ void FGenObject::Die(const FString& DeathType, FGenObjectID Killer)
 	}
 	const uint32 Frame = Logic->GetFrame();
 	bDead = true;
+	if (Template->AssaultTransport.bValid)
+	{
+		AssaultGiveFinalOrders(); // AssaultTransportAIUpdate::update: "isEffectivelyDead -> giveFinalOrders"
+	}
+	if (Template->RebuildHole.bValid)
+	{
+		// RebuildHoleBehavior::onDie: the worker goes with the hole.
+		if (FGenObject* Worker = Logic->FindObject(HoleWorker))
+		{
+			Worker->bPendingDestroy = true;
+		}
+		HoleWorker = GenInvalidObjectID;
+	}
 	if (Template->BattlePlan.bValid)
 	{
 		StopBattlePlan(); // BattlePlanUpdate::onDelete (the strategy center is destroyed as it dies)
@@ -1721,6 +2049,14 @@ void FGenObject::Die(const FString& DeathType, FGenObjectID Killer)
 	SetModelCondition(DyingIndex(), true);
 	Logic->OnObjectDied(*this);
 	Logic->OnObjectKilled(*this, Killer);
+	// Object::onDie: "objects that were spawned from something, need to tell their spawner that they have died"
+	if (FGenObject* Spawner = Logic->FindObject(Producer))
+	{
+		if (Spawner->Template->Spawner.bValid)
+		{
+			Spawner->OnSpawnDeath(ID, Killer);
+		}
+	}
 	if (Template->bTechBuilding)
 	{
 		// TechBuildingBehavior::onDie: "put us on the team of the neutral player so no player has any bonus from us"
@@ -1769,7 +2105,9 @@ void FGenObject::Die(const FString& DeathType, FGenObjectID Killer)
 		{
 			bActive = bActive && !HasUpgrade(U);
 		}
-		if (!bActive)
+		// "if (!d->m_dieMuxData.isDieApplicable(getObject(), damageInfo)) return;" - a combat cycle's bomb goes off
+		// only with the terrorist aboard, and only at the deaths it names.
+		if (!bActive || !DeathTypeApplies(DW.DeathTypes, DeathType) || StatusExemptApplies(*this, DW.ExemptStatus) || !StatusRequiredMet(*this, DW.RequiredStatus))
 		{
 			continue;
 		}
@@ -1823,8 +2161,14 @@ void FGenObject::Die(const FString& DeathType, FGenObjectID Killer)
 	for (const FGenDieModule& M : Template->DieModules)
 	{
 		// DieMuxData::isDieApplicable: "wrong death type? punt", "wrong vet level? punt", "wrong status? punt"
-		if (!DeathTypeApplies(M.DeathTypes, DeathType) || (M.VeterancyMask & (1 << VeterancyLevel)) == 0 || StatusExemptApplies(*this, M.ExemptStatus))
+		if (!DeathTypeApplies(M.DeathTypes, DeathType) || (M.VeterancyMask & (1 << VeterancyLevel)) == 0 || StatusExemptApplies(*this, M.ExemptStatus)
+			|| !StatusRequiredMet(*this, M.RequiredStatus))
 		{
+			continue;
+		}
+		if (M.Type == EGenDieModule::RebuildHoleExpose)
+		{
+			Logic->ExposeRebuildHole(*this, M);
 			continue;
 		}
 		if (M.Type == EGenDieModule::EjectPilot)
@@ -1893,7 +2237,7 @@ void FGenObject::Die(const FString& DeathType, FGenObjectID Killer)
 	int32 TotalWeight = 0;
 	for (const FGenSlowDeath& D : Template->SlowDeaths)
 	{
-		if (DeathTypeApplies(D.DeathTypes, DeathType) && !StatusExemptApplies(*this, D.ExemptStatus))
+		if (DeathTypeApplies(D.DeathTypes, DeathType) && !StatusExemptApplies(*this, D.ExemptStatus) && StatusRequiredMet(*this, D.RequiredStatus))
 		{
 			Candidates.Add(&D);
 			TotalWeight += FMath::Max(1, D.ProbabilityModifier);

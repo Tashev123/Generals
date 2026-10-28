@@ -302,11 +302,12 @@ void UGenGameLogic::ExecCheat(const FGenCommand& C)
 	}
 	else if (What.Equals(TEXT("damage"), ESearchCase::IgnoreCase) && Parts.Num() >= 3)
 	{
-		// Our first living object of that type keeps that percentage of its health.
+		// Our first living object of that type keeps that percentage of its health. ("damage,Type,Percent,Player": that player's.)
+		const int32 Whose = Parts.Num() >= 4 ? FCString::Atoi(*Parts[3]) : Local;
 		for (FGenObjectID Id : ObjectOrder)
 		{
 			FGenObject* O = Objects[Id].Get();
-			if (O->GetOwner() == Local && !O->IsDead() && O->GetTemplate()->Canonical()->Name.Equals(Arg, ESearchCase::IgnoreCase))
+			if (O->GetOwner() == Whose && !O->IsDead() && O->GetTemplate()->Canonical()->Name.Equals(Arg, ESearchCase::IgnoreCase))
 			{
 				const float Keep = O->GetMaxHealth() * FCString::Atof(*Parts[2]) / 100.f;
 				O->AttemptDamage(FMath::Max(0.f, O->GetHealth() - Keep), TEXT("UNRESISTABLE"), TEXT("NORMAL"), GenInvalidObjectID);

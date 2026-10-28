@@ -157,6 +157,58 @@ struct FGenContain
 	bool bPassengersFire = false;              // m_passengerAllowedToFire: the data's say, until a PassengersFireUpgrade
 	uint32 LastLoadSoundFrame = 0;             // OpenContain::doLoadSound / doUnloadSound: not more than one a frame
 	uint32 LastUnloadSoundFrame = 0;
+	bool bRiderSwap = false;                   // RiderChangeContain's m_containing: a new rider is pushing the old one off
+};
+
+/** RailroadBehavior's TrainTrack: the chain of waypoints a train runs on, shared by all its cars. */
+struct FGenTrainTrack
+{
+	struct FPoint
+	{
+		FVector3f Pos = FVector3f::ZeroVector;
+		float DistFromFirst = 0.f;
+		int32 Handle = -1;              // the waypoint the stretch from here starts at (TrackPoint::m_handle)
+		bool bTunnel = false;           // a waypoint named ...Tunnel: the train keeps its height (tunnels, bridges)
+		bool bStation = false;          // ...Station: it stops here a while
+		bool bDisembark = false;        // ...Disembark: it stops and lets its passengers out
+		bool bPingPong = false;         // ...PingPong: it stops and goes back the way it came
+	};
+	TArray<FPoint> Points;
+	float Length = 0.f;
+	bool bLooping = false;
+};
+
+/** RailroadBehavior: one car's part in a train (the locomotive's, or a car's that it pulls). */
+struct FGenTrain
+{
+	struct FPull
+	{
+		float Direction = 1.f;           // 1 forward, -1 backward
+		float Speed = 0.f;               // along the track, per 30 Hz frame (the data's)
+		float TrackDistance = 0.f;
+		FVector3f TowHitch = FVector3f::ZeroVector;
+		int32 MostRecentSpecial = -1;
+	};
+	enum class EConductor : uint8 { ApplyBrakes, WaitAtStation, Accelerate, Coast };
+	TSharedPtr<FGenTrainTrack> Track;
+	FPull Conductor;                     // conductorPullInfo: what pulls it (its own, the lead car's)
+	FPull Mine;                          // m_pullInfo: what it hands on to the car behind
+	EConductor State = EConductor::Coast;
+	FGenObjectID Trailer = GenInvalidObjectID;
+	bool bLocomotive = false;
+	bool bLead = false;
+	int32 WantsToBeLead = 0;
+	bool bTrackLoaded = false;
+	bool bWaitingInWings = true;         // not on the track yet (an open track: still behind its start)
+	bool bEndOfLine = false;             // run off its end
+	bool bInTunnel = false;
+	bool bDisembark = false;
+	bool bEverHitched = false;
+	bool bWall = false;                  // standing at a station: an obstacle to paths
+	bool bPlaced = false;
+	int32 WaitTimer = 0;
+	int32 CurrentPointHandle = -1;
+	uint32 WhistleFrame = 0;
 };
 
 /** SlavedUpdate: a drone's ties to its master. */
@@ -462,7 +514,8 @@ public:
 	/** A living, locomotor-driven unit on the ground: takes part in unit-vs-unit collision. */
 	bool IsGroundUnit() const
 	{
-		return CanMove() && !bFlies && !bDead && !bPendingDestroy && !Projectile.bActive && !bHeldByParachute && ContainedBy == GenInvalidObjectID;
+		return CanMove() && !bFlies && !bDead && !bPendingDestroy && !Projectile.bActive && !bHeldByParachute && ContainedBy == GenInvalidObjectID
+			&& !bNoCollide;
 	}
 	/** Moves through the air only (helicopters, planes): flies straight to its goal above everything. */
 	bool IsFlying() const { return bFlies; }
@@ -473,7 +526,7 @@ public:
 	uint32 GetBlockedFrames() const { return BlockedFrames; }
 
 	/** The drawable has to follow this object every frame (it moves, tumbles, flies or sinks). */
-	bool IsDynamic() const { return CanMove() || bDead || Projectile.bActive || bFreePhysics || ToppleState == EToppleState::Falling || TreeSinkFramesLeft > 0; }
+	bool IsDynamic() const { return CanMove() || bDead || Projectile.bActive || bFreePhysics || ToppleState == EToppleState::Falling || TreeSinkFramesLeft > 0 || Train.IsValid(); }
 	/** ToppleUpdate::applyTopplingForce: pushed over that way (a 2D direction) at that speed. */
 	void ApplyTopplingForce(const FVector2f& Direction, float Speed, uint32 Options);
 	/** ToppleUpdate::isAbleToBeToppled */
@@ -487,7 +540,15 @@ public:
 	/** Has an AI module and a locomotor: can receive move orders. */
 	bool CanMove() const { return Locomotor != nullptr && bHasAI && !bImmobile; }
 	bool IsMoving() const { return bMoving; }
+	/** AIUpdateInterface::getLocomotorDistanceToGoal: how far along its path it still has to go (0: not moving). */
+	float GetDistanceToGoal() const { return bMoving ? PathDistanceFrom(PathIndex) : 0.f; }
 	bool IsSelectable() const;
+	/** The template whose geometry its pathfinding footprint has (a GLA hole: its building's). */
+	const FGenThingTemplate* GetFootprintTemplate() const { return FootprintTemplate ? FootprintTemplate : Template; }
+	float GetDrawManualFrame() const { return DrawManualFrame; }
+	uint32 GetDrawManualFrameVersion() const { return DrawManualFrameVersion; }
+	/** RiderChangeContain: the STATUS_RIDERn of whoever rides it (empty: nobody, or not a combat cycle). */
+	const FString& GetRiderStatus() const { return RiderStatus; }
 
 	void CommandMoveTo(const FVector3f& Goal);
 	/** Halts the current move (also used internally; an order to stop is CommandIdle). */
@@ -544,7 +605,8 @@ public:
 	FGenObjectID GetTargetID() const { return TargetID; }
 	/** Body::attemptDamage: armor, health, damage state, death. */
 	/** bInFlight: a missile in the air may be hit too (a point defense laser shooting it down). */
-	void AttemptDamage(float Amount, const FString& DamageType, const FString& DeathType, FGenObjectID Source, bool bInFlight = false);
+	/** DamageFXType: what is shown for it instead of DamageType's effects (m_damageFXOverride - a dose of poison is unresistable damage). */
+	void AttemptDamage(float Amount, const FString& DamageType, const FString& DeathType, FGenObjectID Source, bool bInFlight = false, const TCHAR* DamageFXType = nullptr);
 	/** Body::attemptHealing: health back, up to the maximum; the damage state follows. */
 	void AttemptHealing(float Amount);
 	/** Turret angle relative to the body (radians) for turret slot 0/1, and previous frame value. */
@@ -724,7 +786,11 @@ public:
 	int32 GetVeterancyLevel() const { return VeterancyLevel; }
 	int32 GetExperience() const { return Experience; }
 	/** ExperienceTracker::addExperiencePoints */
-	void AddExperience(int32 Points);
+	void AddExperience(int32 Points, bool bCanScaleForBonus = true);
+	/** PoisonedBehavior: still taking poison damage. */
+	bool IsPoisoned() const { return PoisonStopFrame != 0; }
+	/** HordeUpdate: in a horde (its HORDE bonus). */
+	bool IsInHorde() const { return bInHorde; }
 	void SetVeterancyLevel(int32 NewLevel, bool bProvideFeedback = true);
 	void ClearAIMode() { AIMode = EGenAIMode::None; }
 	/** Frame this object last took damage, and from whom. */
@@ -763,6 +829,12 @@ public:
 	float GetVisionRange() const;
 	/** SpawnBehavior: the units it keeps (the stinger site's soldiers). */
 	const TArray<FGenObjectID>& GetSpawns() const { return Spawns; }
+	/** CleanupHazardUpdate::setCleanupAreaParameters: off to clean up round there until it is clean. */
+	void SetCleanupAreaParameters(const FVector3f& Pos, float Range);
+	/** The angry mob's nexus a member belongs to (MobMemberSlavedUpdate::getSlaverID). */
+	FGenObjectID GetMobSlaver() const { return MobSlaver; }
+	/** Object::getHealthBoxPosition's m_healthBoxOffset (the nexus: the middle of its mob). */
+	const FVector3f& GetHealthBoxOffset() const { return HealthBoxOffset; }
 	/** SpawnBehavior::getCanAnySlavesAttackSpecificTarget (SPAWNS_ARE_THE_WEAPONS: its soldiers do its fighting). */
 	bool SpawnsCanAttack(const FGenObject& Target) const;
 	/** Factor a weapon gains from this object's bonus conditions (WeaponBonus lines; 1 = none). */
@@ -879,6 +951,121 @@ private:
 	bool bLocoUpgraded = false;            // SET_NORMAL_UPGRADED replaces SET_NORMAL
 	bool bPowerPlantUpgraded = false;
 	FString CommandSetOverride;
+	FString RiderStatus;                   // RiderChangeContain: STATUS_RIDERn of the rider aboard
+	float XPScalar = 1.f;                  // ExperienceTracker's m_experienceScalar (ExperienceScalarUpgrade adds to it)
+	// PoisonedBehavior
+	uint32 PoisonDamageFrame = 0;          // the next dose
+	uint32 PoisonStopFrame = 0;            // poisoned until then (0: not)
+	float PoisonAmount = 0.f;              // what each dose does (what the poison did when it hit)
+	FString PoisonDeathType;
+	void StartPoison(float Amount, const FString& DeathType);
+	void UpdatePoison(uint32 Frame);
+	// BaseRegenerateUpdate
+	uint32 BaseRegenFrame = 0;             // when it next looks at its health (MAX_uint32: whole, asleep until hurt)
+	void UpdateBaseRegenerate(uint32 Frame);
+	// FireOCLAfterWeaponCooldownUpdate: per module, the run of shots under way
+	struct FCooldownOCLState
+	{
+		int32 Shots = 0;
+		uint32 StartFrame = 0;
+		bool bValid = false;
+	};
+	TArray<FCooldownOCLState> CooldownOCL;
+	void UpdateFireOCLAfterCooldown(uint32 Frame);
+	int32 AttackShotsLeft = -1;            // aiAttackObject's maxShotsToFire (an assisting Patriot's clip); < 0: no limit
+	uint32 HealScanFrame = 0;              // AutoFindHealingUpdate
+	void UpdateAutoFindHealing(uint32 Frame);
+	// ProjectileStreamUpdate and BoneFXUpdate (GenStreams.cpp)
+	struct FGenStream
+	{
+		static constexpr int32 Max = 20;   // MAX_PROJECTILE_STREAM
+		FGenObjectID Ids[Max] = {};        // a ring: the shots in flight, oldest first, holes where the aim changed
+		int32 NextFree = 0;
+		int32 FirstValid = 0;
+		FGenObjectID Owner = GenInvalidObjectID;
+		FGenObjectID TargetObject = GenInvalidObjectID;
+		FVector3f TargetPos = FVector3f::ZeroVector;
+	};
+	TUniquePtr<FGenStream> Stream;
+	FGenObjectID ProjectileStreams[3] = { GenInvalidObjectID, GenInvalidObjectID, GenInvalidObjectID }; // Weapon::m_projectileStreamID, per slot
+	void AddStreamProjectile(FGenObjectID Source, FGenObjectID Shot, FGenObjectID Victim, const FVector3f* VictimPos);
+	bool UpdateProjectileStream();
+	void UpdateBoneFX(uint32 Frame);
+	TArray<int32> BoneFXNext;              // the frame each of the template's BoneFX entries is due (-1: not)
+	TArray<FVector3f> BoneFXBones;         // ... and where on the model it is
+	TArray<uint32> BoneFXSystems;          // the particle systems it has started (killed when the damage state changes)
+	int32 BoneFXState = -1;                // the body damage state BoneFXNext was set up for
+	// CleanupHazardUpdate (GenCleanup.cpp)
+	void UpdateCleanupHazard(uint32 Frame);
+	void CleanupFireWhenReady(uint32 Frame);
+	FGenObject* CleanupScanClosestTarget();
+	FGenObjectID CleanupTarget = GenInvalidObjectID; // m_bestTargetID
+	int32 CleanupNextScanFrames = 0;
+	bool bCleanupInRange = false;
+	float CleanupMoveRange = 0.f;          // > 0: cleaning up an area round CleanupPos, not just what is in reach
+	FVector3f CleanupPos = FVector3f::ZeroVector;
+	// DeployStyleAIUpdate
+	enum class EDeploy : uint8 { ReadyToMove, Deploy, ReadyToAttack, Undeploy, AligningTurrets };
+	EDeploy DeployState = EDeploy::ReadyToMove;
+	uint32 DeployDoneFrame = 0;            // m_frameToWaitForDeploy
+	void UpdateDeploy(uint32 Frame);
+	void SetDeployState(EDeploy State, bool bReverse = false);
+	/** Packing, unpacking or lining its turret up for that: AI_BUSY, it neither moves nor fires. */
+	bool IsDeployBusy() const;
+	/** Its weapons may fire (a deploying unit only once it has unpacked). */
+	bool IsDeployedToFire() const;
+	// AssaultTransportAIUpdate
+	struct FAssaultMember
+	{
+		FGenObjectID ID = GenInvalidObjectID;
+		bool bNew = false;                 // came aboard during this assault: stays in
+		uint32 JoinFrame = 0;
+	};
+	TArray<FAssaultMember> AssaultMembers;
+	FGenObjectID AssaultTarget = GenInvalidObjectID; // m_designatedTarget: what the DEPLOY weapon was last fired at
+	FVector3f AssaultMoveGoal = FVector3f::ZeroVector;
+	bool bAssaultAttackMove = false;
+	bool bAssaultAttackObject = false;
+	bool bAssaultNewOccupantsAreNew = false;
+	uint32 LastPlayerOrderFrame = 0;       // (getLastCommandSource: when the player last told it anything)
+	void UpdateAssaultTransport(uint32 Frame);
+	void AssaultReset();
+	void AssaultRetrieveMembers();
+	void AssaultGiveFinalOrders();
+	// UndeadBody + BattleBusSlowDeathBehavior
+	bool bSecondLife = false;
+	uint8 BusState = 0;                    // 1: thrown into the air by its first death, 2: down again, a hulk
+	const FGenSlowDeath* BusDeath = nullptr;
+	uint32 BusGroundCheckFrame = 0;
+	uint32 BusPenaltyFrame = 0;
+	uint32 BusNextHulkCheck = 0;
+	float BusVelZ = 0.f;
+	void StartSecondLife(const FString& DeathType);
+	void UpdateBattleBus(uint32 Frame);
+	// RebuildHoleBehavior (on the hole) and RebuildHoleExposeDie (on the building)
+	FGenObjectID HoleWorker = GenInvalidObjectID;
+	FGenObjectID HoleReconstructing = GenInvalidObjectID;
+	int32 HoleWorkerWait = 0;
+	const FGenThingTemplate* HoleRebuildTemplate = nullptr;
+	const FGenThingTemplate* FootprintTemplate = nullptr; // a hole stands on its building's footprint (setGeometryInfo)
+	bool bMasked = false;                  // OBJECT_STATUS_MASKED: neither selected nor targeted (a hole whose building is going up again)
+	void UpdateRebuildHole(uint32 Frame);
+	void HoleNewWorkerProcess(FGenObject* ExistingWorker);
+	// manual animation frames (ManualDeployAnimations): the frame (at 30 a second) the logic puts the model's animation at
+	float DrawManualFrame = -1.f;
+	uint32 DrawManualFrameVersion = 0;
+	// HordeUpdate
+	bool bInHorde = false;
+	bool bTrueHordeMember = false;         // in the thick of one (not just rubbing off on one)
+	uint32 HordeNextFrame = 0;
+	void UpdateHorde(uint32 Frame);
+	/** AIUpdateInterface::evaluateMoraleBonus: the HORDE, NATIONALISM and FANATICISM weapon bonuses. */
+	void EvaluateMoraleBonus();
+	uint32 ScuttleFrame = 0;               // RiderChangeContain's m_scuttledOnFrame: its rider got off, it falls over
+	bool bUnselectable = false;            // OBJECT_STATUS_UNSELECTABLE (a scuttled combat cycle)
+	int32 SteerAnim = 0;                   // AnimationSteeringUpdate: the lean under way (a condition bit, 0: upright)
+	uint32 SteerAnimNextFrame = 0;
+	void UpdateAnimationSteering(uint32 Frame);
 	TArray<TPair<FString, bool>> SubObjectOverrides;
 	uint32 SubObjectVersion = 0;
 	bool bAutoHealActive = false;
@@ -1381,6 +1568,22 @@ private:
 	float RappelRate = 0.f;
 	float RappelDestZ = 0.f;
 	TUniquePtr<FGenContain> Contain;
+	TUniquePtr<FGenTrain> Train;          // RailroadBehavior (GenTrains.cpp)
+	void UpdateTrain(uint32 Frame);
+	void TrainLoadTrack();
+	void TrainCreateCarriages();
+	void TrainHitch(FGenObjectID Loco, int32 TemplateIndex, bool bByProximity);
+	FGenObject* TrainFindCarBehind() const;
+	void TrainGetPulled(FGenTrain::FPull& Info);
+	void TrainPlace(const FGenTrain::FPull& Puller, FGenTrain::FPull& Mine);
+	FVector3f TrainFindPos(float Dist, bool bSetState);
+	void TrainCollide(uint32 Frame);
+	void TrainOnCollide(FGenObject& Other);
+	void TrainSetWall(bool bOn);
+	void TrainDisembark();
+	void TrainImpactSound(const FGenObject& Victim);
+	/** RailroadBehavior::isRailroad: a car that is on the line and either leads the train or ends it. */
+	bool IsDangerousRailroad() const;
 	FGenObjectID ContainedBy = GenInvalidObjectID;
 	uint32 ContainedFrame = 0;
 	FGenObjectID EnterTarget = GenInvalidObjectID;
@@ -1470,8 +1673,32 @@ private:
 	void EndSpawns(bool bDestroy);
 	/** SpawnBehavior::getClosestSlave */
 	FGenObject* GetClosestSpawn(const FVector3f& Pos) const;
+	/** SpawnBehavior::onSpawnDeath: one of ours died (or went), to be replaced SpawnReplaceDelay later. With
+	 *  AggregateHealth the spawner goes with the last of them, the killer scoring it. */
+	void OnSpawnDeath(FGenObjectID Spawn, FGenObjectID Killer);
+	/** SpawnBehavior::computeAggregateStates (AggregateHealth: the angry mob's nexus): their health and veterancy
+	 *  are its own, its health bar over the middle of them. */
+	void ComputeAggregateStates();
+	/** The new spawn's place: by the barracks' door, budded from the one nearest us, or where we stand. */
+	void ExitSpawn(FGenObject& Spawn);
+	/** SpawnBehavior::maySpawnSelfTaskAI */
+	bool MaySpawnSelfTask(float MaxSelfTaskersRatio) const;
+	/** MobMemberSlavedUpdate::update: keep up with the nexus, take up its target. */
+	void UpdateMobMember(uint32 Frame);
 	TArray<FGenObjectID> Spawns;
 	TArray<uint32> SpawnReplaceFrames;     // m_replacementTimes: when the next ones may come
+	int32 SpawnTemplateIndex = 0;          // m_templateNameIterator: which of the names comes next
+	int32 SpawnInitialBurstLeft = 0;       // m_initialBurstCountdown: still to leave by the barracks' door
+	int32 SpawnCount = -1;                 // m_spawnCount (-1: NONE_SPAWNED_YET)
+	int32 SelfTaskingSpawns = 0;           // m_selfTaskingSpawnCount
+	FVector3f HealthBoxOffset = FVector3f::ZeroVector; // Object::m_healthBoxOffset: the mob's health bar over the mob
+	// MobMemberSlavedUpdate
+	FGenObjectID MobSlaver = GenInvalidObjectID;
+	FGenObjectID MobPrimaryVictim = GenInvalidObjectID; // the nexus's last target, remembered
+	int32 MobFramesToWait = 0;
+	int32 MobCatchUpCrisisTimer = 0;
+	bool bMobSelfTasking = false;
+	uint32 LastAICommandFrame = 0;         // getLastCommandSource is CMD_FROM_AI while this is no earlier than LastPlayerOrderFrame
 	TArray<FVector3f> SpawnPoints;         // the spawn point bones in the world (found once)
 	TArray<float> SpawnPointAngles;
 	TArray<FGenObjectID> SpawnPointUsers;  // m_spawnPointOccupier
@@ -1643,9 +1870,19 @@ private:
 	void MoveTreads(const FVector3f& Goal, float OnPathDistToGoal, float DesiredSpeed);
 	void MoveWheels(const FVector3f& Goal, float OnPathDistToGoal, float DesiredSpeed, uint32 Frame);
 	void MoveLegs(const FVector3f& Goal, float OnPathDistToGoal, float DesiredSpeed);
+	/** Locomotor::moveTowardsPositionClimb: up a cliff facing it, down it backwards. */
+	void MoveClimb(const FVector3f& Goal, float OnPathDistToGoal, float DesiredSpeed);
+	/** LocomotorSet::findLocomotor for the ground under the unit (Pathfinder::chooseBestLocomotorForPosition); null: none fits. */
+	const FGenLocomotorTemplate* FindLocomotorForPosition() const;
+	/** AIUpdateInterface::chooseGoodLocomotorFromCurrentSet: every frame, the set's locomotor for where the unit is. */
+	void ChooseGoodLocomotorFromCurrentSet();
+	/** Fills LocoSet / LocoSetSurfaces from a set's locomotor names. */
+	void SetLocomotorSet(const TArray<FString>& Names);
 	int32 RotateAroundLocoPivot(const FVector3f& Goal, float MaxTurnRate, float* OutRelAngle = nullptr);
 	float KeepTurningWay(float Amount) const;
 	void ApplyGoalSpeed(float GoalSpeed, float ActualSpeed, float MaxAccel, float BrakingFactor, bool bBackwards = false);
+	/** A push that keeps GoalSpeed along Dir whichever way the nose points (sliding into place), braking to stop at the goal. */
+	void ApplyGoalSpeedAlong(float GoalSpeed, const FVector2f& Dir, float OnPathDistToGoal);
 	float GetBraking() const;
 
 	// --- PhysicsBehavior ---
@@ -1682,6 +1919,7 @@ private:
 	float Health = 1.f;
 	float MaxHealth = 1.f;
 	bool bHasAI = false;
+	bool bNoCollide = false;           // KindOf NO_COLLIDE (the angry mob's nexus): no part in unit collisions
 	bool bImmobile = false;
 
 	FGenConditionBits ModelConditions;
@@ -1718,8 +1956,14 @@ private:
 
 	// Locomotor
 	const FGenLocomotorTemplate* Locomotor = nullptr;
+	/** LocomotorSet: every locomotor of the set in use (Burton's ground and cliff ones); Locomotor is the one for
+	 *  the ground under the unit. LocoSetSurfaces: all of their surfaces (getValidSurfaces), what paths are found on. */
+	TArray<const FGenLocomotorTemplate*, TInlineAllocator<2>> LocoSet;
+	uint32 LocoSetSurfaces = 0;
 	bool bLocoBraking = false;       // IS_BRAKING
-	bool bLocoBackwards = false;     // MOVING_BACKWARDS
+	bool bLocoBackwards = false;     // MOVING_BACKWARDS (a climber backing down a cliff, too)
+	bool bLocoClimbing = false;      // CLIMBING: on a cliff face, with the climbing animation
+	uint8 LastClimbState = 0;        // (what the [climb] trace said last)
 	bool bLocoThreePointTurn = false;
 	float BrakingFactor = 1.f;
 	uint32 DonutTimer = 0;

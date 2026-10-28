@@ -40,6 +40,8 @@ public:
 	float GetHeight() const { return Height; }
 	/** ... and the height the wheel has asked for, that it is easing towards. */
 	float GetTargetHeight() const { return TargetHeight; }
+	/** Settle on a given height (Generals units), clamped to the wheel's range. Test runs use it to look at something close. */
+	void SetHeight(float NewHeight) { Height = TargetHeight = FMath::Clamp(NewHeight, MinCameraHeight, MaxCameraHeight); }
 	UCameraComponent* GetCamera() const { return Camera; }
 
 	UPROPERTY(EditAnywhere, Category = "Generals")

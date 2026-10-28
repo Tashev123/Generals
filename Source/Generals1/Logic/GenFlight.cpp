@@ -79,7 +79,46 @@ void FGenObject::MoveOther(const FVector3f& GoalPos, float OnPathDistToGoal, flo
 	DesiredSpeed = FMath::Min(DesiredSpeed, Locomotor->Speed);
 	float GoalSpeed = DesiredSpeed;
 	const float ActualSpeed = GetForwardSpeed2D();
-	RotateAroundLocoPivot(GoalPos, Locomotor->TurnRate);
+	const FVector2f ToGoal(GoalPos.X - Position.X, GoalPos.Y - Position.Y);
+	const float GoalDist = ToGoal.Size();
+
+	// "if very close (ie, we could get there in 2 frames or less), and ULTRA_ACCURATE, just slide into place":
+	// no turning, the push goes straight at the goal.
+	if (bLocoUltraAccurate && GoalDist > 0.001f && FMath::Abs(ToGoal.X) <= GoalSpeed * Locomotor->SlideIntoPlaceFrames
+		&& FMath::Abs(ToGoal.Y) <= GoalSpeed * Locomotor->SlideIntoPlaceFrames)
+	{
+		Turning = 0;
+		ApplyGoalSpeedAlong(GoalSpeed, ToGoal / GoalDist, OnPathDistToGoal);
+		return;
+	}
+
+	// Beyond the original (the user's report of 2026-10-28: helicopters circling the spot they were sent to). The
+	// original pushes along the nose whatever the angle to the goal, so a goal inside the turning circle - a short
+	// move to one side or behind - is flown round for ever at the turning radius. A hovering craft holds its
+	// forward push back while the goal is well off its nose (it turns on the spot, as a helicopter does), and the
+	// last cell it slides into place without turning at all.
+	// (Only for what flies and may stop: a fire wall's flame creeps along the ground on a HOVER locomotor with a
+	// minimum speed, turning a degree a second - it has to keep going as it always did.)
+	if (Locomotor->Appearance == EGenLocoAppearance::Hover && !bLocoUltraAccurate && IsUsingAirLoco() && Locomotor->MinSpeed <= 0.f)
+	{
+		if (GoalDist <= GenLogic::PathfindCellSize && OnPathDistToGoal <= GenLogic::PathfindCellSize)
+		{
+			Turning = 0;
+			if (GoalDist > 0.001f)
+			{
+				ApplyGoalSpeedAlong(GoalSpeed, ToGoal / GoalDist, OnPathDistToGoal);
+			}
+			return;
+		}
+		float RelAngle = 0.f;
+		Turning = int8(RotateAroundLocoPivot(GoalPos, Locomotor->TurnRate, &RelAngle));
+		// Full speed within 15 degrees of the nose, none beyond 60.
+		GoalSpeed *= FMath::Clamp(1.f - (FMath::Abs(RelAngle) - PI / 12.f) / (PI / 4.f), 0.f, 1.f);
+	}
+	else
+	{
+		RotateAroundLocoPivot(GoalPos, Locomotor->TurnRate);
+	}
 
 	// calcSlowDownDist
 	const float Delta = ActualSpeed - Locomotor->MinSpeed;
@@ -89,6 +128,23 @@ void FGenObject::MoveOther(const FVector3f& GoalPos, float OnPathDistToGoal, flo
 		GoalSpeed = Locomotor->MinSpeed;
 	}
 	ApplyGoalSpeed(GoalSpeed, ActualSpeed, Locomotor->Acceleration, 1.f);
+}
+
+void FGenObject::ApplyGoalSpeedAlong(float GoalSpeed, const FVector2f& Dir, float OnPathDistToGoal)
+{
+	// moveTowardsPositionOther's "slide into place": the speed kept along Dir, the push no more than is needed. A
+	// craft that slides sideways also has what it still carries across the way taken off (lateral friction knows
+	// only the nose), and it comes to rest on the spot: no faster than it can still brake from.
+	const FVector2f Vel(Velocity.X, Velocity.Y);
+	const float Along = FVector2f::DotProduct(Vel, Dir);
+	const FVector2f Across = Vel - Dir * Along;
+	const float StopSpeed = FMath::Sqrt(2.f * GetBraking() * FMath::Max(OnPathDistToGoal, 0.f));
+	const float Want = FMath::Max(FMath::Min(GoalSpeed, StopSpeed), Locomotor->MinSpeed);
+	const float Push = FMath::Clamp(Want - Along, -GetBraking(), Locomotor->Acceleration);
+	const float AcrossSize = Across.Size();
+	const FVector2f AcrossFix = AcrossSize > 0.001f ? -Across / AcrossSize * FMath::Min(AcrossSize, GetBraking()) : FVector2f::ZeroVector;
+	const FVector2f A = Dir * Push + AcrossFix;
+	ApplyForce(FVector3f(A.X * Mass, A.Y * Mass, 0.f));
 }
 
 void FGenObject::HandleBehaviorZ(uint32 Frame)

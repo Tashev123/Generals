@@ -94,6 +94,13 @@ public:
 
 	/** PathfindCell::getPinched: open ground hard by a cliff or a structure - passable, at a price. */
 	bool IsPinched(int32 X, int32 Y) const;
+	/**
+	 * Pathfinder::validLocomotorSurfacesForCellType for the cell under a spot: which of a unit's locomotors may
+	 * move it there (chooseBestLocomotorForPosition). Beyond the original, the open ground at a cliff's foot and
+	 * edge that classifyMap counts as cliff ("Expand all cliff cells one step") also takes a ground locomotor:
+	 * a climber walks it rather than climbing flat ground.
+	 */
+	uint32 LocomotorSurfacesAt(const FVector2f& WorldPos, int32 Layer) const;
 	/** Pathfinder::clearCellForDiameter: how wide a body of units (in cells, PathDiameter at most) has room around that cell.
 	 *  CrushableLevel: that of a unit, for the ones parked in the way (< 0: no such unit). */
 	int32 ClearCellForDiameter(bool bCrusher, int32 X, int32 Y, int32 Layer, int32 PathDiameter, TFunctionRef<int32(FGenObjectID)> CrushableLevel) const;
@@ -207,6 +214,7 @@ private:
 	int32 Height = 0;
 	int32 Border = 0;
 	TArray<ECell> Terrain;     // static classification
+	TArray<float> CellZ;       // the ground's height at each cell's corner (what examineNeighboringCells compares on a cliff)
 	TArray<uint16> Obstacles;  // footprint reference counts
 	TArray<uint8> Fences;      // fences across the cell
 	/** Which object put a footprint cell there (-1: none). PathfindCellInfo's obstacle id. */

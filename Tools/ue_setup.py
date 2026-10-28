@@ -14,7 +14,8 @@ Creates under /Game/Generals:
   Maps/Skirmish                            empty level; the game mode builds everything
 
 Material parameters (set at runtime by UGenAssetSubsystem / UGenTerrainComponent):
-  BaseTexture, UseTexture, Tint (rgb * diffuse, a = opacity), Emissive, HouseColor, HouseColorMode
+  BaseTexture, UseTexture, Tint (rgb * diffuse, a = opacity), Emissive, HouseColor, HouseColorMode,
+  HouseColorShape (1 for an alpha-blended house-coloured quad: the house-colour mask is its shape)
   EnvTexture, UnderTint, UnderlayMode (opaque first pass under an alpha-blended texture, see W3D_SHADE_HLSL)
   IgnoreAlpha (an opaque section in the masked material), and per component, as custom primitive data:
   [0] StealthFade (0 solid .. 1 gone), [1] StealthGlow (0 .. 1: the look of a detected stealth unit),
@@ -57,13 +58,16 @@ return float2(u, 1.0 - v);
 # W3D shading, mirroring the original fixed-function pipeline plus Generals house color:
 #   HouseColorMode 1: mesh named HOUSECOLOR* -> diffuse multiplied by the player color
 #   HouseColorMode 2: ZHC* texture -> pixels with alpha < 1 get the player's hue/saturation
-#                     (W3DAssetManager remapAlphaTexture16Bit, DO_HUE_SHIFT), alpha forced opaque
+#                     (W3DAssetManager remapAlphaTexture16Bit, DO_HUE_SHIFT), alpha forced opaque,
+#                     unless HouseColorShape: for an alpha-blended house-coloured quad (a logo painted on
+#                     the ground) the mask is the shape and everything outside it is left transparent.
 W3D_SHADE_HLSL = r"""
 float3 c = (UseTexture > 0.5) ? Tex.rgb : float3(1, 1, 1);
 float a = (UseTexture > 0.5) ? Tex.a : 1.0;
 if (HouseColorMode > 1.5)
 {
-    if (a < 0.97)
+    float mask = 1.0 - a;   // the ZHC texture's alpha channel is the house-colour intensity
+    if (mask > 0.03)
     {
         float4 K = float4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
         float4 p = lerp(float4(c.bg, K.wz), float4(c.gb, K.xy), step(c.b, c.g));
@@ -81,7 +85,11 @@ if (HouseColorMode > 1.5)
         float3 pp = abs(frac(hsv.xxx + K2.xyz) * 6.0 - K2.www);
         c = hsv.z * lerp(K2.xxx, saturate(pp - K2.xxx), hsv.y);
     }
-    a = 1.0;
+    // The original forces a house-coloured texture opaque. A house-coloured quad drawn with alpha
+    // blending is the logo painted on the ground in front of a command center: there the mask is the
+    // shape itself (the base art that goes with it has exactly that shape as its alpha), so the painted
+    // part is drawn opaque and everything else leaves the ground showing through.
+    a = (HouseColorShape > 0.5) ? ((mask > 0.03) ? 1.0 : 0.0) : 1.0;
     c *= TintRGB;
 }
 else if (HouseColorMode > 0.5)
@@ -246,6 +254,7 @@ def build_w3d_material(name, lit, mpc=None):
     tint = vector_param(mat, "Tint", (1, 1, 1, 1), -900, 150)
     house = vector_param(mat, "HouseColor", (1, 1, 1, 1), -900, 350)
     house_mode = scalar_param(mat, "HouseColorMode", 0.0, -900, 550)
+    house_shape = scalar_param(mat, "HouseColorShape", 0.0, -900, 750)
     emissive = vector_param(mat, "Emissive", (0, 0, 0, 0), -900, 650)
     vcol = expr(mat, unreal.MaterialExpressionVertexColor, -900, 850)
     ignore_alpha = scalar_param(mat, "IgnoreAlpha", 0.0, -1300, 50)
@@ -294,7 +303,8 @@ def build_w3d_material(name, lit, mpc=None):
     custom.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT4)
     custom.set_editor_property("description", "W3DShade")
     inputs = []
-    for n in ("Tex", "UseTexture", "TintRGB", "TintA", "HouseColor", "HouseColorMode", "VColorRGB", "VColorA",
+    for n in ("Tex", "UseTexture", "TintRGB", "TintA", "HouseColor", "HouseColorMode", "HouseColorShape",
+              "VColorRGB", "VColorA",
               "Under", "UnderTint", "UnderlayMode", "IgnoreAlpha", "StealthFade", "StealthGlow"):
         ci = unreal.CustomInput()
         ci.set_editor_property("input_name", n)
@@ -309,6 +319,7 @@ def build_w3d_material(name, lit, mpc=None):
     MEL.connect_material_expressions(tint, "A", custom, "TintA")
     MEL.connect_material_expressions(house, "", custom, "HouseColor")
     MEL.connect_material_expressions(house_mode, "", custom, "HouseColorMode")
+    MEL.connect_material_expressions(house_shape, "", custom, "HouseColorShape")
     MEL.connect_material_expressions(vcol, "", custom, "VColorRGB")
     MEL.connect_material_expressions(vcol, "A", custom, "VColorA")
     MEL.connect_material_expressions(ignore_alpha, "", custom, "IgnoreAlpha")

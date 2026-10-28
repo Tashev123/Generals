@@ -23,6 +23,7 @@ FGenObject::FGenObject(FGenObjectID InID, const FGenThingTemplate* InTemplate, i
 	MaxHealth = Template->MaxHealth > 0.f ? Template->MaxHealth : 1.f;
 	Health = Template->InitialHealth > 0.f ? Template->InitialHealth : MaxHealth;
 	bHasAI = Template->bHasAI;
+	bNoCollide = Template->bKindNoCollide;
 	bImmobile = Template->IsKindOf(TEXT("IMMOBILE")) || Template->IsKindOf(TEXT("STRUCTURE"));
 	Mass = FMath::Max(0.01f, Template->Mass);
 	// The default frictions are per-frame values at 30 fps; rescale for the configured rate.
@@ -32,13 +33,19 @@ FGenObject::FGenObject(FGenObjectID InID, const FGenThingTemplate* InTemplate, i
 
 	if (const TArray<FString>* Set = Template->LocomotorSets.Find(TEXT("SET_NORMAL")))
 	{
-		for (const FString& Name : *Set)
+		// chooseGoodLocomotorFromCurrentSet for "a newly-created object": its ground locomotor (or the first there is).
+		SetLocomotorSet(*Set);
+		for (const FGenLocomotorTemplate* L : LocoSet)
 		{
-			if (const FGenLocomotorTemplate* L = FGenGameData::Get().FindLocomotor(Name))
+			if (L->Surfaces & GenSurface::Ground)
 			{
 				Locomotor = L;
 				break;
 			}
+		}
+		if (!Locomotor && LocoSet.Num() > 0)
+		{
+			Locomotor = LocoSet[0];
 		}
 	}
 	bFlies = Locomotor && Locomotor->IsAirOnly();
@@ -46,6 +53,15 @@ FGenObject::FGenObject(FGenObjectID InID, const FGenThingTemplate* InTemplate, i
 	bSpawnPending = !Template->SpawnTemplate.IsEmpty() && Template->SpawnNumber > 0;
 	bPoweredKind = Template->IsKindOf(TEXT("POWERED"));
 	ExitBurstLeft = Template->ProductionInitialBurst;
+	SpawnInitialBurstLeft = Template->Spawner.InitialBurst;
+	if (Template->bProjectileStream)
+	{
+		Stream = MakeUnique<FGenStream>();
+	}
+	if (Template->MobMember.bValid)
+	{
+		MobFramesToWait = Logic->GetRandom().RandRange(0, 20); // MobMemberSlavedUpdate's constructor
+	}
 	InitSupply();
 	InitContain();
 	bAllowBounce = Template->bAllowBouncing;
@@ -58,6 +74,17 @@ FGenObject::FGenObject(FGenObjectID InID, const FGenThingTemplate* InTemplate, i
 	}
 	InitCombat();
 	InitUpgrades();
+	if (Template->Railroad.bValid)
+	{
+		Train = MakeUnique<FGenTrain>();
+		Train->bLocomotive = Template->Railroad.bIsLocomotive;
+		Train->bLead = Train->bLocomotive; // "for now, I am the lead, only if I am the locomotive"
+		Train->State = Train->bLocomotive ? FGenTrain::EConductor::Accelerate : FGenTrain::EConductor::Coast;
+	}
+	if (Template->LockWeaponSlot != INDEX_NONE)
+	{
+		PermanentLockSlot = Template->LockWeaponSlot; // LockWeaponCreate::onBuildComplete: setWeaponLock( slot, LOCKED_PERMANENTLY )
+	}
 	// BattlePlanUpdate::onObjectCreated: "enableTurret( false )" - the gun only comes out with the bombardment plan.
 	bTurretsDisabled = Template->BattlePlan.bValid;
 	InitPayload();
@@ -112,7 +139,7 @@ bool FGenObject::IsSelectable() const
 	// (BuildAssistant::sellObject: a building being sold is OBJECT_STATUS_UNSELECTABLE from that moment.)
 	// (And a drone is nobody's to select: NO_SELECT, and OBJECT_STATUS_UNSELECTABLE once it has a master.)
 	// (A salvage crate is SELECTABLE only "so the mouse can interact with it": "being dead makes them not actually selectable".)
-	return !bDead && !bPendingDestroy && SellFrame == 0 && ContainedBy == GenInvalidObjectID && HijackedVehicle == GenInvalidObjectID && Template->IsKindOf(TEXT("SELECTABLE"))
+	return !bDead && !bPendingDestroy && SellFrame == 0 && !bUnselectable && !bMasked && ContainedBy == GenInvalidObjectID && HijackedVehicle == GenInvalidObjectID && Template->IsKindOf(TEXT("SELECTABLE"))
 		&& !Template->IsKindOf(TEXT("NO_SELECT")) && !Template->Crate.IsValid();
 }
 
@@ -371,6 +398,16 @@ void FGenObject::Update(uint32 Frame)
 	{
 		return;
 	}
+	if (Stream && UpdateProjectileStream())
+	{
+		bPendingDestroy = true;
+		Logic->ProjectileStreams.Remove(ID);
+		return;
+	}
+	if (Template->BoneFX.Num() > 0)
+	{
+		UpdateBoneFX(Frame); // (dead or flying too: a tower's rubble, a flame in the air)
+	}
 	if (Projectile.bActive)
 	{
 		UpdateProjectile(Frame);
@@ -591,6 +628,73 @@ void FGenObject::Update(uint32 Frame)
 	if (bAutoHealActive)
 	{
 		UpdateAutoHeal(Frame);
+	}
+	if (PoisonStopFrame != 0)
+	{
+		UpdatePoison(Frame);
+		if (bDead || bPendingDestroy)
+		{
+			return;
+		}
+	}
+	if (Template->bBaseRegenerate && Frame >= BaseRegenFrame)
+	{
+		UpdateBaseRegenerate(Frame);
+	}
+	if (Template->Horde.bValid && Frame >= HordeNextFrame)
+	{
+		UpdateHorde(Frame);
+	}
+	if (Train)
+	{
+		UpdateTrain(Frame);
+		if (bDead || bPendingDestroy)
+		{
+			return;
+		}
+	}
+	if (Template->FireOCLAfterCooldown.Num() > 0)
+	{
+		UpdateFireOCLAfterCooldown(Frame); // (before this frame's shots: "getLastShotFrame() == now - 1")
+	}
+	if (Template->AutoFindHealing.bValid)
+	{
+		UpdateAutoFindHealing(Frame);
+	}
+	if (Template->CleanupHazard.bValid)
+	{
+		UpdateCleanupHazard(Frame);
+	}
+	if (Template->bWanderAI && CanMove() && !bMoving && IsAIIdle())
+	{
+		// WanderAIUpdate::update: "if (isIdle())" - off a little way, always the same way round.
+		FRandomStream& Rand = Logic->GetRandom();
+		const float DX = float(Rand.RandRange(5, 50)), DY = float(Rand.RandRange(5, 50));
+		CommandMoveTo(FVector3f(Position.X + DX, Position.Y + DY, Position.Z));
+	}
+	if (BusState != 0)
+	{
+		UpdateBattleBus(Frame);
+		if (BusState == 1 || bDead || bPendingDestroy)
+		{
+			return; // in the air: nothing else of it works until it is down
+		}
+	}
+	if (Template->RebuildHole.bValid)
+	{
+		UpdateRebuildHole(Frame);
+		if (bPendingDestroy)
+		{
+			return;
+		}
+	}
+	if (Template->AssaultTransport.bValid)
+	{
+		UpdateAssaultTransport(Frame);
+	}
+	if (Template->Deploy.bValid)
+	{
+		UpdateDeploy(Frame);
 	}
 	if (bCountermeasuresActive)
 	{
@@ -817,11 +921,29 @@ void FGenObject::Update(uint32 Frame)
 		}
 		// A unit held up behind another one stops its move animation after a quarter second.
 		SetModelCondition(GenConditions::Moving(), bMoving && !bPackingUp && BlockedFrames <= uint32(GenLogic::GetLogicFPS() / 4)
-			&& !(Path.Num() == 0 && IsWaitingForPath()));
+			&& !(Path.Num() == 0 && IsWaitingForPath()) && !IsDeployBusy());
+		if (Template->AnimationSteeringFrames >= 0)
+		{
+			UpdateAnimationSteering(Frame);
+		}
+		if (LocoSet.Num() > 1)
+		{
+			// AIInternalMoveToState::update: on a cliff, CLIMBING - or RAPPELLING while backing down it ("to make col.
+			// burton's monkey ass not slide down the cliffs backwards"). Both stay when it stops on the face.
+			static const int32 ClimbingBit = GenConditions::Index(TEXT("CLIMBING"));
+			static const int32 RappellingBit = GenConditions::Index(TEXT("RAPPELLING"));
+			const bool bOnFace = bLocoClimbing && Locomotor->Appearance == EGenLocoAppearance::Climber;
+			SetModelCondition(ClimbingBit, bOnFace && !bLocoBackwards);
+			SetModelCondition(RappellingBit, bOnFace && bLocoBackwards);
+		}
 	}
 	else if (bFreePhysics)
 	{
 		UpdateFreePhysics(Frame);
+	}
+	if (Template->MobMember.bValid && !bDead && !bPendingDestroy)
+	{
+		UpdateMobMember(Frame); // (MobMemberSlavedUpdate comes after the AI and its weapons)
 	}
 }
 
@@ -859,6 +981,16 @@ void FGenObject::UpdateAI(uint32 Frame)
 	bBlockedAndStuck = false;
 
 	SteerBlocker = GenInvalidObjectID;
+	if (IsDeployBusy())
+	{
+		// DeployStyleAIUpdate: "setTemporaryState( AI_BUSY )" and "setLocomotorGoalNone" - the move waits, it isn't given up.
+		Velocity.X = Velocity.Y = 0.f;
+		return;
+	}
+	if (LocoSet.Num() > 1 && !bFlies)
+	{
+		ChooseGoodLocomotorFromCurrentSet(); // doLocomotor
+	}
 	if (!bMoving || Path.Num() == 0)
 	{
 		SteerSide = 0;
@@ -1107,6 +1239,7 @@ void FGenObject::LocoMoveTowardsPosition(const FVector3f& GoalPos, float OnPathD
 		switch (Locomotor->Appearance)
 		{
 		case EGenLocoAppearance::TwoLegs: MoveLegs(GoalPos, OnPathDistToGoal, DesiredSpeed); break;
+		case EGenLocoAppearance::Climber: MoveClimb(GoalPos, OnPathDistToGoal, DesiredSpeed); break;
 		case EGenLocoAppearance::FourWheels:
 		case EGenLocoAppearance::Motorcycle: MoveWheels(GoalPos, OnPathDistToGoal, DesiredSpeed, Frame); break;
 		case EGenLocoAppearance::Treads: MoveTreads(GoalPos, OnPathDistToGoal, DesiredSpeed); break;
@@ -1389,6 +1522,120 @@ void FGenObject::MoveLegs(const FVector3f& GoalPos, float OnPathDistToGoal, floa
 	ApplyGoalSpeed(GoalSpeed, ActualSpeed, Locomotor->Acceleration, 1.f);
 }
 
+void FGenObject::UpdateAnimationSteering(uint32 Frame)
+{
+	// AnimationSteeringUpdate::update: a combat cycle leans into a turn (CENTER_TO_LEFT / RIGHT), and back up
+	// once the turn is over (LEFT / RIGHT_TO_CENTER), each stage held for at least MinTransitionTime.
+	static const int32 CenterToLeft = GenConditions::Index(TEXT("CENTER_TO_LEFT"));
+	static const int32 LeftToCenter = GenConditions::Index(TEXT("LEFT_TO_CENTER"));
+	static const int32 CenterToRight = GenConditions::Index(TEXT("CENTER_TO_RIGHT"));
+	static const int32 RightToCenter = GenConditions::Index(TEXT("RIGHT_TO_CENTER"));
+	if (Frame < SteerAnimNextFrame)
+	{
+		return;
+	}
+	const int32 Turn = bMoving ? Turning : TurnNone; // (standing, it isn't turning)
+	const uint32 Hold = uint32(Template->AnimationSteeringFrames);
+	if (SteerAnim == 0)
+	{
+		if (Turn == TurnNegative || Turn == TurnPositive)
+		{
+			SteerAnim = Turn == TurnNegative ? CenterToRight : CenterToLeft; // "Initiate a right turn" / left
+			SetModelCondition(SteerAnim, true);
+			SteerAnimNextFrame = Frame + Hold;
+		}
+	}
+	else if (SteerAnim == CenterToRight || SteerAnim == CenterToLeft)
+	{
+		if (Turn != (SteerAnim == CenterToRight ? TurnNegative : TurnPositive))
+		{
+			// "Recenter!"
+			SetModelCondition(SteerAnim, false);
+			SteerAnim = SteerAnim == CenterToRight ? RightToCenter : LeftToCenter;
+			SetModelCondition(SteerAnim, true);
+			SteerAnimNextFrame = Frame + Hold;
+		}
+	}
+	else if (Turn == TurnNone)
+	{
+		// "Finish the turn"
+		SetModelCondition(LeftToCenter, false);
+		SetModelCondition(RightToCenter, false);
+		SteerAnim = 0;
+		SteerAnimNextFrame = Frame;
+	}
+}
+
+void FGenObject::MoveClimb(const FVector3f& GoalPos, float OnPathDistToGoal, float DesiredSpeed)
+{
+	// Locomotor::moveTowardsPositionClimb: legs that go up a cliff facing it and back down it, slowed by how steep
+	// the face is. What differs from the original (the user asked for it to be better than it was there):
+	//  - It reads the ground over three units ahead, not one, and climbs only where the face is steep, with some
+	//    give either way (climbing from 0.6 - about 31 degrees - walking again under 0.35): the original climbed
+	//    whenever its waypoint was more than a cell above or below, flat or not, and turned to back down at any
+	//    dip a tenth of a unit deep, so it flipped round and round on uneven ground.
+	//  - Its pace on the face is a steady quarter of its speed upwards or downwards whatever the slope; the
+	//    original's was full speed up to 45 degrees and then a quarter of it at once.
+	DesiredSpeed = FMath::Min(DesiredSpeed, Locomotor->Speed);
+	FVector2f Dir(GoalPos.X - Position.X, GoalPos.Y - Position.Y);
+	const float Dist = Dir.Size();
+	Dir = Dist > 0.001f ? Dir / Dist : GetDirection2D();
+	constexpr float Probe = 3.f;
+	const float Here = Logic->GetGroundHeight(Position.X, Position.Y);
+	const float Ahead = Logic->GetGroundHeight(Position.X + Dir.X * Probe, Position.Y + Dir.Y * Probe);
+	const float Slope = (Ahead - Here) / Probe; // rising towards the goal: > 0
+	const float Steep = FMath::Abs(Slope);
+	if (Steep > 0.6f)
+	{
+		bLocoClimbing = true;
+	}
+	else if (Steep < 0.35f)
+	{
+		bLocoClimbing = false;
+	}
+	if (!bLocoClimbing || Slope > -0.35f)
+	{
+		bLocoBackwards = false;
+	}
+	else if (Slope < -0.6f)
+	{
+		bLocoBackwards = true; // "human climber - backs down cliffs"
+	}
+	if (bLocoClimbing && Steep > 0.25f)
+	{
+		DesiredSpeed = FMath::Min(DesiredSpeed, Locomotor->Speed / (4.f * Steep));
+	}
+	const uint8 ClimbState = uint8(bLocoClimbing) | (uint8(bLocoBackwards) << 1);
+	UE_CLOG(Logic->IsTracing() && ClimbState != LastClimbState, LogGenerals, Log, TEXT("  [climb f%u] #%u %s %s at (%.0f, %.0f), slope %.2f"), Logic->GetFrame(), ID,
+		*Template->Name, bLocoBackwards ? TEXT("backs down") : (bLocoClimbing ? TEXT("climbs") : TEXT("walks")), Position.X, Position.Y, Slope);
+	LastClimbState = ClimbState;
+
+	// Orient toward goal position (away from it, backing down).
+	float DesiredAngle = FMath::Atan2(Dir.Y, Dir.X);
+	if (bLocoBackwards)
+	{
+		DesiredAngle = GenLogic::AngleDiff(DesiredAngle, PI);
+	}
+	const float RelAngle = GenLogic::AngleDiff(DesiredAngle, Orientation);
+	SetOrientation(Orientation + FMath::Clamp(RelAngle, -Locomotor->TurnRate, Locomotor->TurnRate)); // locoUpdate_moveTowardsAngle
+
+	// "The more we have to turn, the slower we go"
+	const float AngleCoeff = FMath::Min(FMath::Abs(RelAngle) / (PI / 4.f), 1.f);
+	float GoalSpeed = (1.f - AngleCoeff) * DesiredSpeed;
+	float ActualSpeed = GetForwardSpeed2D();
+	if (bLocoBackwards)
+	{
+		ActualSpeed = -ActualSpeed;
+	}
+	const float Delta = ActualSpeed - Locomotor->MinSpeed;
+	const float SlowDownDist = Delta > 0.f ? (Sqr(Delta) / GetBraking()) * 0.5f * 1.05f : 0.f; // calcSlowDownDist
+	if (OnPathDistToGoal < SlowDownDist)
+	{
+		GoalSpeed = Locomotor->MinSpeed;
+	}
+	ApplyGoalSpeed(GoalSpeed, ActualSpeed, Locomotor->Acceleration, 1.f, bLocoBackwards);
+}
+
 // ---- PhysicsBehavior ----------------------------------------------------------------------------
 
 void FGenObject::ApplyMotiveForce(const FVector3f& Force, uint32 Frame)
@@ -1445,7 +1692,58 @@ uint32 FGenObject::GetFlashNow() const
 
 uint32 FGenObject::GetPathSurfaces() const
 {
-	return (Locomotor ? Locomotor->Surfaces : uint32(GenSurface::Ground)) | (Template->CrusherLevel > 0 ? uint32(GenSurface::Fence) : 0u);
+	// (LocomotorSet::getValidSurfaces: a climber's paths go up cliffs, whichever locomotor it is on right now.)
+	const uint32 Surfaces = LocoSet.Num() > 1 ? LocoSetSurfaces : (Locomotor ? Locomotor->Surfaces : uint32(GenSurface::Ground));
+	return Surfaces | (Template->CrusherLevel > 0 ? uint32(GenSurface::Fence) : 0u);
+}
+
+void FGenObject::SetLocomotorSet(const TArray<FString>& Names)
+{
+	LocoSet.Reset();
+	LocoSetSurfaces = 0;
+	for (const FString& Name : Names)
+	{
+		if (const FGenLocomotorTemplate* L = FGenGameData::Get().FindLocomotor(Name))
+		{
+			LocoSet.Add(L);
+			LocoSetSurfaces |= L->Surfaces;
+		}
+	}
+}
+
+const FGenLocomotorTemplate* FGenObject::FindLocomotorForPosition() const
+{
+	// LocomotorSet::findLocomotor: the first of the set that may move on what the ground there is.
+	const uint32 Acceptable = Logic->GetPathfinder().LocomotorSurfacesAt(FVector2f(Position.X, Position.Y), Layer);
+	for (const FGenLocomotorTemplate* L : LocoSet)
+	{
+		if (L->Surfaces & Acceptable)
+		{
+			return L;
+		}
+	}
+	return nullptr;
+}
+
+void FGenObject::ChooseGoodLocomotorFromCurrentSet()
+{
+	// "due to physics, we might slide into a cell for which we have no loco (eg, cliff) and get stuck... as a
+	// solution" the one in use is kept when none fits.
+	const FGenLocomotorTemplate* New = FindLocomotorForPosition();
+	if (!New || New == Locomotor)
+	{
+		return;
+	}
+	Locomotor = New;
+	// "turn off precision-z-pos anytime the loco changes ... ditto for ultra-accuracy." (Each of the original's
+	// locomotors has flags of its own: the one taken over starts with nothing of the other's.)
+	bLocoPreciseZ = false;
+	bLocoUltraAccurate = false;
+	bLocoBackwards = false;
+	if (Locomotor->Appearance != EGenLocoAppearance::Climber)
+	{
+		bLocoClimbing = false;
+	}
 }
 
 float FGenObject::GetSurfaceHeight() const

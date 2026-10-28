@@ -241,6 +241,50 @@ void FGenObject::UpdateProduction(uint32 Frame)
 	}
 }
 
+void UGenGameLogic::GetFactoryExit(const FGenObject& Factory, FVector3f& OutCreate, FVector3f& OutRally)
+{
+	const FGenThingTemplate* FT = Factory.GetTemplate();
+	const FTransform3f Xf = Factory.GetTransform();
+	OutCreate = Factory.GetPosition();
+	OutRally = Factory.GetPosition();
+	if (FT->bHasExit)
+	{
+		OutCreate = Xf.TransformPositionNoScale(FT->UnitCreatePoint);
+		// A little beyond the door, so the next unit has room to come out.
+		const FVector3f Out = FT->NaturalRallyPoint + FT->NaturalRallyPoint.GetSafeNormal() * (2.f * GenLogic::PathfindCellSize);
+		OutRally = Xf.TransformPositionNoScale(Out);
+	}
+	else
+	{
+		const float R = FT->GetBoundingCircleRadius();
+		OutCreate = OutRally = FindPositionAround(Factory.GetPosition(), R + 10.f, R + 60.f, GenSurface::Ground);
+	}
+	OutCreate.Z = GetGroundHeight(OutCreate.X, OutCreate.Y);
+}
+
+void UGenGameLogic::FollowExitPath(const FGenObject& Factory, FGenObject& U, const FVector3f& Rally)
+{
+	if (Factory.GetTemplate()->bHasExit && !U.IsFlying() && U.CanMove())
+	{
+		// aiFollowExitProductionPath: straight out of the door along the exit path, the factory it was made
+		// in no obstacle on the way (no path is looked for: one from inside the building went round
+		// whichever side came first).
+		U.StartDirectMove(FVector3f(Rally.X, Rally.Y, GetGroundHeight(Rally.X, Rally.Y)));
+		U.IgnoreObstacle = Factory.GetID();
+	}
+	else
+	{
+		U.CommandMoveTo(FVector3f(Rally.X, Rally.Y, GetGroundHeight(Rally.X, Rally.Y)));
+	}
+	// aiFollowExitProductionPath: out by the door first, then on to the building's rally point
+	// (only what moves on the ground; the move there ends on the nearest free spot).
+	if (Factory.HasRallyPoint() && !U.IsFlying())
+	{
+		U.bHasExitRally = true;
+		U.ExitRally = Factory.GetRallyPoint();
+	}
+}
+
 FVector3f FGenObject::GetNaturalRallyPoint(bool bOffset) const
 {
 	// DefaultProductionExitUpdate::getNaturalRallyPoint (a building without an exit: where it stands)
@@ -548,12 +592,89 @@ bool UGenGameLogic::CanMake(int32 Player, const FGenThingTemplate& Template, FSt
 			return false;
 		}
 	}
+	// The limit a type has on how many a player may have: the special agents say one each, so a second
+	// Colonel Burton, Jarmen Kell or Black Lotus is refused - the data's "MaxSimultaneousOfType = 1".
+	// What is still in a factory's queue counts against it, and so does a captured one: the count is over
+	// everything the player owns, not per factory, so taking a base does not grant another agent.
+	if (Template.MaxSimultaneousOfType > 0)
+	{
+		const int32 Have = CountOwnedOrQueued(Player, Template);
+		if (Have >= Template.MaxSimultaneousOfType)
+		{
+			if (OutWhy)
+			{
+				*OutWhy = Template.MaxSimultaneousOfType == 1 ? TEXT("You already have one of these")
+					: FString::Printf(TEXT("You already have %d of these, the most"), Have);
+			}
+			return false;
+		}
+	}
 	if (bCheckMoney && GetMoney(Player) < CalcCostToBuild(Player, Template))
 	{
 		if (OutWhy) { *OutWhy = TEXT("Not enough money"); }
 		return false;
 	}
 	return true;
+}
+
+int32 UGenGameLogic::CountOwnedOrQueued(int32 Player, const FGenThingTemplate& Template) const
+{
+	int32 Count = 0;
+	for (int32 P = 0; P < Players.Num(); ++P)
+	{
+		// Player::iterateObjects goes through the players of the player's team, so allies share the count.
+		if (GetRelationship(Player, P) != EGenRelationship::Allies)
+		{
+			continue;
+		}
+		for (const FGenObject* O : GetObjectsOf(P))
+		{
+			if (O->IsDead())
+			{
+				continue; // "Don't care about dead objects" - one still being built does count
+			}
+			const FGenThingTemplate* T = O->GetTemplate();
+			if (T->Canonical() == Template.Canonical())
+			{
+				++Count;
+				continue;
+			}
+			if (!Template.MaxSimultaneousLinkKey.IsEmpty()
+				&& T->MaxSimultaneousLinkKey.Equals(Template.MaxSimultaneousLinkKey, ESearchCase::IgnoreCase))
+			{
+				++Count; // templates that share a link key are one type for this number
+			}
+		}
+	}
+	// A unit that is paid for and still inside a factory counts, so two heroes cannot be queued; structures
+	// are not counted from the queue, because a building cannot leave a factory and the one standing already
+	// does (the assumption countExisting makes).
+	if (!Template.IsKindOf(TEXT("STRUCTURE")))
+	{
+		for (int32 P = 0; P < Players.Num(); ++P)
+		{
+			if (GetRelationship(Player, P) != EGenRelationship::Allies)
+			{
+				continue;
+			}
+			for (const FGenObject* F : GetObjectsOf(P))
+			{
+				if (F->IsDead() || !F->GetTemplate()->bHasProduction)
+				{
+					continue;
+				}
+				for (const FGenObject::FProduction& Q : F->GetProductionQueue())
+				{
+					// The original compares the entry's template pointer, not its type.
+					if (Q.Unit == &Template)
+					{
+						++Count;
+					}
+				}
+			}
+		}
+	}
+	return Count;
 }
 
 bool UGenGameLogic::IsLocationLegalToBuild(const FGenThingTemplate& Template, const FVector3f& Pos, float Angle, const TCHAR** OutWhy) const
@@ -821,14 +942,17 @@ void UGenGameLogic::ExecConstruct(const FGenCommand& C)
 	ConstructBuilding(D, *T, C.Pos, C.F, D->GetOwner());
 }
 
-FGenObject* UGenGameLogic::ConstructBuilding(FGenObject* Dozer, const FGenThingTemplate& Template, const FVector3f& Pos, float Angle, int32 Player)
+FGenObject* UGenGameLogic::ConstructBuilding(FGenObject* Dozer, const FGenThingTemplate& Template, const FVector3f& Pos, float Angle, int32 Player, bool bRebuild)
 {
 	// BuildAssistant::buildObjectNow
 	if (!Players.IsValidIndex(Player))
 	{
 		return nullptr;
 	}
-	Withdraw(Player, CalcCostToBuild(Player, Template));
+	if (!bRebuild)
+	{
+		Withdraw(Player, CalcCostToBuild(Player, Template)); // (a GLA hole builds its building again for nothing)
+	}
 
 	// Shrubs, rocks and other lifeless props under the footprint are cleared away.
 	const float C = FMath::Cos(Angle), S = FMath::Sin(Angle);
@@ -895,6 +1019,51 @@ FGenObject* UGenGameLogic::ConstructBuilding(FGenObject* Dozer, const FGenThingT
 		ResumeConstruction(*Dozer, *B);
 	}
 	return B;
+}
+
+void UGenGameLogic::ExposeRebuildHole(FGenObject& Building, const FGenDieModule& M)
+{
+	// RebuildHoleExposeDie::onDie: a player who is still in the game, a building that was finished.
+	const FGenThingTemplate* HoleT = FGenGameData::Get().FindTemplate(M.HoleName);
+	const int32 Player = Building.GetOwner();
+	if (!HoleT || !Players.IsValidIndex(Player) || Player == GetNeutralPlayer() || Players[Player].bDefeated || Building.IsUnderConstruction())
+	{
+		return;
+	}
+	FGenObject* Hole = CreateObject(HoleT, Player, Building.GetPosition(), Building.GetOrientation());
+	if (!Hole)
+	{
+		return;
+	}
+	// "hole->setGeometryInfo( us->getGeometryInfo() )": it keeps the building's ground.
+	if (ObstacleOwners.Contains(Hole->GetID()))
+	{
+		Pathfinder.RemoveObstacle(*Hole);
+		Hole->FootprintTemplate = Building.GetTemplate();
+		Pathfinder.AddObstacle(*Hole);
+	}
+	else
+	{
+		Hole->FootprintTemplate = Building.GetTemplate();
+	}
+	Hole->MaxHealth = M.HoleMaxHealth > 0.f ? M.HoleMaxHealth : Hole->MaxHealth;
+	Hole->Health = FMath::Min(Hole->Health, Hole->MaxHealth);
+	// RebuildHoleBehavior::startRebuildProcess
+	Hole->HoleRebuildTemplate = Building.GetTemplate();
+	Hole->HoleNewWorkerProcess(nullptr);
+	if (M.bTransferAttackers)
+	{
+		for (FGenObjectID Id : ObjectOrder)
+		{
+			FGenObject* O = Objects[Id].Get();
+			if (O->TargetID == Building.GetID())
+			{
+				O->TargetID = Hole->GetID(); // AIUpdateInterface::transferAttack
+			}
+		}
+	}
+	UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [hole f%u] #%u %s leaves #%u %s (%.0f health); a %s comes in %d frames"), Frame, Building.GetID(),
+		*Building.GetTemplate()->Name, Hole->GetID(), *HoleT->Name, Hole->MaxHealth, *HoleT->RebuildHole.WorkerName, Hole->HoleWorkerWait);
 }
 
 void UGenGameLogic::ResumeConstruction(FGenObject& Dozer, FGenObject& Building)
@@ -1308,24 +1477,11 @@ void UGenGameLogic::SpawnProducedUnit(const FGenObject& Factory, const FGenThing
 	// DefaultProductionExitUpdate::exitObjectViaDoor: appear at the create point inside the building,
 	// facing the way the building faces, and drive out to the natural rally point.
 	const FGenThingTemplate* FT = Factory.GetTemplate();
-	const FTransform3f Xf = Factory.GetTransform();
-	FVector3f Create = Factory.GetPosition();
-	FVector3f Rally = Factory.GetPosition();
-	if (FT->bHasExit)
-	{
-		Create = Xf.TransformPositionNoScale(FT->UnitCreatePoint);
-		// A little beyond the door, so the next unit has room to come out.
-		const FVector3f Out = FT->NaturalRallyPoint + FT->NaturalRallyPoint.GetSafeNormal() * (2.f * GenLogic::PathfindCellSize);
-		Rally = Xf.TransformPositionNoScale(Out);
-	}
-	else
-	{
-		const float R = FT->GetBoundingCircleRadius();
-		Create = Rally = FindPositionAround(Factory.GetPosition(), R + 10.f, R + 60.f, GenSurface::Ground);
-	}
-	Create.Z = GetGroundHeight(Create.X, Create.Y);
+	FVector3f Create, Rally;
+	GetFactoryExit(Factory, Create, Rally);
 	if (FGenObject* U = CreateObject(&Unit, Factory.GetOwner(), Create, Factory.GetOrientation()))
 	{
+		U->Producer = Factory.GetID(); // ProductionUpdate: "newObj->setProducer(creationBuilding)"
 		// SupplyCenterProductionExitUpdate: gatherers leaving a supply center go straight to work, and
 		// the flying ones don't bother with the rally point first.
 		PlayObjectSound(*U, { TEXT("VoiceCreated") });
@@ -1334,25 +1490,7 @@ void UGenGameLogic::SpawnProducedUnit(const FGenObject& Factory, const FGenThing
 		const bool bGatherer = FT->bSupplyCenter && Unit.bIsSupplyTruck;
 		if (!(bGatherer && U->IsFlying()))
 		{
-			if (FT->bHasExit && !U->IsFlying() && U->CanMove())
-			{
-				// aiFollowExitProductionPath: straight out of the door along the exit path, the factory it was made
-				// in no obstacle on the way (no path is looked for: one from inside the building went round
-				// whichever side came first).
-				U->StartDirectMove(FVector3f(Rally.X, Rally.Y, GetGroundHeight(Rally.X, Rally.Y)));
-				U->IgnoreObstacle = Factory.GetID();
-			}
-			else
-			{
-				U->CommandMoveTo(FVector3f(Rally.X, Rally.Y, GetGroundHeight(Rally.X, Rally.Y)));
-			}
-			// aiFollowExitProductionPath: out by the door first, then on to the building's rally point
-			// (only what moves on the ground; the move there ends on the nearest free spot).
-			if (Factory.HasRallyPoint() && !U->IsFlying())
-			{
-				U->bHasExitRally = true;
-				U->ExitRally = Factory.GetRallyPoint();
-			}
+			FollowExitPath(Factory, *U, Rally);
 		}
 		U->bForceWanting = bGatherer;
 		if (FGenSkirmishAI* AI = GetAI(Factory.GetOwner()))

@@ -1872,6 +1872,210 @@ clicking sends it there to be repaired. If the helicopter is full hp, I should n
       "200,pick,1170,520,hover;300,damage,AmericaVehicleComanche,40;350,pick,1170,520,hover"`, grep `pick at`
       and `[cursor]`. Confirmed in the editor by the user.
 
+## Done (the user's report of 2026-10-28: more than one special agent could be built)
+"A player should be able to build only one of those special agents. I am not sure what happens if I captured
+another player's base - should it allow me to build one from there?"
+
+- [x] What the original does: the limit is on the template, not on the factory. Each agent's object says
+      `MaxSimultaneousOfType = 1` (`data\ini\object\AmericaInfantry.ini:309` for Burton,
+      `GLAInfantry.ini:552` for Jarmen Kell, `ChinaInfantry.ini:644` for Black Lotus), and none of them has a
+      `MaxSimultaneousLinkKey`, so it is one *of each type*: a player may have a Burton and a Jarmen Kell at
+      the same time. `Player::canBuildMoreOfType` (Player.cpp:2886) asks `countExisting` (Player.cpp:2852),
+      which goes through `Player::iterateObjects` - the players of the player's team - skips dead objects,
+      matches by `ThingTemplate::isEquivalentTo` (so a general's reskin of Jarmen Kell is the same type as
+      Jarmen Kell) or by the link key, and adds what is in the production queues, of units only: a structure
+      can never come out of a factory, so the building standing is the count. `Player::canBuild` calls it, so
+      the button greys out, and `BuildAssistant::canMakeUnit` answers `CANMAKE_MAXED_OUT_FOR_PLAYER`
+      (BuildAssistant.cpp:1328), which the tooltip puts as the maximum number.
+- [x] So a captured base changes nothing: the count is per player, not per factory or per base. A captured
+      agent is one you own and counts against the one you may build, and you can build from a captured
+      factory only if you have none of that type - what it produces is its own faction's agents, by its
+      command set. Prerequisites stay as they are: each agent is built at its faction's barracks and needs a
+      different building first (America's Strategy Center, China's Propaganda Center, GLA's Palace).
+- [x] Port: `FGenThingTemplate::MaxSimultaneousOfType` and `MaxSimultaneousLinkKey` from the object blocks,
+      `UGenGameLogic::CountOwnedOrQueued` (countExisting: the same team iteration, the same equivalence
+      through `Canonical()`, and the queue entries for units), checked in `CanMake` before the money - the one
+      path the control bar's availability, the queue command and the computer player's build choices all go
+      through - with the reason for the tooltip ("You already have one of these").
+      "DeterminedBySuperweaponRestriction" is the lobby option this game has no screen for; the original reads
+      it as unlimited when there is no game info and its default is off, so it parses as unlimited and the
+      superweapons are as before.
+- [x] Tested on Tournament Desert with the buildings at their own spots (the row the test places them in is
+      too tight for building footprints): GLABarracks at 900,470 and GLAPalace at 1050,620, one Jarmen Kell
+      queued at frame 30, and its build button clicked at frame 60 while it is still inside the factory - the
+      click is refused ("NOT POSSIBLE (not shown, or greyed out)") and only the first Kell comes out at frame
+      630. With an agent already standing the same run prints "refused: You already have one of these", and
+      without one standing it queues it. The queue test switch now prints why a unit is refused instead of
+      only "has no factory". Recipe: `-Faction FactionGLA -Objects "GLABarracks@900:470,GLAPalace@1050:620"
+      -TestQueue GLAInfantryJarmenKell -TestSelect GLABarracks -TestPowers
+      "60,click,Command_ConstructGLAInfantryJarmenKell" -Delay 70 -Trace`.
+
+## Done (the user's report of 2026-10-28: Burton on cliffs, helicopters circling, supply drop-off, the combat cycle)
+"Colonel Burton should be able to climb hills... the old game had this feature and it was a bit crappy. Try to
+improve it a bit after porting." "After arriving at a location, [helicopters] are circling around a point. They
+should just hover." "GLA workers should be allowed to drop the collected supplies only at a GLA supply center;
+the Chinook only in a USA one; the China supply truck only in a China one." "The GLA motorcycle lacks some
+animations and looks weird" - and "gla motorcycles are able to drive on hills as well".
+- [x] Locomotor sets (AIUpdateInterface::chooseGoodLocomotorFromCurrentSet, LocomotorSet::getValidSurfaces):
+      the port took only the first locomotor of a set, so `SET_NORMAL ColonelBurtonGroundLocomotor
+      ColonelBurtonCliffLocomotor` was a ground unit. Now an object keeps the whole set (`LocoSet`), its paths
+      are found on every surface of it, and every frame it takes the one for the cell under it
+      (`FGenPathfinder::LocomotorSurfacesAt`). That is Burton, the saboteur and every combat cycle (their
+      cliff locomotor, CLIFF_JUMPER): up and down cliffs. Beyond the original, the flat ground classifyMap
+      counts as cliff at a face's foot and top takes the ground locomotor too (no climbing on flat ground)
+- [x] Climbing (Locomotor::moveTowardsPositionClimb, AIInternalMoveToState's CLIMBING / RAPPELLING): up a
+      face facing it, down it backwards, the conditions held while it stops on the face. What is better than
+      the original: it climbs where the ground is steep (from slope 0.6, walking again under 0.35, read three
+      units ahead) - the original climbed whenever its waypoint was a cell above or below, and turned round at
+      any dip a tenth of a unit deep; its pace on the face is a steady quarter of its speed upwards or downwards
+      (the original's was full speed to 45 degrees, then a quarter at once); and the path's cost of a cliff step
+      goes by direction - more than 60 degrees off the way the face falls costs seven diagonal steps more (the
+      original's "rises less than a cell" rule caught nearly every step on a 45-degree face, and the first
+      version here walked 60 units round to find the narrowest crossing). Kept from the original: the path's
+      corners where it goes onto a cliff and off it (buildActualPath's setCanOptimize), no destination on a
+      cliff (checkForAdjust). `-Trace` adds `[climb f..] ... climbs / backs down / walks`
+- [x] Tested on Twilight Flame, the 51-unit face between (1135,885) and (1005,845): Burton up in 8 s on
+      AIHERO_CLMUP, down (backing, the animation backwards) and on to the start by f1262 from an order at f900;
+      the combat cycle up and down the same face. Recipe: `-Map "Twilight Flame" -Cam "1068,866,90,170"
+      -Objects "AmericaInfantryColonelBurton@1150:885,GLAVehicleCombatBike@1150:845" -NoAI -TestPowers
+      "40,move,1000,850,AmericaInfantryColonelBurton;45,move,1000,820,GLAVehicleCombatBike" -Trace` (pause
+      f230 for him on the face). Tournament Desert's high ground in the west is painted cliff from the top
+      down - no destination there, a climber stops short of it as in the original
+- [x] Helicopters circling: moveTowardsPositionOther pushes along the nose whatever the angle to the goal, so
+      a goal inside the turning circle - a short move to one side or behind - was flown round for ever at the
+      turning radius (a Comanche sent 13 units sideways: 35 units/s round an 11-unit circle until the next
+      order). Beyond the original, a HOVER locomotor holds its push back while the goal is off its nose (full
+      within 15 degrees, none beyond 60: it turns on the spot) and slides the last cell in without turning; and
+      the original's ULTRA_ACCURATE slide (SlideIntoPlaceTime) is ported. Tested: Comanche, Helix and Chinook,
+      moves of 13 to 250 units ahead, aside and behind: every one ends hovering within two seconds
+- [x] Supply centers by faction (not the original, which takes any of the player's own): a gatherer delivers
+      only to a supply center of its own BaseSide (by the PlayerTemplate of the object's Side - a general's
+      reskin counts as its faction); a gatherer of no faction (the civilian truck) as before. One rule in
+      CanTransferSuppliesAt, so the click, the cursor and the computer players follow it. Tested: GLA workers
+      beside an owned Chinese supply center load and wait with their box; its Chinese truck delivers 7 times
+- [x] The combat cycle (RiderChangeContain, AnimationSteeringUpdate): its rider makes it what it is - RIDERn
+      (the bike's model, and the second draw module's soldier with his riding animation: before, a bare skin
+      in its bind pose), WEAPON_RIDERn (it had no weapon at all), STATUS_RIDERn, the command set (Jarmen Kell's
+      snipe button) and the locomotor set (the terrorist's sluggish one), and the rank goes over and back. A
+      soldier of the Rider list getting on pushes the one riding off (the bike is never full for them); the
+      rider getting off (the scuttle button is EVACUATE) tips it over (TOPPLED), unselectable, gone after
+      ScuttleDelay by a TOPPLED death (the hulk OCL). The bike dying takes its rider quietly (its RIDERn death
+      modules are the ones that throw a body). The selection follows the rider on and off. Leaning into turns:
+      CENTER_TO_LEFT / RIGHT and back, each held MinTransitionTime. Die modules and FireWeaponWhenDeadBehavior
+      now ask RequiredStatus (and the latter its DeathTypes / ExemptStatus, which it ignored - by the code,
+      every combat cycle's death would have set off the terrorist's bike bomb). Tested: a rebel's bike leans
+      (UVCOMBIKEG_A1) on a turn, a tunnel defender takes it over (UVComBikeTN, rocket weapon), the scuttle tips
+      it (UVComBike_F) and it is gone 45 frames later; two bikes killed at once take their riders with them.
+      Not seen in a test: the thrown body, the bomb staying quiet, the selection hand-over (it needs a mouse).
+      An 8-player Twilight Flame game against hard computer players replays every frame the same (36124
+      frames, seed 3). Recipe: `-Faction FactionGLA -Objects "GLAVehicleCombatBike@1005:760,
+      GLAInfantryTunnelDefender@1060:760" -TestPowers "40,move,1100,900,GLAVehicleCombatBike;
+      400,enter,GLAInfantryTunnelDefender,GLAVehicleCombatBike;620,evacuate,GLAVehicleCombatBike" -Trace`
+- [ ] Not done: StealthUpdate's UseRiderStealth (a stealthed rider's bike), the stealth general's bike
+- [x] The last two items of notes.txt's "new additions 1.0" (the Air Force General's Comanche stealth; the
+      Stealth General's stealthed buildings showing themselves while they fire) were done by the user with
+      another AI session (GenStealth.cpp, 2026-10-27) and are checked here: an AirF_AmericaVehicleComanche with
+      AirF_Upgrade_StealthComanche is stealthed at f75, shows itself the frame it is told to attack, stealthed
+      again 1.5 s after; a Slth_GLATunnelNetwork with two Rangers in reach stays visible while its gun and
+      defenders fight (to f211) and is stealthed 2.5 s after the last one falls. Recipes: `-Fog -Faction
+      FactionAmericaAirForceGeneral -Objects "AirF_AmericaVehicleComanche@1005:760" -Enemy FactionGLA -Enemies
+      "GLAInfantryRebel,GLAInfantryRebel" -EnemyAt "1005,1100" -NoAI -TestSelect AirF_AmericaVehicleComanche
+      -TestPowers "30,grant,AirF_Upgrade_StealthComanche;160,move,1005,1000;300,leftclick,985,1100" -Trace`
+      (grep `[stealth f`); `-Fog -Faction FactionGLAStealthGeneral -Objects "Slth_GLATunnelNetwork@1005:760"
+      -Enemy FactionAmerica -Enemies "AmericaInfantryRanger,AmericaInfantryRanger" -EnemyAt "1005,870" -NoAI`
+
+## Done (the user's choice of 2026-10-28: the gameplay gaps of the module audit)
+Eight modules no code read yet, picked by the user from the audit in "Next" ("gameplay gaps first").
+- [x] Poison (PoisonedBehavior, 103 objects): POISON damage taken goes on hurting - the same amount again every
+      PoisonDamageInterval (unresistable, shown as poison) until PoisonDuration after the last dose; healing cures
+      it. (The original's poisoned tint is commented out in Drawable.cpp: none here either.) Tested: Burton hit
+      by the toxin truck's spray, the truck gone at f39 and its last shot in at f45 (130 health) - 80 at f60,
+      dead by f90
+- [x] Advanced Training (ExperienceScalarUpgrade): the scalar is added to on the upgrade; kills, captures and the
+      like count that many times ("canScaleForBonus"; a pilot's rank given to a vehicle doesn't), and what goes
+      to an experience sink is scaled by the killer's too. Tested: a Ranger with the upgrade kills a Red Guard
+      worth 5 and has 10
+- [x] Buildings mending themselves (BaseRegenerateUpdate, GameData's BaseRegenHealthPercentPerSecond 0.3% /
+      BaseRegenDelay 3 s): left alone for the delay, a little every third frame until whole; any damage but
+      healing starts the delay again. Tested: a command center at half health mends 0.5 a frame from 3 s on
+      (the idle dozer then comes to repair it too)
+- [x] Hordes (HordeUpdate, AIUpdateInterface::evaluateMoraleBonus): every UpdateRate (started at a random frame)
+      it counts its kind within Radius (bounding spheres, all of KindOf, allies, ExactMatch); Count less one of
+      them and it is a true member, fewer but within RubOffRadius of a true member and it is in the horde too.
+      HORDE, and NATIONALISM / FANATICISM with the player's upgrades (unless AllowedNationalism = No in a horde),
+      are weapon bonus conditions - GameData's rates of fire. `-Trace` adds `[horde f..] joins / leaves`. Not
+      done: the decal under a horde's members (TERRAIN_DECAL_HORDE...). Tested: six Red Guards all join
+- [x] Deploying (DeployStyleAIUpdate, the Nuke Cannon and the sentry drone): in range of what it attacks (or
+      guarding idle) it unpacks, UnpackTime; it aims and fires only once DEPLOYED; told to move, it lines its
+      turret up (TurretsMustCenterBeforePacking) and packs, PackTime, before it goes; turned round half way it
+      reverses from where it had got. Meanwhile it is busy (no move, no fire; the move waits). The Deploy /
+      Undeploy unit sounds; ManualDeployAnimations: the logic steps the unpacking animation's frame (a new channel
+      to the drawing, `SetDrawManualFrame`). `[deploy f..]`. Tested: a Nuke Cannon told to attack a Crusader
+      unpacks f31-f131 and fires at f197; the Crusader closing inside its minimum range sends it off to
+      reposition - it lines up and packs first
+- [x] The Troop Crawler (AssaultTransportAIUpdate): its DEPLOY weapon (Weapon::fireWeapon's DAMAGE_DEPLOY) marks
+      the target of an assault; the riders that are whole and were aboard get out and attack it, those below
+      MembersGetHealedAtLifeRatio come back in to heal, and when an attack order's target is gone they all
+      come back; an attack-move goes on; the player's orders to a member take it out of the assault, and any
+      order to the crawler starts over (Stop also calls them back); a crawler with nobody to send gives up; its
+      death leaves those outside with their last orders. `[assault f..]`. Tested: eight Red Guards out at a
+      Humvee one every 8 frames from f66, one back in at half health and out again healed, all back in after
+      the kill
+- [x] The Battle Bus (UndeadBody, BattleBusSlowDeathBehavior): the blow that would kill it the first time leaves
+      it a point (before its armor), then a second life of SecondLifeMaxHealth with the SECOND_LIFE armor; its
+      slow death, not a death this time, throws it up (the force over its mass), tumbling, hurts those inside;
+      down again it is a hulk on the spot (SECOND_LIFE model, held) that its passengers fire out of, and left
+      empty for EmptyHulkDestructionDelay it kills itself (EXTRA_4). `[bus f..]`. Tested: two Crusaders - thrown
+      up at f189, down at f261 with 650 health, its rebel shooting, dead for good at f609
+- [x] GLA holes (RebuildHoleExposeDie, RebuildHoleBehavior): a finished GLA building of a player still in the
+      game leaves its hole (HoleMaxHealth, on the building's footprint), whoever was attacking the building
+      attacks the hole; WorkerRespawnDelay later a worker (unselectable) comes out and builds it again for
+      nothing, the hole masked (neither targeted nor selected) and its attackers sent to the site; a worker or
+      a site lost starts the wait again; the hole heals HoleHealthRegen%PerSecond; finished, the hole and worker
+      are gone. `[hole f..]`. Tested: a barracks destroyed at f60 - its hole (500), the worker at f660, the
+      barracks whole again at f961, money unchanged. Not done: StickyBombUpdate's bombs moved over to the site
+      (transferBombs), the script names
+- Tested together: 8-player Twilight Flame against hard computer players (replay below); recipes in the
+  scratchpad batch of that day: Tournament Desert, `-Faction` of the side, the unit at 1005,760 and an enemy in
+  reach, `-TestSelect` + `leftclick,x,y` for an attack order, `destroy,Type,x,y` for a building
+
+## Done (the user's choice of 2026-10-28: the rest of the gameplay modules of the audit, trains)
+The play modules of the audit left after the gaps above ("remaining gameplay").
+- [x] A GLA fake building made real (ReplaceObjectUpgrade): the upgrade swaps the object for one of the named
+      template where it stood, the same way round, whole and counted as built (its create modules'
+      onBuildComplete, the player's onStructureConstructionComplete; `UGenGameLogic::ReplaceWithObject`). Tested: a fake barracks upgraded at f30 is a real one at f330,
+      whole, $375 spent
+- [x] The toxin truck's puddles (FireOCLAfterWeaponCooldownUpdate): MinShotsToCreateOCL shots in a row from the
+      weapon in hand (a spot attack's weapon while it fires at a spot), then the weapon falls silent, the slot
+      changes or an upgrade turns it off - and it leaves its OCL; the longer it sprayed, the longer the puddle
+      lasts (OCLLifetimePerSecond, OCLLifetimeMaxCap). `[ocl f..]`. Tested: Contaminate at a spot, 11 shots - a
+      puddle for 630 frames
+- [x] The Air Force Patriots' shared targets (AssistedTargetingUpdate, the weapon's RequestAssistRange): a
+      battery that fires asks its own kind within the range, ready to fire, to fire a clip from their assisting
+      slot at the same target, with the feedback lasers between them. `[assist f..]`. Tested: three batteries
+      with power and a Battlemaster - the two that weren't firing join in at f27
+- [x] Hurt infantry going to heal (AutoFindHealingUpdate): a computer player's idle unit below NeverHeal of its
+      health looks for the nearest HEAL_PAD it may enter within ScanRange every ScanRate and goes in; a human
+      player's never do (as the original). `[heal f..]`. Tested: a Ranger at 72 / 180 goes into its barracks
+- [x] A weapon locked from the start (LockWeaponCreate: Rangers and SCUD launchers - PRIMARY,
+      "two unpickable weapons equaling no attack"). Tested: a Ranger shoots a Red Guard with its rifle from f11
+- [x] Wandering (WanderAIUpdate: a fire wall's flames, a burning man): idle, it walks off a little way at random
+      (GetRandom - the logic's own). Tested: a fire wall segment's flame creeps about
+- [x] Trains (RailroadBehavior, Logic/GenTrains.cpp): the locomotive finds the waypoint track it stands on (a
+      loop, or a line with its ends) and makes and hitches its cars from CarriageTemplateName (or the cars
+      already behind it); each car is placed a car's length behind the one pulling it, facing its tow hitch;
+      the conductor accelerates to SpeedMax, brakes and waits at ...Station waypoints (an obstacle to paths
+      while it stands there), lets passengers out at ...Disembark, turns back at ...PingPong, keeps its height
+      in ...Tunnel; cars left without a locomotive coast to a stop (Friction). What it hits: faster than
+      KillSpeedMin it kills, slower it crushes; vehicles are shoved aside, the dead flung; it smashes anyone's
+      power, factories, defenses, tech buildings and holes but not other buildings, a demo trap blows it up.
+      The running, clickety-clack, whistle and bounce sounds. `[train f..]`. Tested: Alpine Assault's
+      locomotive - a loop of 212 points, 12 cars, over a Humvee on the line at f589 (shot: drawn with its cars
+      and smoke). Winding River's train has no locomotive (TrainCab IsLocomotive = No): it stands, as there.
+      Drawing: a train car has no locomotor, so `IsDynamic()` counts trains in (else it is never re-placed)
+- Tested together: replays of 4-player Alpine Assault (hard computer players, the train running; 29,045 frames) and
+  8-player Twilight Flame (29,018 frames) - every frame the same
+
 ## Next
 (Performance: no profiling between milestones - one review at the very end, the user's word of
 2026-10-12. Things to look at then are noted where they are made: FindGroundPath asks for the
@@ -1891,6 +2095,15 @@ one with somebody in its way predicts up to ~22 ways against each neighbour.)
       the maps' ambient sounds - M7c; the voices and sounds still missing - M7d. Left: volume settings
       (with the options, M8), surround output, the trucks' sounds (with the vehicles' wheels and treads)
 - [x] The vehicles' wheels, treads and dust, and their bodies on the ground - M2d
+- [ ] Modules of the game's objects nothing here reads yet (an audit of 2026-10-28: every Behavior / Draw /
+      Body / ClientUpdate type in Data\INI\Object against the source - 61 of 201 types; the campaign's left
+      out). Poison, hordes, Advanced Training, base regeneration, GLA holes, the Troop Crawler, deploying and
+      the Battle Bus: done the same day (above); the rest of the play modules (fake buildings, puddles, the
+      Patriots' shared targets, healing, weapon locks, wandering, trains) too (above). Looks:
+      ProjectileStreamUpdate / W3DProjectileStreamDraw (the flame and toxin streams), BoneFXUpdate /
+      BoneFXDamage, SwayClientUpdate, FloatUpdate, AnimatedParticleSysBoneClientUpdate, W3DPoliceCarDraw.
+      With the not-done lines above: the tank paradrop, the cleanup of toxins (CleanupHazardUpdate /
+      CleanupAreaPower) and the angry mob (MobNexusContain / MobMemberSlavedUpdate)
 - [ ] M8 leftovers: see M8a. Next: M8b, the shell drawn from the original's window files - a small
       window manager over Core/GenWnd (the gadgets: push buttons, check boxes, combo boxes, list boxes,
       sliders, text entry, static text, with WindowTransitions.ini's transitions) and the menus' callbacks

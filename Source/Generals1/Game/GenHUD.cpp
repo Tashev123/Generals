@@ -172,7 +172,10 @@ void AGenHUD::DrawHUD()
 		{
 			continue;
 		}
-		const FVector BarWorld = GenCoords::ToUE(P.X, P.Y, P.Z + T->GeometryHeight + 10.f);
+		// (The angry mob's nexus: over the middle of its mob, and "pos.z += 20;// dear God, I confess my kluge, and repent.")
+		const FVector3f& BoxOffset = O->GetHealthBoxOffset();
+		const float MobLift = T->IsKindOf(TEXT("MOB_NEXUS")) ? 20.f : 0.f;
+		const FVector BarWorld = GenCoords::ToUE(P.X + BoxOffset.X, P.Y + BoxOffset.Y, P.Z + BoxOffset.Z + T->GeometryHeight + 10.f + MobLift);
 		const float Size = FMath::Clamp(T->GeometryMajorRadius + (T->IsBox() ? T->GeometryMinorRadius : T->GeometryMajorRadius), 20.f, 150.f);
 		FVector2D Top, Side;
 		if (PC->ProjectWorldLocationToScreen(BarWorld, Top) && PC->ProjectWorldLocationToScreen(BarWorld + CameraRight * double(Size) * GenCoords::UnitsToCm, Side))

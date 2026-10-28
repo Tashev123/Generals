@@ -45,14 +45,15 @@ void FGenObject::SetVeterancyLevel(int32 NewLevel, bool bProvideFeedback)
 	}
 }
 
-void FGenObject::AddExperience(int32 Points)
+void FGenObject::AddExperience(int32 Points, bool bCanScaleForBonus)
 {
 	// ExperienceTracker::addExperiencePoints
 	if (!Template->bIsTrainable || Points <= 0 || bDead)
 	{
 		return;
 	}
-	Experience += Points;
+	// ("if ( canScaleForBonus ) amountToGain *= m_experienceScalar" - Advanced Training doubles it.)
+	Experience += bCanScaleForBonus ? FMath::TruncToInt32(float(Points) * XPScalar) : Points;
 	int32 Level = 0;
 	while (Level + 1 < 4 && Experience >= Template->ExperienceRequired[Level + 1])
 	{

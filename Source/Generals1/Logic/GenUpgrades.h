@@ -96,6 +96,8 @@ enum class EGenUpgradeEffect : uint8
 	ObjectCreation,     // ObjectCreationUpgrade: an ObjectCreationList is run (a drone, an Overlord's add-on)
 	PassengersFire,     // PassengersFireUpgrade: whoever rides in it may shoot out from now on (a Helix's bunker)
 	SpyVision,          // SpyVisionUpdate (NeedsUpgrade): its owner sees what the enemy's things of some kinds see (satellite hacks)
+	ExperienceScalar,   // ExperienceScalarUpgrade: it learns AddXPScalar times faster again (Advanced Training)
+	ReplaceObject,      // ReplaceObjectUpgrade: it is swapped for another object (a GLA fake building made real)
 };
 
 struct GENERALS1_API FGenUpgradeModule
@@ -122,6 +124,8 @@ struct GENERALS1_API FGenUpgradeModule
 	TArray<FString> SpyOnKindOf;            // SpyVisionUpdate: whose eyes (empty: everything of the enemy's)
 	int32 SpyDuration = 0;                  // ... on for this long (0: for good) ...
 	int32 SpyInterval = 0;                  // ... then off for this long (SelfPoweredDuration / SelfPoweredInterval)
+	float AddXPScalar = 0.f;                // ExperienceScalarUpgrade
+	FString ReplaceObject;                  // ReplaceObjectUpgrade
 };
 
 /** AutoHealBehavior: repairs the object itself (Radius 0) or what stands around it. */
@@ -187,6 +191,7 @@ enum class EGenPowerModule : uint8
 	CashBounty,     // passive: a share of the cost of everything this player destroys
 	SpyVision,      // SpyVisionSpecialPower: for a while the player sees what the enemy's units see
 	SpecialAbility, // SpecialAbility: a unit's own ability; its SpecialAbilityUpdate carries it out
+	CleanupArea,    // CleanupAreaPower: the ambulance cleans up every hazard round a spot (its CleanupHazardUpdate)
 };
 
 struct GENERALS1_API FGenSpecialPowerModule
@@ -206,6 +211,7 @@ struct GENERALS1_API FGenSpecialPowerModule
 	float Bounty = 0.f;                         // CashBountyPower: share of the victim's cost
 	int32 Duration = 0;                         // SpyVisionSpecialPower: BaseDuration, frames
 	FString InitiateSound;                      // SpecialAbility: what the unit says when sent to do it
+	float CleanupMoveRange = 0.f;               // CleanupAreaPower: MaxMoveDistanceFromLocation
 };
 
 /**

@@ -27,6 +27,7 @@ void FGenPathfinder::Build(const FGenMapData& Map, const TArray<FGenBridgeInfo>&
 	Height = Map.Height - 1;
 	Border = Map.Border;
 	Terrain.Init(ECell::Clear, Width * Height);
+	CellZ.SetNumUninitialized(Width * Height);
 	Obstacles.Init(0, Width * Height);
 	ObstacleOwner.Init(GenInvalidObjectID, Width * Height);
 	Fences.Init(0, Width * Height);
@@ -59,6 +60,7 @@ void FGenPathfinder::Build(const FGenMapData& Map, const TArray<FGenBridgeInfo>&
 				Type = ECell::Water;
 			}
 			Terrain[Y * Width + X] = Type;
+			CellZ[Y * Width + X] = Map.GetHeightAt(X, Y);
 		}
 	}
 
@@ -461,6 +463,33 @@ bool FGenPathfinder::CanPass(int32 X, int32 Y, uint32 Surfaces, int32 Layer) con
 	}
 }
 
+uint32 FGenPathfinder::LocomotorSurfacesAt(const FVector2f& WorldPos, int32 Layer) const
+{
+	if (Layer > 0)
+	{
+		return GenSurface::Ground | GenSurface::Air; // a bridge's deck
+	}
+	const FIntPoint C = WorldToCell(WorldPos);
+	if (C.X < 0 || C.Y < 0 || C.X >= Width || C.Y >= Height)
+	{
+		return GenSurface::Ground | GenSurface::Air; // "off the map? call it CELL_CLEAR..."
+	}
+	switch (GetCell(C.X, C.Y))
+	{
+	case ECell::Clear:
+	case ECell::Fence:
+		return GenSurface::Ground | GenSurface::Air;
+	case ECell::Water:
+		return GenSurface::Water | GenSurface::Air;
+	case ECell::Cliff:
+		return (CellFlags[C.Y * Width + C.X] & FlagGrownCliff) != 0 ? (GenSurface::Ground | GenSurface::Cliff | GenSurface::Air) : (GenSurface::Cliff | GenSurface::Air);
+	case ECell::Rubble:
+		return GenSurface::Rubble | GenSurface::Air;
+	default:
+		return GenSurface::Air; // obstacles, the map's edge, ground shut beside a structure
+	}
+}
+
 bool FGenPathfinder::IsPassable(const FVector2f& WorldPos, uint32 Surfaces, int32 Layer) const
 {
 	const FIntPoint C = WorldToCell(WorldPos);
@@ -470,7 +499,7 @@ bool FGenPathfinder::IsPassable(const FVector2f& WorldPos, uint32 Surfaces, int3
 FIntRect FGenPathfinder::RasterizeFootprint(const FGenObject& Obj, int32 Delta)
 {
 	FIntRect Touched(FIntPoint(MAX_int32, MAX_int32), FIntPoint(MIN_int32, MIN_int32));
-	const FGenThingTemplate* T = Obj.GetTemplate();
+	const FGenThingTemplate* T = Obj.GetFootprintTemplate();
 	if (!T || Width == 0)
 	{
 		return Touched;
@@ -968,6 +997,11 @@ bool FGenPathfinder::IsDestinationFree(FGenObjectID Id, const FVector2f& Pos, fl
 			{
 				return false;
 			}
+			// Pathfinder::checkForAdjust: "no final destinations on cliffs" (a climber stops on either side of one).
+			if (Layer == 0 && Terrain[Y * Width + X] == ECell::Cliff)
+			{
+				return false;
+			}
 			// "if (cell->isObstaclePresent( ignoreId )) continue": ending on the ground the thing we are going
 			// into stands on is allowed, and so is ending where it holds the cell itself
 			// ("if (goalUnitID == ignoreId ) continue").
@@ -1211,6 +1245,7 @@ bool FGenPathfinder::FindPath(const FVector2f& Start, const FVector2f& Goal, uin
 
 	int32 BestIdx = StartIdx;
 	int32 BestH = Heuristic(S.X, S.Y);
+	const bool bClimber = (Surfaces & GenSurface::Cliff) != 0 && (Surfaces & GenSurface::Air) == 0;
 	const int32 DX8[8] = { 1, -1, 0, 0, 1, 1, -1, -1 };
 	const int32 DY8[8] = { 0, 0, 1, -1, 1, -1, 1, -1 };
 
@@ -1260,8 +1295,25 @@ bool FGenPathfinder::FindPath(const FVector2f& Start, const FVector2f& Goal, uin
 			const bool bDiag = k >= 4;
 			if (bDiag && (!CanPass(CX + DX8[k], CY, Surfaces, CL) || !CanPass(CX, CY + DY8[k], Surfaces, CL))) { continue; }
 			// PathfindCell::costSoFar ("if (getPinched()) cost += COST_DIAGONAL") and examineNeighboringCells
-			// ("else if (newCell->getPinched()) newCostSoFar += COST_ORTHOGONAL").
-			Relax(NodeIndex(CL, NX, NY), NX, NY, (bDiag ? 14 : 10) + ((CL == 0 && IsPinched(NX, NY)) ? 24 : 0));
+			// ("else if (newCell->getPinched()) newCostSoFar += COST_ORTHOGONAL"). A step a climber takes across a cliff
+			// costs seven diagonal steps more when it doesn't go up or down the face but along it. (The original asks
+			// whether the ground rises less than a cell across the step, which on a face of 45 degrees or less is true
+			// of nearly every step whichever way it goes - climbers went miles round to cross where it was narrowest.
+			// Here: more than 60 degrees off the way the face falls, on ground that slopes at all.)
+			int32 Extra = 0;
+			if (CL == 0 && bClimber && Terrain[NY * Width + NX] == ECell::Cliff && NX + 1 < Width && NY + 1 < Height)
+			{
+				const float Z = CellZ[NY * Width + NX];
+				const float GX = CellZ[NY * Width + NX + 1] - Z, GY = CellZ[(NY + 1) * Width + NX] - Z;
+				const float Grad = FMath::Sqrt(GX * GX + GY * GY);
+				const float Along = FMath::Abs(GX * DX8[k] + GY * DY8[k]) / (Grad * (bDiag ? UE_SQRT_2 : 1.f) + 1e-3f);
+				Extra = (Grad > 2.f && Along < 0.5f) ? 7 * 14 : 0;
+			}
+			else if (CL == 0 && IsPinched(NX, NY))
+			{
+				Extra = 24;
+			}
+			Relax(NodeIndex(CL, NX, NY), NX, NY, (bDiag ? 14 : 10) + Extra);
 		}
 		// Pathfinder::checkChangeLayers: at a bridge's ends the cell above (or below) is the same place.
 		if (CL == 0)
@@ -1306,6 +1358,15 @@ bool FGenPathfinder::FindPath(const FVector2f& Start, const FVector2f& Goal, uin
 		return true; // already at the closest reachable point
 	}
 
+	auto IsCliffCorner = [&](int32 k)
+	{
+		if (!bClimber || CellLayers[k] != 0)
+		{
+			return false;
+		}
+		const FIntPoint C = WorldToCell(Cells[k]);
+		return C.X >= 0 && C.Y >= 0 && C.X < Width && C.Y < Height && Terrain[C.Y * Width + C.X] == ECell::Cliff;
+	};
 	// Smooth: from each anchor, jump to the farthest waypoint in line of sight - within a layer. Where the
 	// path changes layer (the two cells are one place) the spot itself stays in the path.
 	FVector2f Anchor = Start;
@@ -1332,8 +1393,10 @@ bool FGenPathfinder::FindPath(const FVector2f& Start, const FVector2f& Goal, uin
 			++i;
 			continue;
 		}
+		// (buildActualPath: "setCanOptimize(false)" where the path goes onto a cliff and where it comes off one - a
+		// climber walks to the foot of the face, goes up it, and walks on from its top.)
 		int32 RunEnd = i;
-		while (RunEnd + 1 < Cells.Num() && CellLayers[RunEnd + 1] == AnchorLayer)
+		while (RunEnd + 1 < Cells.Num() && CellLayers[RunEnd + 1] == AnchorLayer && IsCliffCorner(RunEnd + 1) == IsCliffCorner(i))
 		{
 			++RunEnd;
 		}

@@ -61,6 +61,8 @@ struct GENERALS1_API FGenLocomotorTemplate
 	int32 AirborneTargetingHeight = MAX_int32;
 	/** Radius of the circle a winged aircraft flies while it has nowhere to go (negative: the other way round; 0: as tight as it can). */
 	float CirclingRadius = 0.f;
+	/** SlideIntoPlaceTime (m_ultraAccurateSlideIntoPlaceFactor), in frames: ULTRA_ACCURATE, this close it slides in without turning. */
+	float SlideIntoPlaceFrames = 0.f;
 
 	/** Moves only through the air: no ground pathfinding, no collisions with ground units. */
 	bool IsAirOnly() const { return (Surfaces & GenSurface::Air) != 0 && (Surfaces & ~uint32(GenSurface::Air)) == 0; }
@@ -147,6 +149,21 @@ struct GENERALS1_API FGenContainData
 	FString EnterSound;                 // OpenContain's EnterSound / ExitSound: the container's own, once a frame (a garrison's door)
 	FString ExitSound;
 	TArray<FString> PayloadTemplateNames; // PayloadTemplateName: comes with these aboard (an Avenger's laser turret)
+	/** RiderChangeContain (the combat cycle): "Rider1 = Template MODELCONDITION WEAPONSETFLAG STATUS CommandSet LocomotorSet" -
+	 *  who may ride it, and what each makes of it. */
+	struct FRider
+	{
+		FString Template;
+		FString Condition;
+		FString WeaponFlag;
+		FString Status;
+		FString CommandSet;
+		FString LocomotorSet;
+	};
+	bool bRiderChange = false;
+	TArray<FRider> RiderTypes;
+	int32 ScuttleFrames = 0;            // ScuttleDelay: from the rider getting off to the bike falling over for good
+	FString ScuttleCondition;           // ScuttleStatus: the model condition meanwhile (TOPPLED)
 };
 
 /** Weapon.ini entry (WeaponTemplate); times in logic frames, speeds per frame. */
@@ -170,6 +187,7 @@ struct GENERALS1_API FGenWeaponTemplate
 	float WeaponSpeed = 999999.f;       // per frame
 	float WeaponRecoil = 0.f;           // radians
 	FString ProjectileObject;           // empty = instant/delayed damage
+	FString ProjectileStreamName;       // an object that draws the line through this weapon's shots in flight (a spray, a flame)
 	bool bAllowAttackGarrisonedBldgs = false; // may be aimed at a garrisoned building whatever its damage (flash-bangs, flames, toxin)
 	bool bAntiMine = false;                    // AntiMine: may be aimed at mines and demo traps (a dozer's disarming tool)
 	float ContinueAttackRange = 0.f;           // with its victim gone, on to the nearest like it within this of where that was
@@ -179,6 +197,7 @@ struct GENERALS1_API FGenWeaponTemplate
 	FString ProjectileDetonationOCL;
 	FString ProjectileExhaust;          // particle system attached to the projectile
 	FString LaserName;                  // the shot is a beam: an object with W3DLaserDraw that lives a moment
+	float RequestAssistRange = 0.f;     // firing it asks those of its kind this close to fire a clip too (AssistedTargetingUpdate)
 	FString LaserBoneName;              // ... from this bone of the shooter's model
 	FString FireSound;
 	int32 FireSoundLoopTime = 0;        // frames: the fire sound loops for as long as shots come no further apart than this
@@ -374,9 +393,19 @@ struct GENERALS1_API FGenSlowDeath
 	int32 ProbabilityModifier = 10;
 	TArray<FString> DeathTypes;         // raw DeathTypes tokens
 	TArray<FString> ExemptStatus;       // ... and the raw DieMuxData ExemptStatus tokens
+	TArray<FString> RequiredStatus;     // ... and RequiredStatus: every one of them must be set (a combat cycle's rider)
 	TArray<FString> FX[NumPhases];      // "FX = INITIAL name": one is picked at random per phase
 	TArray<FString> OCL[NumPhases];
 	TArray<FString> Weapons[NumPhases]; // "Weapon = FINAL name": fired where the object is
+	// BattleBusSlowDeathBehavior: the first death (UndeadBody) throws it up; it comes down as a bunker.
+	bool bBattleBus = false;
+	FString FXStartUndeath;
+	FString OCLStartUndeath;
+	FString FXHitGround;
+	FString OCLHitGround;
+	float ThrowForce = 1.f;
+	float PercentDamageToPassengers = 0.f;
+	int32 EmptyHulkDestructionDelay = 0; // frames: empty that long, the hulk kills itself (0: never)
 };
 
 /** One TransitionDamageFX entry: played when the body's damage state gets worse and reaches State. */
@@ -437,7 +466,7 @@ struct GENERALS1_API FGenHeliDeath
 };
 
 /** Die modules that all run when their DeathTypes apply (unlike slow deaths, where one is chosen). */
-enum class EGenDieModule : uint8 { FXList, CreateObject, Destroy, Instant, EjectPilot, CreateCrate };
+enum class EGenDieModule : uint8 { FXList, CreateObject, Destroy, Instant, EjectPilot, CreateCrate, RebuildHoleExpose };
 
 struct GENERALS1_API FGenDieModule
 {
@@ -445,6 +474,10 @@ struct GENERALS1_API FGenDieModule
 	TArray<FString> DeathTypes;
 	uint8 VeterancyMask = 0xF;          // DieMuxData VeterancyLevels: bit per level it applies at (regular .. heroic)
 	TArray<FString> ExemptStatus;       // ... and ExemptStatus: the raw tokens, e.g. "ALL -UNDER_CONSTRUCTION"
+	TArray<FString> RequiredStatus;     // ... and RequiredStatus: every one of them must be set
+	FString HoleName;                   // RebuildHoleExposeDie: the hole left behind ...
+	float HoleMaxHealth = 0.f;          // ... its health ...
+	bool bTransferAttackers = true;     // ... and whoever attacked the building attacks the hole
 	FString GroundOCL;                  // EjectPilotDie: what comes out of a wreck on the ground ...
 	FString AirOCL;                     // ... and out of one in the air
 	TArray<FString> FX;                 // FXListDie DeathFX / InstantDeathBehavior FX (random pick)
@@ -890,12 +923,25 @@ struct GENERALS1_API FGenDynamicShroud
 	float FinalVision = 0.f;
 };
 
+/** W3DProjectileStreamDraw: a strip of texture through a weapon's shots in flight (SegmentedLineClass, TILED_TEXTURE_MAP). */
+struct FGenStreamDraw
+{
+	bool bValid = false;
+	FString Texture;
+	float Width = 0.f;
+	float TileFactor = 0.f;            // times the texture repeats along each segment
+	float ScrollRate = 0.f;            // texture lengths a second it flows outwards
+	int32 MaxSegments = 0;             // only the newest so many points (0: all)
+};
+
+
 struct GENERALS1_API FGenThingTemplate
 {
 	FString Name;
 	TSharedPtr<FGenIniBlock> Block;  // merged entries (base + overrides)
 	TSet<FString> KindOf;            // upper case
 	bool bKindInfantry = false;      // KindOf INFANTRY (asked about every neighbour every frame by the steering)
+	bool bKindNoCollide = false;     // KindOf NO_COLLIDE: never collides with anything, nor is collided with (the mob's nexus)
 	FString Side;
 	FString EditorSorting;
 	TArray<FGenDrawModule> Draws;
@@ -969,6 +1015,14 @@ struct GENERALS1_API FGenThingTemplate
 	float OverchargeMinHealth = 0.f;    // ... until below this share (and not allowed to start then)
 	TArray<TArray<FString>> Prerequisites; // each entry: the player must own one of these objects
 	TArray<FString> PrerequisiteSciences;  // ... and all of these sciences (a general's promotion unlocks the unit)
+	/** Player::canBuildMoreOfType: the most of this type one player may have at once (0: unlimited).
+	 *  The special agents are the ones that use it - Colonel Burton, Jarmen Kell and Black Lotus have
+	 *  "MaxSimultaneousOfType = 1", so a player can only ever have one of each of them.
+	 *  "DeterminedBySuperweaponRestriction" is the lobby option; with no game info the original reads it
+	 *  as unlimited, and this game has no screen for it, so it comes through as 0. */
+	int32 MaxSimultaneousOfType = 0;
+	/** MaxSimultaneousLinkKey: templates that share it count as one type for that number (all superweapons). */
+	FString MaxSimultaneousLinkKey;
 	int32 ExperienceValue = 0;          // what destroying it is worth (regular level)
 	int32 SkillPointValue = -1;         // general's skill points for destroying it (-1: the experience value)
 	// Veterancy (ExperienceTracker): by level REGULAR, VETERAN, ELITE, HEROIC
@@ -987,6 +1041,21 @@ struct GENERALS1_API FGenThingTemplate
 	FGenHackInternet HackInternet;              // HackInternetAIUpdate
 	FGenStickyBomb StickyBomb;                  // StickyBombUpdate
 	FGenLaserDraw LaserDraw;                    // W3DLaserDraw: the object is nothing but a beam
+	FGenStreamDraw StreamDraw;                  // W3DProjectileStreamDraw: ... or the line through a weapon's shots in flight
+	bool bProjectileStream = false;             // ProjectileStreamUpdate: it keeps track of those shots (GenStreams.cpp)
+	/** BoneFXUpdate (with BoneFXDamage): FX lists, object creation lists and particle systems at model bones, a set
+	 *  for each body damage state, once or again and again (GenStreams.cpp). */
+	struct FBoneFX
+	{
+		enum EKind : uint8 { FXList, OCL, ParticleSystem };
+		EKind Kind = FXList;
+		int32 State = 0;                        // PRISTINE, DAMAGED, REALLYDAMAGED, RUBBLE
+		FString Bone;                           // "NULL": the object's own position
+		bool bOnlyOnce = true;
+		int32 MinDelay = 0, MaxDelay = 0;       // frames
+		FString Name;
+	};
+	TArray<FBoneFX> BoneFX;
 	FGenAutoDeposit AutoDeposit;                // AutoDepositUpdate
 	FGenOCLUpdate OCLUpdate;                    // OCLUpdate
 	FGenCrateCollide Crate;                     // MoneyCrateCollide, SalvageCrateCollide, UnitCrateCollide
@@ -1019,8 +1088,130 @@ struct GENERALS1_API FGenThingTemplate
 		bool bRequiresAllTriggers = false;
 		TArray<FString> TriggeredBy;
 		TArray<FString> ConflictsWith;
+		TArray<FString> DeathTypes;      // its DieMuxData: what deaths it goes off at, and in what state
+		TArray<FString> ExemptStatus;
+		TArray<FString> RequiredStatus;
 	};
 	TArray<FDeathWeapon> DeathWeapons;
+	/** PoisonedBehavior: poison damage taken goes on hurting - as much again every IntervalFrames, until DurationFrames after the last dose. */
+	struct FPoisoned
+	{
+		bool bValid = false;
+		int32 IntervalFrames = 0;
+		int32 DurationFrames = 0;
+	};
+	FPoisoned Poisoned;
+	bool bBaseRegenerate = false;               // BaseRegenerateUpdate: mends itself (GameData's BaseRegen...) once not hurt for a while
+	/** HordeUpdate: with enough of its kind close by it is in a horde (the HORDE weapon bonus, and NATIONALISM / FANATICISM). */
+	struct FHorde
+	{
+		bool bValid = false;
+		int32 UpdateRate = 30;                  // frames
+		TArray<FString> KindOf;                 // all of these (upper case)
+		int32 Count = 0;                        // a horde is this many, itself included ...
+		float Radius = 0.f;                     // ... this close (bounding spheres apart)
+		float RubOffRadius = 20.f;              // this close to one in the thick of a horde, it is in it too
+		bool bAlliesOnly = true;
+		bool bExactMatch = false;
+		bool bAllowedNationalism = true;
+	};
+	FHorde Horde;
+	/** DeployStyleAIUpdate: it unpacks before it can fire and packs up before it can move (the Nuke Cannon, the sentry drone). */
+	struct FDeploy
+	{
+		bool bValid = false;
+		int32 UnpackFrames = 0;
+		int32 PackFrames = 0;
+		bool bTurretsOnlyWhenDeployed = false;  // TurretsFunctionOnlyWhenDeployed
+		bool bTurretsMustCenter = false;        // TurretsMustCenterBeforePacking
+		bool bManualAnimations = false;         // ManualDeployAnimations: the pack / unpack animation is stepped by the logic
+	};
+	FDeploy Deploy;
+	/** AssaultTransportAIUpdate (the Troop Crawler): what its DEPLOY weapon is fired at, its riders get out and attack. */
+	struct FAssaultTransport
+	{
+		bool bValid = false;
+		float HealRatio = 0.f;                  // MembersGetHealedAtLifeRatio: below this they come back in to heal
+	};
+	FAssaultTransport AssaultTransport;
+	float SecondLifeMaxHealth = 0.f;            // UndeadBody: the first death is a change of state (the Battle Bus)
+	/** RebuildHoleBehavior: a GLA building's hole - a worker comes out after a while and builds the building again. */
+	struct FRebuildHole
+	{
+		bool bValid = false;
+		FString WorkerName;
+		int32 WorkerRespawnFrames = 0;
+		float RegenPercentPerSecond = 0.001f;   // HoleHealthRegen%PerSecond
+	};
+	FRebuildHole RebuildHole;
+	/** FireOCLAfterWeaponCooldownUpdate: a weapon kept firing leaves something behind when it stops - the longer
+	 *  it fired, the longer that lasts (the toxin truck's puddles). */
+	struct FFireOCLAfterCooldown
+	{
+		int32 Slot = 0;
+		FString OCL;
+		int32 MinShots = 1;
+		float LifetimeMsPerSecond = 1000.f;     // OCLLifetimePerSecond
+		int32 MaxFrames = 1000;                 // OCLLifetimeMaxCap
+		TArray<FString> TriggeredBy;            // its UpgradeMux
+		TArray<FString> ConflictsWith;
+		bool bRequiresAllTriggers = false;
+	};
+	TArray<FFireOCLAfterCooldown> FireOCLAfterCooldown;
+	/** AssistedTargetingUpdate: one of its kind firing a RequestAssistRange weapon near it gets it to fire a clip too (Patriots). */
+	struct FAssistedTargeting
+	{
+		bool bValid = false;
+		int32 ClipSize = 0;
+		int32 Slot = 1;
+		FString LaserFromAssisted;
+		FString LaserToTarget;
+	};
+	FAssistedTargeting AssistedTargeting;
+	/** AutoFindHealingUpdate: a computer player's hurt unit, idle, goes to the nearest HEAL_PAD to be healed. */
+	struct FAutoFindHealing
+	{
+		bool bValid = false;
+		int32 ScanFrames = 0;
+		float ScanRange = 0.f;
+		float NeverHeal = 0.95f;
+		float AlwaysHeal = 0.25f;
+	};
+	FAutoFindHealing AutoFindHealing;
+	/** CleanupHazardUpdate: the ambulance cleans up the toxins and radiation (CLEANUP_HAZARD) near it by itself,
+	 *  or - CleanupAreaPower - all of them round a spot it is sent to (GenCleanup.cpp). */
+	struct FCleanupHazard
+	{
+		bool bValid = false;
+		int32 WeaponSlot = 0;
+		int32 ScanFrames = 0;               // ScanRate
+		float ScanRange = 0.f;
+	};
+	FCleanupHazard CleanupHazard;
+	bool bWanderAI = false;                     // WanderAIUpdate: idle, it wanders off a little way (a fire wall's flames, a burning man)
+	/** RailroadBehavior (RailroadGuideAIUpdate.cpp): a train - a locomotive on the waypoint track it stands on, pulling its cars. */
+	struct FRailroad
+	{
+		bool bValid = false;
+		bool bIsLocomotive = false;
+		TArray<FString> CarriageTemplates;      // what a locomotive makes and hitches when no car stands behind it
+		float RunningGarrisonSpeedMax = 1.f;    // slower than this, units may climb aboard (speeds per 30 Hz frame, as the data's)
+		float KillSpeedMin = 1.f;               // faster than this, the locomotive kills what it hits
+		float SpeedMax = 4.f;
+		float Acceleration = 1.01f;             // a factor a frame
+		float Braking = 0.99f;
+		float Friction = 0.97f;                 // a car without its locomotive coasts to a stop
+		int32 WaitAtStationFrames = 150;
+		FString RunningSound;
+		FString ClicketyClackSound;
+		FString WhistleSound;
+		FString BigMetalBounceSound;
+		FString SmallMetalBounceSound;
+		FString MeatyBounceSound;
+	};
+	FRailroad Railroad;
+	int32 LockWeaponSlot = INDEX_NONE;          // LockWeaponCreate: this slot is locked for good from the start
+	int32 AnimationSteeringFrames = -1;  // AnimationSteeringUpdate MinTransitionTime (frames; < 0: none) - a combat cycle leans into its turns
 	bool bHasDeletion = false;                  // DeletionUpdate: silently removed after a while
 	int32 DeletionMin = 0;
 	int32 DeletionMax = 0;
@@ -1095,17 +1286,31 @@ struct GENERALS1_API FGenThingTemplate
 	// SpawnBehavior (OneShot): units a finished building comes with (a supply center's first gatherer)
 	FString SpawnTemplate;
 	int32 SpawnNumber = 0;
-	/** SpawnBehavior that keeps its units (not OneShot): the stinger site's soldiers, each replaced a while after
-	 *  it dies (GenSpawner.cpp). */
+	/** SpawnBehavior that keeps its units (not OneShot): the stinger site's soldiers, the angry mob's members,
+	 *  each replaced a while after it dies (GenSpawner.cpp). */
 	struct FSpawner
 	{
 		bool bValid = false;
-		FString Template;                   // SpawnTemplateName
+		TArray<FString> Templates;          // SpawnTemplateName: "a list of template names", made in turn, round and round
 		int32 Number = 0;                   // SpawnNumber
 		int32 ReplaceFrames = 0;            // SpawnReplaceDelay
 		bool bRequireSpawner = false;       // SpawnedRequireSpawner: they die with it
+		int32 InitialBurst = 0;             // InitialBurst: the first so many leave by the door of the barracks that made it
+		bool bExitByBudding = false;        // ExitByBudding: a new one appears where the one nearest the spawner stands
+		bool bAggregateHealth = false;      // AggregateHealth: its health is theirs together, and it goes when they have all gone
+		bool bSlavesHaveFreeWill = false;   // SlavesHaveFreeWill: an attack order for it isn't passed on to them
 	};
 	FSpawner Spawner;
+	/** MobMemberSlavedUpdate: one of an angry mob, kept with the invisible nexus that spawned it (GenSpawner.cpp). */
+	struct FMobMember
+	{
+		bool bValid = false;
+		float MustCatchUpRadius = 0.f;      // further from the nexus than this, it hurries after it
+		float NoNeedToCatchUpRadius = 0.f;
+		float Squirrelliness = 0.f;         // the share of the mob that may pick targets of its own
+		int32 CatchUpCrisisBailTime = 0;    // over three times that far for this many looks, it gives up (dies)
+	};
+	FMobMember MobMember;
 	FString SpawnPointBone;             // SpawnPointProductionExitUpdate: they stand at these bones ("SpawnPoint01.."), held there
 	TArray<FString> HivePropagateDamage; // HiveStructureBody: damage of these types goes to the spawn nearest the shooter ...
 	TArray<FString> HiveSwallowDamage;  // ... and of these types is lost when there is none
@@ -1320,6 +1525,8 @@ public:
 	const FGenTerrainType* FindTerrain(const FString& Name) const;
 	const FGenLocomotorTemplate* FindLocomotor(const FString& Name) const;
 	const FGenPlayerTemplate* FindPlayerTemplate(const FString& Name) const;
+	/** The BaseSide ("USA", "China", "GLA") of the player template whose Side that is; empty if none. */
+	const FString& BaseSideOf(const FString& Side) const;
 	const TArray<FGenPlayerTemplate>& GetPlayerTemplates() const { return PlayerTemplates; }
 	const TMap<FString, TSharedPtr<FGenThingTemplate>>& GetTemplates() const { return Templates; }
 
@@ -1329,6 +1536,9 @@ public:
 	/** GameData.ini AutoFireParticle... / AutoSmokeParticle... / AutoAflameParticle...: small, medium and large fire, the same of smoke, then "aflame". */
 	FGenAutoParticles AutoParticles[7];
 
+	/** GameData.ini BaseRegenHealthPercentPerSecond / BaseRegenDelay (frames): BaseRegenerateUpdate's mending. */
+	float BaseRegenHealthPercentPerSecond = 0.f;
+	int32 BaseRegenDelay = 0;
 	/** GameData.ini Gravity, per frame^2 (negative). */
 	float Gravity = -1.f;
 	float UnitDamagedThreshold = 0.5f;

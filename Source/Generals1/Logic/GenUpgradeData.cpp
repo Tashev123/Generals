@@ -148,7 +148,8 @@ bool FGenUpgradeData::Initialize()
 			TEXT("SPECIAL_GPS_SCRAMBLER"), TEXT("SPECIAL_INFANTRY_CAPTURE_BUILDING"), TEXT("SPECIAL_BLACKLOTUS_CAPTURE_BUILDING"),
 			TEXT("SPECIAL_BLACKLOTUS_DISABLE_VEHICLE_HACK"), TEXT("SPECIAL_BLACKLOTUS_STEAL_CASH_HACK"), TEXT("SPECIAL_HACKER_DISABLE_BUILDING"),
 			TEXT("SPECIAL_REMOTE_CHARGES"), TEXT("SPECIAL_TIMED_CHARGES"), TEXT("SPECIAL_TANKHUNTER_TNT_ATTACK"), TEXT("SPECIAL_BOOBY_TRAP"),
-			TEXT("SPECIAL_MISSILE_DEFENDER_LASER_GUIDED_MISSILES"), TEXT("SPECIAL_SCUD_STORM"), TEXT("SPECIAL_NEUTRON_MISSILE"), TEXT("SPECIAL_PARTICLE_UPLINK_CANNON"), TEXT("SPECIAL_FRENZY"), TEXT("SPECIAL_LEAFLET_DROP"), TEXT("SPECIAL_CLUSTER_MINES"), TEXT("SPECIAL_SPECTRE_GUNSHIP"), TEXT("SPECIAL_SNEAK_ATTACK"), TEXT("SPECIAL_DISGUISE_AS_VEHICLE"), TEXT("SPECIAL_CHANGE_BATTLE_PLANS"), TEXT("SPECIAL_HELIX_NAPALM_BOMB") };
+			TEXT("SPECIAL_MISSILE_DEFENDER_LASER_GUIDED_MISSILES"), TEXT("SPECIAL_SCUD_STORM"), TEXT("SPECIAL_NEUTRON_MISSILE"), TEXT("SPECIAL_PARTICLE_UPLINK_CANNON"), TEXT("SPECIAL_FRENZY"), TEXT("SPECIAL_LEAFLET_DROP"), TEXT("SPECIAL_CLUSTER_MINES"), TEXT("SPECIAL_SPECTRE_GUNSHIP"), TEXT("SPECIAL_SNEAK_ATTACK"), TEXT("SPECIAL_DISGUISE_AS_VEHICLE"), TEXT("SPECIAL_CHANGE_BATTLE_PLANS"), TEXT("SPECIAL_HELIX_NAPALM_BOMB"),
+			TEXT("SPECIAL_CLEANUP_AREA"), TEXT("SPECIAL_TANK_PARADROP") };
 		// (The generals' own variants carry a prefix: EARLY_SPECIAL_..., AIRF_SPECIAL_...)
 		const int32 EnumAt = P.Enum.Find(TEXT("SPECIAL_"), ESearchCase::IgnoreCase);
 		const FString BaseEnum = EnumAt != INDEX_NONE ? P.Enum.Mid(EnumAt) : P.Enum;
@@ -263,6 +264,16 @@ bool FGenUpgradeData::ParseUpgradeModule(const FString& Type, const FGenIniBlock
 		Out.OCL = Block.GetString(TEXT("UpgradeObject"));
 	}
 	else if (Is(TEXT("PassengersFireUpgrade"))) { Out.Effect = EGenUpgradeEffect::PassengersFire; }
+	else if (Is(TEXT("ReplaceObjectUpgrade")))
+	{
+		Out.Effect = EGenUpgradeEffect::ReplaceObject;
+		Out.ReplaceObject = Block.GetString(TEXT("ReplaceObject"));
+	}
+	else if (Is(TEXT("ExperienceScalarUpgrade")))
+	{
+		Out.Effect = EGenUpgradeEffect::ExperienceScalar;
+		Out.AddXPScalar = Block.GetFloat(TEXT("AddXPScalar"), 0.f);
+	}
 	else if (Is(TEXT("CostModifierUpgrade")))
 	{
 		Out.Effect = EGenUpgradeEffect::CostModifier;
@@ -345,6 +356,12 @@ bool FGenUpgradeData::ParseSpecialPowerModule(const FString& Type, const FGenIni
 	{
 		Out.Type = EGenPowerModule::SpecialAbility;
 		Out.InitiateSound = Block.GetString(TEXT("InitiateSound"));
+	}
+	else if (Type.Equals(TEXT("CleanupAreaPower"), ESearchCase::IgnoreCase))
+	{
+		Out.Type = EGenPowerModule::CleanupArea;
+		Out.InitiateSound = Block.GetString(TEXT("InitiateSound"));
+		Out.CleanupMoveRange = Block.GetFloat(TEXT("MaxMoveDistanceFromLocation"), 0.f);
 	}
 	return true;
 }

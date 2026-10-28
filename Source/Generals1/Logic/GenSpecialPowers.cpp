@@ -242,6 +242,21 @@ bool UGenGameLogic::FireSpecialPower(FGenObject& Source, int32 Module, const FVe
 		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [ability f%u] #%u p%d %s sets off to use %s on #%u"), Frame, Source.GetID(), Player, *Source.GetTemplate()->Name, *T.Name, TargetObj);
 		return true;
 	}
+	case EGenPowerModule::CleanupArea:
+	{
+		// CleanupAreaPower::doSpecialPowerAtLocation: "if (getObject()->isDisabled()) return;" - and its
+		// CleanupHazardUpdate takes it from there.
+		if (Source.IsDisabled() || !Source.GetTemplate()->CleanupHazard.bValid)
+		{
+			return false;
+		}
+		Source.OnPlayerCommand(false);
+		Source.SetCleanupAreaParameters(TargetPos, M.CleanupMoveRange);
+		PlaySoundAt(M.InitiateSound, Source);
+		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [cleanup f%u] #%u p%d %s is sent to clean up round (%.0f, %.0f), %.0f about"), Frame, Source.GetID(), Player,
+			*Source.GetTemplate()->Name, TargetPos.X, TargetPos.Y, M.CleanupMoveRange);
+		break;
+	}
 	case EGenPowerModule::OCL:
 	{
 		// OCLSpecialPower::findOCL: the strongest version whose science the player owns.

@@ -119,6 +119,10 @@ void AGenPlayerController::PlayerTick(float DeltaTime)
 			}
 		}
 	}
+	if (UGenGameLogic* SelLogic = UGenGameLogic::Get(this); SelLogic && SelLogic->IsRunning())
+	{
+		MaintainSelection(SelLogic);
+	}
 	ControlBar.Layout(UGenGameLogic::Get(this), Selection, FVector2D(ViewX, ViewY));
 	// The controls page's mouse: held in the window, and the pointer's own speed - while a game is on.
 	const bool bPlaying = IsPlayingWithMouse();
@@ -716,6 +720,12 @@ const FGenObject* AGenPlayerController::FindSpeaker(const TArray<FGenObjectID>& 
 	for (FGenObjectID Id : Units)
 	{
 		const FGenObject* O = Logic ? Logic->FindObject(Id) : nullptr;
+		if (O && O->IsKindOf(TEXT("IGNORED_IN_GUI")))
+		{
+			// CommandXlat: no voices from the members of a mob ("if (obj->isKindOf( KINDOF_IGNORED_IN_GUI )) continue"):
+			// its nexus speaks for them (as InGameUI makes the hint over one the nexus's).
+			O = Logic->FindObject(O->GetMobSlaver());
+		}
 		if (O && Logic->CanPlayerCommand(Logic->GetLocalPlayer(), *O) && !O->IsDead())
 		{
 			return O;
@@ -1713,7 +1723,50 @@ void AGenPlayerController::UpdateSelectionInput(float MX, float MY, bool bHasMou
 		}
 		Logic->IssueCreateFormation(Own);
 	}
+}
 
+void AGenPlayerController::MaintainSelection(UGenGameLogic* Logic)
+{
+	// (Every tick, input or none: what the logic does to the selected - riders changing places, a mob's
+	// members, deaths - before the control bar looks at it.)
+	// RiderChangeContain: a soldier selected getting onto a combat cycle hands the selection to the bike, and the
+	// bike to its rider getting off.
+	for (const UGenGameLogic::FSelectionHandoff& H : Logic->GetSelectionHandoffs())
+	{
+		const FGenObject* To = Logic->FindObject(H.To);
+		if (Selection.Contains(H.From) && To && To->IsSelectable() && To->GetOwner() == Logic->GetLocalPlayer())
+		{
+			Selection.AddUnique(H.To);
+		}
+	}
+	// SpawnBehavior::computeAggregateStates: "IF ANY ONE OF MY SPAWN ARE SELECTED RIGHT NOW, I JUST SET THEM ALL
+	// SELECTED ... THIS WAY WE ARE ALWAYS ONE BIG HAPPY MOB" - and the angry mob's nexus with them.
+	TArray<FGenObjectID, TInlineAllocator<4>> Mobs;
+	for (FGenObjectID Id : Selection)
+	{
+		const FGenObject* O = Logic->FindObject(Id);
+		if (O && O->GetMobSlaver() != GenInvalidObjectID)
+		{
+			Mobs.AddUnique(O->GetMobSlaver());
+		}
+	}
+	for (FGenObjectID NexusId : Mobs)
+	{
+		const FGenObject* Nexus = Logic->FindObject(NexusId);
+		if (!Nexus || !Nexus->IsSelectable())
+		{
+			continue;
+		}
+		Selection.AddUnique(NexusId);
+		for (FGenObjectID SpawnId : Nexus->GetSpawns())
+		{
+			const FGenObject* Member = Logic->FindObject(SpawnId);
+			if (Member && Member->IsSelectable())
+			{
+				Selection.AddUnique(SpawnId);
+			}
+		}
+	}
 	// Drop objects that died, no longer exist, or have gone back into the fog of war.
 	Selection.RemoveAll([Logic](FGenObjectID Id)
 	{

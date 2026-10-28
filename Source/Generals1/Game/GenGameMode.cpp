@@ -320,7 +320,9 @@ bool AGenGameMode::BeginMatch(const FGenMatchSettings& Settings, bool bFromMenu,
 		if (Parts.Num() >= 4)
 		{
 			Cam->CameraHeight = FCString::Atof(*Parts[3]);
+			// ResetView goes back to the height a match starts at, so the one asked for has to be set after it.
 			Cam->ResetView();
+			Cam->SetHeight(FCString::Atof(*Parts[3]));
 		}
 		if (Parts.Num() >= 3)
 		{
@@ -431,10 +433,14 @@ bool AGenGameMode::BeginGame(const FString& MapName, const TArray<FGenSkirmishSl
 		EnemyList.ParseIntoArray(Names, TEXT(","));
 		for (int32 i = 0; i < Names.Num() && EnemyPlayer != INDEX_NONE; ++i)
 		{
-			if (const FGenThingTemplate* T = FGenGameData::Get().FindTemplate(Names[i]))
+			// ("Template@x:y" puts that one at its own spot, as -GenObject does.)
+			FString Entry = Names[i], PlaceText, PlaceX, PlaceY;
+			const bool bPlaced = Names[i].Split(TEXT("@"), &Entry, &PlaceText) && PlaceText.Split(TEXT(":"), &PlaceX, &PlaceY);
+			if (const FGenThingTemplate* T = FGenGameData::Get().FindTemplate(bPlaced ? Entry : Names[i]))
 			{
-				const float X = At.X + (float(i) - (Names.Num() - 1) * 0.5f) * 40.f;
-				if (const FGenObject* O = Logic->CreateObject(T, EnemyPlayer, FVector3f(X, At.Y, Logic->GetGroundHeight(X, At.Y)), FMath::DegreesToRadians(-90.f)))
+				const float X = bPlaced ? FCString::Atof(*PlaceX) : At.X + (float(i) - (Names.Num() - 1) * 0.5f) * 40.f;
+				const float Y = bPlaced ? FCString::Atof(*PlaceY) : At.Y;
+				if (const FGenObject* O = Logic->CreateObject(T, EnemyPlayer, FVector3f(X, Y, Logic->GetGroundHeight(X, Y)), FMath::DegreesToRadians(-90.f)))
 				{
 					if (TestAttackTarget == GenInvalidObjectID) { TestAttackTarget = O->GetID(); }
 				}
@@ -1225,24 +1231,29 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 			Arg.ParseIntoArray(Units, TEXT(","));
 			for (const FString& Unit : Units)
 			{
-				bool bQueued = false;
+				const FGenThingTemplate* T = FGenGameData::Get().FindTemplate(Unit);
+				bool bQueued = false, bRefused = false;
+				FString Why;
 				for (FGenObjectID Id : Logic->GetObjectIDs())
 				{
 					const FGenObject* O = Logic->FindObject(Id);
 					const FGenCommandSet* Set = (O && O->GetOwner() == Local && O->GetTemplate()->bHasProduction && !O->IsUnderConstruction())
 						? FGenCommandData::Get().FindSet(O->GetCommandSet()) : nullptr;
-					for (int32 s = 0; Set && s < FGenCommandSet::NumSlots && !bQueued; ++s)
+					for (int32 s = 0; Set && s < FGenCommandSet::NumSlots && !bQueued && !bRefused; ++s)
 					{
 						const FGenCommandButton* Btn = FGenCommandData::Get().FindButton(Set->Slots[s]);
 						if (Btn && Btn->Command == EGenCommand::UnitBuild && Btn->Object.Equals(Unit, ESearchCase::IgnoreCase))
 						{
+							// What the control bar would say about it (the limit a type has, prerequisites, money).
+							if (T && !Logic->CanMake(Local, *T, &Why)) { bRefused = true; break; }
 							Logic->IssueQueueUnit(Id, Unit);
 							bQueued = true;
 						}
 					}
-					if (bQueued) { break; }
+					if (bQueued || bRefused) { break; }
 				}
-				UE_LOG(LogGenerals, Log, TEXT("Test queue: %s %s"), *Unit, bQueued ? TEXT("queued") : TEXT("has no factory"));
+				UE_LOG(LogGenerals, Log, TEXT("Test queue: %s %s"), *Unit,
+					bQueued ? TEXT("queued") : bRefused ? *FString::Printf(TEXT("refused: %s"), *Why) : TEXT("has no factory"));
 			}
 		}
 		AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC);
@@ -1974,6 +1985,31 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 				}
 				Logic->IssueMove(Units, FVector3f(At.X, At.Y, Logic->GetGroundHeight(At.X, At.Y)));
 				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: move %d units to (%.0f, %.0f)"), Logic->GetFrame(), Units.Num(), At.X, At.Y);
+			}
+			else if ((What.Equals(TEXT("selecttype"), ESearchCase::IgnoreCase) && Parts.Num() >= 3) || What.Equals(TEXT("selection"), ESearchCase::IgnoreCase))
+			{
+				// "frame,selecttype,Type": selects the first of ours of that type, as -GenTestSelect does at the start;
+				// "frame,selection": what is selected now (after the controller's own additions, a mob's members).
+				AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC);
+				if (GenPC && What.Equals(TEXT("selecttype"), ESearchCase::IgnoreCase))
+				{
+					for (FGenObjectID Id : Logic->GetObjectIDs())
+					{
+						const FGenObject* O = Logic->FindObject(Id);
+						if (O && O->GetOwner() == Local && !O->IsDead() && O->GetTemplate()->Name.Equals(Parts[2], ESearchCase::IgnoreCase))
+						{
+							GenPC->SetSelection({ Id });
+							break;
+						}
+					}
+				}
+				TArray<FString> Names;
+				for (FGenObjectID Id : GenPC ? GenPC->GetSelection() : TArray<FGenObjectID>())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					Names.Add(O ? FString::Printf(TEXT("#%u %s"), Id, *O->GetTemplate()->Name) : FString::Printf(TEXT("#%u"), Id));
+				}
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: %s - %d selected: %s"), Logic->GetFrame(), *What, Names.Num(), *FString::Join(Names, TEXT(", ")));
 			}
 			else if (What.Equals(TEXT("desync"), ESearchCase::IgnoreCase))
 			{
