@@ -1845,6 +1845,33 @@ it would replace only the route, not the steering).
 - [ ] Not done: the destination of a big group still takes a few seconds to settle (late arrivals ease in
       among the parked ones); soldiers among soldiers keep the original's pass-through
 
+## Done (the user's report of 2026-10-27: a full-health helicopter still gets the airfield cursor)
+"With a damaged helicopter selected, hovering over an airport gives the cursor of three arrows pointing down, and
+clicking sends it there to be repaired. If the helicopter is full hp, I should not be able to even get that cursor."
+
+- [x] What the original does, in two places - and the cursor is one of them. `ActionManager::canGetRepairedAt`
+      has "if I am at full health, I can't get repair there", and `InGameUI::canSelectedObjectsDoAction` (the hint
+      that chooses the cursor) asks that same function. The other is `canEnterObject`'s special case for aircraft
+      (ActionManager.cpp:578): an airfield takes in only a craft of the same player that has a place there,
+      `hasReservedSpace(obj)` or `shouldReserveDoorWhenQueued(template) && hasAvailableSpaceFor(template)` -
+      and `shouldReserveDoorWhenQueued` is false for `KINDOF_PRODUCED_AT_HELIPAD` (ParkingPlaceBehavior.cpp:291),
+      so a helicopter built on the helipad never has a place and is not taken in at all; what was showing at full
+      health was the landing cursor, `EnterFriendly`, not the repair one. A plane built at the airfield does have
+      a place reserved for it, so it keeps its enter cursor.
+- [x] Port: `FGenParkingPlace::ShouldReserveDoorWhenQueued`, `UGenGameLogic::CanLandAtAirfield` (that special
+      case, with the same controlling player and `isAboveTerrain`), and `AGenPlayerController::EvaluateClick`'s
+      aircraft branch asks it instead of taking any selected `bJetAI` unit. The decision order still puts the
+      repair before the landing, as `CommandXlat` does (GET_REPAIRED_AT at 1815 before ENTER_OBJECT at 1966), so a
+      damaged craft gets its repair cursor and order as before, and a landed helipad craft at full health goes
+      back up at once (JetAIUpdate) as it did.
+- [x] Tested in a window (the cursor path needs the platform itself): airfield at 1170,520 on Tournament Desert,
+      a Comanche selected, mouse held over it. Full health: the airfield is hovered and the cursor is plain
+      `Select`, nothing to do with it. At 88 / 220 the same spot gives `GetRepaired` and the click sends it to be
+      mended. Recipe: `-Window -Cam "1170,520,0,300" -Objects "AmericaAirfield@1170:520,
+      AmericaVehicleComanche@1150:600" -TestSelect AmericaVehicleComanche -TestPowers
+      "200,pick,1170,520,hover;300,damage,AmericaVehicleComanche,40;350,pick,1170,520,hover"`, grep `pick at`
+      and `[cursor]`. Confirmed in the editor by the user.
+
 ## Next
 (Performance: no profiling between milestones - one review at the very end, the user's word of
 2026-10-12. Things to look at then are noted where they are made: FindGroundPath asks for the

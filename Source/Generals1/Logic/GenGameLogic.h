@@ -405,6 +405,8 @@ public:
 	// --- garrisons and transports (GenContain.cpp) ---
 	/** ActionManager::canEnterObject: that unit may get into that transport, building or tunnel. */
 	bool CanEnterObject(const FGenObject& Unit, const FGenObject& Container, bool bCheckCapacity = true) const;
+	/** ActionManager::canEnterObject's special case for aircraft: that craft may come down at that airfield (a craft built on the helipad has no place there, so it may only be mended). */
+	bool CanLandAtAirfield(const FGenObject& Unit, const FGenObject& Airfield) const;
 	/** Sabotage...CrateCollide::isValidToExecute: the unit (a saboteur) has something to do to that building. */
 	bool CanSabotage(const FGenObject& Unit, const FGenObject& Building) const;
 	/** Sabotage...CrateCollide::executeCrateBehavior, every one that applies; the saboteur is gone afterwards. */

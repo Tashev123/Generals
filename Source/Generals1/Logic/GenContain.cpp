@@ -239,6 +239,30 @@ bool UGenGameLogic::CanEnterObject(const FGenObject& Unit, const FGenObject& Con
 	return IsValidContainerFor(Container, Unit, bCheckCapacity);
 }
 
+bool UGenGameLogic::CanLandAtAirfield(const FGenObject& Unit, const FGenObject& Airfield) const
+{
+	// ActionManager::canEnterObject's special case for aircraft: an airfield takes in only a craft of the same
+	// player, and only one that has a place there. A craft built on the helipad is never given one, so a healthy
+	// helicopter is not taken in at all - a damaged one comes to the airfield through the repair path instead, and
+	// takes off again as soon as it is mended.
+	if (!Unit.IsKindOf(TEXT("AIRCRAFT")) || !Airfield.IsKindOf(TEXT("FS_AIRFIELD")))
+	{
+		return false;
+	}
+	const FGenParkingPlace* PP = Airfield.GetParking();
+	if (!PP || Unit.GetOwner() != Airfield.GetOwner())
+	{
+		return false;
+	}
+	const FVector3f& P = Unit.GetPosition();
+	if (P.Z - GetGroundHeight(P.X, P.Y) <= 0.f)
+	{
+		return false; // isAboveTerrain: only a craft in the air is asked to come down
+	}
+	return PP->HasReservedSpace(Unit.GetID())
+		|| (PP->ShouldReserveDoorWhenQueued(*Unit.GetTemplate()) && PP->HasAvailableSpaceFor(*Unit.GetTemplate()));
+}
+
 bool UGenGameLogic::IsPassengerAllowedToFire(const FGenObject& Container, const FGenObject& Rider) const
 {
 	const FGenContainData& D = Container.GetTemplate()->Contain;

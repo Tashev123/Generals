@@ -266,6 +266,8 @@ public:
 	bool HasReservedSpace(FGenObjectID Id) const;
 	/** A free space for one more aircraft of this kind (helicopters built on the helipad need none). */
 	bool HasAvailableSpaceFor(const FGenThingTemplate& Thing) const;
+	/** Whether one of this kind gets a door when it is queued at the airfield (the helipad craft never do). */
+	bool ShouldReserveDoorWhenQueued(const FGenThingTemplate& Thing) const;
 	/** Keeps (or takes) a parking space for the aircraft; OutInfo, if given, says where everything is. */
 	bool ReserveSpace(FGenObjectID Id, float ParkingOffset, FGenParkingInfo* OutInfo);
 	bool CalcInfo(FGenObjectID Id, FGenParkingInfo& OutInfo);
@@ -1111,6 +1113,9 @@ private:
 	void InitStealth();
 	void UpdateStealth(uint32 Frame);
 	bool AllowedToStealth(uint32 Frame);
+	/** SpawnBehavior::areAllSlavesStealthed: the units it keeps are stealthed as one group with it, so when one
+	 *  of them may not be, all of them are shown up and none of them may. */
+	bool AllSpawnsAllowedToStealth(uint32 Frame);
 	void UpdateStealthDetector(uint32 Frame);
 	/** False once the marker has done its last scan and removed itself. */
 	bool UpdateGrantStealth();

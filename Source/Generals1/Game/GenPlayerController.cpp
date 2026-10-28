@@ -2138,14 +2138,17 @@ void AGenPlayerController::EvaluateClick(FGenObjectID Hit, float MX, float MY, F
 			if (O && Logic->CanPlayerCommand(Local, *O) && Logic->CanTransferSuppliesAt(*O, *HitObj)) { Gatherers.Add(Id); }
 		}
 	}
-	// Aircraft of ours in the selection land at an airfield of ours when it is clicked.
+	// Aircraft of ours in the selection land at an airfield of ours when it is clicked - but only one that airfield
+	// would take in, which is a craft that has a place there. A helicopter built on the helipad is never given a
+	// place, so at full health it gets nothing from the airfield at all; the damaged one is a patient and the cursor
+	// comes from that instead.
 	TArray<FGenObjectID> Aircraft;
 	if (bOwn && HitObj->GetParking() && !HitObj->IsUnderConstruction())
 	{
 		for (FGenObjectID Id : Selection)
 		{
 			const FGenObject* O = Logic->FindObject(Id);
-			if (O && Logic->CanPlayerCommand(Local, *O) && O->GetTemplate()->bJetAI) { Aircraft.Add(Id); }
+			if (O && Logic->CanPlayerCommand(Local, *O) && Logic->CanLandAtAirfield(*O, *HitObj)) { Aircraft.Add(Id); }
 		}
 	}
 	// Dozers of ours in the selection mend a damaged building when it is clicked; damaged vehicles

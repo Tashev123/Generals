@@ -275,6 +275,11 @@ bool FGenParkingPlace::HasAvailableSpaceFor(const FGenThingTemplate& Thing) cons
 	return false;
 }
 
+bool FGenParkingPlace::ShouldReserveDoorWhenQueued(const FGenThingTemplate& Thing) const
+{
+	return !IsHelipadUnit(Thing);
+}
+
 bool FGenParkingPlace::ReserveSpace(FGenObjectID Id, float ParkingOffset, FGenParkingInfo* OutInfo)
 {
 	PurgeDead();
