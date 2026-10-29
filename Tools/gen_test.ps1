@@ -53,7 +53,8 @@ $log = Join-Path $PSScriptRoot "..\Saved\Logs\GenTest.log"
 
 if ($Build) {
     $ErrorActionPreference = "Continue"
-    $out = & cmd /c "`"$ue\Engine\Build\BatchFiles\Build.bat`" Generals1Editor Win64 Development `"-Project=$proj`" -WaitMutex 2>&1"
+    # (-DisablePlugin=Fab: see gen_build.ps1)
+    $out = & cmd /c "`"$ue\Engine\Build\BatchFiles\Build.bat`" Generals1Editor Win64 Development `"-Project=$proj`" -WaitMutex -DisablePlugin=Fab 2>&1"
     $ErrorActionPreference = "Stop"
     $errors = $out | Select-String -Pattern ": (fatal )?error |Result:"
     $errors | ForEach-Object { $_.Line }

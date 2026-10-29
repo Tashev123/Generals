@@ -9,7 +9,10 @@ $proj = (Resolve-Path (Join-Path $PSScriptRoot '..\Generals1.uproject')).Path
 $src = (Resolve-Path (Join-Path $PSScriptRoot '..\Source')).Path
 Enter-GenLock
 try {
-    $out = & cmd /c "`"$ue\Engine\Build\BatchFiles\Build.bat`" Generals1Editor Win64 Development `"-Project=$proj`" -WaitMutex 2>&1"
+    # -DisablePlugin=Fab: the launcher updated the engine's Fab plugin on 2026-10-28 with a module (FabToolset) that
+    # the installed engine's precompiled build rules don't have, and every build stopped at "RulesError". The
+    # project doesn't use Fab; the editor still loads its precompiled binaries.
+    $out = & cmd /c "`"$ue\Engine\Build\BatchFiles\Build.bat`" Generals1Editor Win64 Development `"-Project=$proj`" -WaitMutex -DisablePlugin=Fab 2>&1"
     $code = $LASTEXITCODE
 } finally { Exit-GenLock }
 # (compiler and linker errors from anywhere, warnings only from this project's files)
