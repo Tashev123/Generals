@@ -6,6 +6,7 @@
 #include "Core/GenPerf.h"
 #include "Engine/EngineBaseTypes.h"
 #include "Logic/GenLogicTypes.h"
+#include "Logic/GenMapScripts.h"
 #include "Logic/GenMatch.h"
 #include "Logic/GenObject.h"
 #include "Logic/GenPartition.h"
@@ -88,6 +89,11 @@ struct GENERALS1_API FGenPlayer
 {
 	int32 Index = 0;
 	FString Name;
+	/** A campaign map's side: the name its scripts call the player by ("The_Player"), and how it sees each other
+	 *  player (Player::m_playerRelations; who isn't listed is Neutral). Skirmish players have neither: teams decide. */
+	FString ScriptName;
+	TMap<int32, EGenRelationship> Relations;
+	bool bScriptRelations = false;
 	const FGenPlayerTemplate* Template = nullptr;
 	FLinearColor Color = FLinearColor::White;
 	int32 Money = 0;
@@ -191,6 +197,33 @@ public:
 	bool StartSkirmish(AGenMapActor* InMapActor, const FGenMatchSettings& Settings, int32 InLocalPlayer = INDEX_NONE);
 	bool IsRunning() const { return MapActor != nullptr; }
 	const FGenMatchSettings& GetMatchSettings() const { return Match; }
+
+	// --- campaign missions (GenCampaignGame.cpp) ---
+	/** A campaign mission: the map's sides are the players, its scripts drive the game, and they decide it. */
+	bool IsCampaign() const { return !Match.Campaign.IsEmpty(); }
+	/** The map's script engine (campaign missions; null in a skirmish). */
+	FGenMapScripts* GetMapScripts() const { return MapScripts.Get(); }
+	/** Player::setPlayerRelationship: how From sees To from now on (and who shares sight). */
+	void SetPlayerRelationship(int32 From, int32 To, EGenRelationship Relation);
+	/** VICTORY / DEFEAT: the game is over, won or lost by the local player. */
+	void ScriptGameOver(bool bLocalWins);
+	/** PLAYER_SET_RANKLEVELLIMIT: no general gets past this rank (0: no limit). */
+	void SetRankLevelLimit(int32 Limit) { RankLevelLimit = Limit; }
+	/** ENABLE_SCORING / DISABLE_SCORING: whether what is built, lost and destroyed counts towards the score. */
+	void SetScoringEnabled(bool bEnabled) { bScoringEnabled = bEnabled; }
+	bool IsScoringEnabled() const { return bScoringEnabled; }
+	/** MAP_REVEAL_ALL_PERM / MAP_REVEAL_ALL_UNDO_PERM / MAP_SHROUD_ALL / MAP_REVEAL_PERMANENTLY_AT_WAYPOINT. */
+	void ScriptRevealMapPermanently(int32 Player, bool bReveal);
+	void ScriptShroudMap(int32 Player);
+	void ScriptRevealPermanently(int32 Player, const FVector2f& Pos, float Radius);
+	/** MAP_SWITCH_BORDER: which of the map's boundaries is the playable area. */
+	void SetActiveBoundary(int32 Boundary);
+	/** TheGameLogic->destroyObject: gone at the end of the step, without dying (and what is inside goes with it). */
+	void RemoveObjectByScript(FGenObject& Obj);
+	/** What the scripts want seen and heard since the last time (game thread, inside the logic gate). */
+	void TakeScriptClientEvents(TArray<FGenScriptClientEvent>& Out) { if (MapScripts) { MapScripts->TakeClientEvents(Out); } }
+	/** ScriptEngine::transferObjectName (a terrorist's name goes to the car bomb he makes). */
+	void OnObjectNameTransfer(const FGenObject& From, FGenObject& To) { if (MapScripts) { MapScripts->TransferName(From, To); } }
 
 	// --- orders (GenOrders.cpp) ---
 	/** An order of this computer's player (or Command.Player's): applied at the start of the next logic frame. */
@@ -605,7 +638,9 @@ public:
 	/** One of the player's objects that has the power (a ready one if there is one). */
 	FGenObject* FindPowerSource(int32 Player, const FString& Power, bool bMustBeReady, int32* OutModule = nullptr) const;
 	void IssueSpecialPower(FGenObjectID Source, const FString& Power, const FVector3f& TargetPos, FGenObjectID TargetObj);
-	bool FireSpecialPower(FGenObject& Source, int32 Module, const FVector3f& TargetPos, FGenObjectID TargetObj);
+	/** bFromScript: COMMAND_FIRED_BY_SCRIPT - a map's script fires it whether it is ready or not; TargetPos.X FLT_MAX: at no spot
+	 *  (SpecialPowerModule::doSpecialPower rather than doSpecialPowerAtLocation). */
+	bool FireSpecialPower(FGenObject& Source, int32 Module, const FVector3f& TargetPos, FGenObjectID TargetObj, bool bFromScript = false);
 	/** ObjectCreationList::create for the lists powers and buildings use: things that appear, aircraft that deliver. */
 	void RunPowerOCL(const FString& OCLName, const FGenObject& Source, const FVector3f& CreatePos, const FVector3f& TargetPos, const float* PlacedAngle = nullptr);
 	/** The map's playable rectangle (world units), optionally with the border around it. */
@@ -855,6 +890,13 @@ private:
 	void PublishFrame();
 	void PlaceStartingObjects(const FGenPlayer& Player);
 	void InitPlayerSciences(FGenPlayer& Player);
+	/** A campaign mission's players: the map's sides, in order (side 0 is the neutral player), with their relations. */
+	void SetupCampaignPlayers();
+	/** Who sees through whose eyes (allies share what they see), after the relations have changed. */
+	void RefreshAllianceMasks();
+	TUniquePtr<FGenMapScripts> MapScripts;
+	int32 RankLevelLimit = 0;
+	bool bScoringEnabled = true;
 	bool AddScience(int32 Player, const FString& Science);
 	void StartDelivery(const struct FGenDeliverPayload& Payload, const FGenObject& Source, const FVector3f& Primary, const FVector3f& Secondary);
 	void SpawnMapObjects();
@@ -942,6 +984,7 @@ private:
 		float AppliedRelZ = 0.f;          // how far below (or above) the object's first model it stands (ADJUST_HEIGHT_BY_CONSTRUCTION_PERCENT)
 		const FGenModelConditionState* StateSystemsFor = nullptr; // the state the ParticleSysBone systems below belong to
 		TArray<uint32> StateSystems;
+		TArray<FString> StateSystemBones; // ... and the bone each is on
 	};
 
 	/** Client-side state of one drawable: condition state shown, turret pose, muzzle flash timers. */
@@ -985,7 +1028,11 @@ private:
 		int32 Owner = MIN_int32;          // whose colours it wears (a garrisoned building changes hands)
 		const FGenModelConditionState* StateSystemsFor = nullptr; // condition state the ParticleSysBone systems below belong to
 		TArray<uint32> StateSystems;
+		TArray<FString> StateSystemBones; // ... and the bone each is on
+		bool bAnimatedBones = false;      // ... which follow their bones as the animation moves them (every frame)
+		uint32 BoneTraceFrame = 0;        // (-GenTrace: the last frame that told where they are - or how its police lights are)
 		bool bSystemsStopped = false;     // hidden: the ParticleSysBone systems (the extras' too) emit nothing
+		float PoliceFrame = -1.f;         // W3DPoliceCarDraw: where its light bar's animation stands (-1: not begun)
 		int32 DamageState = 0;            // body damage state the TransitionDamageFX systems below were made for
 		TArray<uint32> TransitionSystems;
 		int32 DebrisAnimState = -1;       // W3DDebrisDraw: -1 not begun, 0 its first animation, 1 flying, 2 landed

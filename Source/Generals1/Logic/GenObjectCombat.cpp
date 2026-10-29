@@ -1498,7 +1498,7 @@ static TAutoConsoleVariable<int32> CVarGenMissileFlight(
 void FGenObject::AttemptDamage(float Amount, const FString& DamageType, const FString& DeathType, FGenObjectID Source, bool bInFlight, const TCHAR* DamageFXType)
 {
 	const bool bShotDown = bInFlight && Projectile.bActive && !bDead && !bPendingDestroy;
-	if ((!IsTargetable() && !bShotDown) || Logic->GetFrame() < InvulnerableUntilFrame)
+	if ((!IsTargetable() && !bShotDown) || Logic->GetFrame() < InvulnerableUntilFrame || bIndestructible)
 	{
 		return;
 	}
@@ -1598,6 +1598,13 @@ void FGenObject::AttemptDamage(float Amount, const FString& DamageType, const FS
 		|| (Template->BodyType.Equals(TEXT("HighlanderBody"), ESearchCase::IgnoreCase) && !DamageType.Equals(TEXT("UNRESISTABLE"), ESearchCase::IgnoreCase));
 	const int32 OldDamageState = GetDamageState();
 	LastDamageFrame = Logic->GetFrame();
+	// (DamageInfo's m_sourceID, m_sourcePlayerMask, m_sourceTemplate.)
+	LastDamageSource = Source;
+	if (const FGenObject* Damager = Logic->FindObject(Source))
+	{
+		LastDamageSourcePlayer = Damager->Owner;
+		LastDamageSourceTemplate = Damager->Template;
+	}
 	PreviousHealth = Health;
 	Health = FMath::Max(bImmortal ? 1.f : 0.f, Health - Amount);
 	if (DamageFX)
@@ -2282,7 +2289,8 @@ void FGenObject::Die(const FString& DeathType, FGenObjectID Killer)
 
 void FGenObject::Kill(const FString& DeathType, FGenObjectID Killer)
 {
-	if (bDead || bPendingDestroy)
+	// (Object::kill is unresistable damage: an indestructible body takes none of it.)
+	if (bDead || bPendingDestroy || bIndestructible)
 	{
 		return;
 	}

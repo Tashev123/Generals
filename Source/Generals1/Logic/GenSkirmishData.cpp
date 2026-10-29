@@ -47,7 +47,7 @@ namespace
 			const int32 Type = R.I32();
 			if (Type == ParamCoord3D)
 			{
-				R.Vec3();
+				P.Coord = R.Vec3();
 			}
 			else
 			{
@@ -137,6 +137,86 @@ namespace
 
 // ---- scripts ------------------------------------------------------------------------------------
 
+void GenScriptIO::ReadScriptLists(FGenChunkReader& R, int32 ChunkEnd, TArray<FGenScriptList>& Out, int32* OutNumScripts)
+{
+	FGenChunkReader::FChunk LC;
+	while (R.NextChunk(ChunkEnd, LC))
+	{
+		if (LC.Name == TEXT("ScriptList"))
+		{
+			FGenScriptList& List = Out.AddDefaulted_GetRef();
+			FGenChunkReader::FChunk SC;
+			while (R.NextChunk(LC.End, SC))
+			{
+				if (SC.Name == TEXT("Script"))
+				{
+					ReadScript(R, SC, List.Scripts.AddDefaulted_GetRef());
+					if (OutNumScripts) { ++*OutNumScripts; }
+				}
+				else if (SC.Name == TEXT("ScriptGroup"))
+				{
+					FGenScriptGroup& G = List.Groups.AddDefaulted_GetRef();
+					G.Name = R.AStr();
+					G.bActive = R.U8() != 0;
+					G.bSubroutine = SC.Version >= 2 ? R.U8() != 0 : false;
+					FGenChunkReader::FChunk GC;
+					while (R.NextChunk(SC.End, GC))
+					{
+						if (GC.Name == TEXT("Script"))
+						{
+							ReadScript(R, GC, G.Scripts.AddDefaulted_GetRef());
+							if (OutNumScripts) { ++*OutNumScripts; }
+						}
+						R.Pos = GC.End;
+					}
+				}
+				R.Pos = SC.End;
+			}
+		}
+		R.Pos = LC.End;
+	}
+}
+
+void GenScriptIO::ReadTeamProto(const FGenDict& D, FGenTeamProto& T)
+{
+	T.Name = DictString(D, TEXT("teamName"));
+	T.Owner = DictString(D, TEXT("teamOwner"));
+	T.bSingleton = DictBool(D, TEXT("teamIsSingleton"));
+	for (int32 u = 1; u <= 7; ++u)
+	{
+		const FString Unit = DictString(D, *FString::Printf(TEXT("teamUnitType%d"), u));
+		const int32 Max = DictInt(D, *FString::Printf(TEXT("teamUnitMaxCount%d"), u));
+		if (Max > 0 && !Unit.IsEmpty())
+		{
+			T.Units.Add({ Unit, DictInt(D, *FString::Printf(TEXT("teamUnitMinCount%d"), u)), Max });
+		}
+	}
+	T.ProductionPriority = DictInt(D, TEXT("teamProductionPriority"));
+	T.SuccessIncrease = DictInt(D, TEXT("teamProductionPrioritySuccessIncrease"));
+	T.FailureDecrease = DictInt(D, TEXT("teamProductionPriorityFailureDecrease"));
+	T.MaxInstances = DictInt(D, TEXT("teamMaxInstances"));
+	T.InitialIdleFrames = DictInt(D, TEXT("teamInitialIdleFrames"));
+	T.bExecuteActions = DictBool(D, TEXT("teamExecutesActionsOnCreate"));
+	T.bAutoReinforce = DictBool(D, TEXT("teamAutoReinforce"));
+	T.bRecruitable = DictBool(D, TEXT("teamIsAIRecruitable"));
+	if (const FGenDictValue* V = D.Find(TEXT("teamDestroyedThreshold"))) { T.DestroyedThreshold = V->Real; }
+	T.ProductionCondition = DictString(D, TEXT("teamProductionCondition"));
+	T.OnCreate = DictString(D, TEXT("teamOnCreateScript"));
+	T.OnDestroyed = DictString(D, TEXT("teamOnDestroyedScript"));
+	T.OnIdle = DictString(D, TEXT("teamOnIdleScript"));
+	T.OnEnemySighted = DictString(D, TEXT("teamEnemySightedScript"));
+	T.OnAllClear = DictString(D, TEXT("teamAllClearScript"));
+	T.OnUnitDestroyed = DictString(D, TEXT("teamOnUnitDestroyedScript"));
+	for (int32 g = 0; g < FGenTeamProto::MaxGenericScripts; ++g)
+	{
+		T.Generic[g] = DictString(D, *FString::Printf(TEXT("teamGenericScriptHook%d"), g));
+	}
+	T.ReinforcementOrigin = DictString(D, TEXT("teamReinforcementOrigin"));
+	T.TransportUnitType = DictString(D, TEXT("teamTransport"));
+	T.bStartsFull = DictBool(D, TEXT("teamStartsFull"));
+	T.bTransportsReturn = DictBool(D, TEXT("teamTransportsReturn"));
+}
+
 FGenScriptLibrary& FGenScriptLibrary::Get()
 {
 	static FGenScriptLibrary Instance;
@@ -180,42 +260,7 @@ bool FGenScriptLibrary::Initialize()
 	{
 		if (C.Name == TEXT("PlayerScriptsList"))
 		{
-			FGenChunkReader::FChunk LC;
-			while (R.NextChunk(C.End, LC))
-			{
-				if (LC.Name == TEXT("ScriptList"))
-				{
-					FGenScriptList& List = ReadLists.AddDefaulted_GetRef();
-					FGenChunkReader::FChunk SC;
-					while (R.NextChunk(LC.End, SC))
-					{
-						if (SC.Name == TEXT("Script"))
-						{
-							ReadScript(R, SC, List.Scripts.AddDefaulted_GetRef());
-							++NumScripts;
-						}
-						else if (SC.Name == TEXT("ScriptGroup"))
-						{
-							FGenScriptGroup& G = List.Groups.AddDefaulted_GetRef();
-							G.Name = R.AStr();
-							G.bActive = R.U8() != 0;
-							G.bSubroutine = SC.Version >= 2 ? R.U8() != 0 : false;
-							FGenChunkReader::FChunk GC;
-							while (R.NextChunk(SC.End, GC))
-							{
-								if (GC.Name == TEXT("Script"))
-								{
-									ReadScript(R, GC, G.Scripts.AddDefaulted_GetRef());
-									++NumScripts;
-								}
-								R.Pos = GC.End;
-							}
-						}
-						R.Pos = SC.End;
-					}
-				}
-				R.Pos = LC.End;
-			}
+			GenScriptIO::ReadScriptLists(R, C.End, ReadLists, &NumScripts);
 		}
 		else if (C.Name == TEXT("ScriptsPlayers"))
 		{
@@ -232,39 +277,7 @@ bool FGenScriptLibrary::Initialize()
 			while (R.Pos < C.End)
 			{
 				const FGenDict D = R.Dict();
-				FGenTeamProto& T = Teams.AddDefaulted_GetRef();
-				T.Name = DictString(D, TEXT("teamName"));
-				T.Owner = DictString(D, TEXT("teamOwner"));
-				T.bSingleton = DictBool(D, TEXT("teamIsSingleton"));
-				for (int32 u = 1; u <= 7; ++u)
-				{
-					const FString Unit = DictString(D, *FString::Printf(TEXT("teamUnitType%d"), u));
-					const int32 Max = DictInt(D, *FString::Printf(TEXT("teamUnitMaxCount%d"), u));
-					if (Max > 0 && !Unit.IsEmpty())
-					{
-						T.Units.Add({ Unit, DictInt(D, *FString::Printf(TEXT("teamUnitMinCount%d"), u)), Max });
-					}
-				}
-				T.ProductionPriority = DictInt(D, TEXT("teamProductionPriority"));
-				T.SuccessIncrease = DictInt(D, TEXT("teamProductionPrioritySuccessIncrease"));
-				T.FailureDecrease = DictInt(D, TEXT("teamProductionPriorityFailureDecrease"));
-				T.MaxInstances = DictInt(D, TEXT("teamMaxInstances"));
-				T.InitialIdleFrames = DictInt(D, TEXT("teamInitialIdleFrames"));
-				T.bExecuteActions = DictBool(D, TEXT("teamExecutesActionsOnCreate"));
-				T.bAutoReinforce = DictBool(D, TEXT("teamAutoReinforce"));
-				T.bRecruitable = DictBool(D, TEXT("teamIsAIRecruitable"));
-				if (const FGenDictValue* V = D.Find(TEXT("teamDestroyedThreshold"))) { T.DestroyedThreshold = V->Real; }
-				T.ProductionCondition = DictString(D, TEXT("teamProductionCondition"));
-				T.OnCreate = DictString(D, TEXT("teamOnCreateScript"));
-				T.OnDestroyed = DictString(D, TEXT("teamOnDestroyedScript"));
-				T.OnIdle = DictString(D, TEXT("teamOnIdleScript"));
-				T.OnEnemySighted = DictString(D, TEXT("teamEnemySightedScript"));
-				T.OnAllClear = DictString(D, TEXT("teamAllClearScript"));
-				T.OnUnitDestroyed = DictString(D, TEXT("teamOnUnitDestroyedScript"));
-				for (int32 g = 0; g < FGenTeamProto::MaxGenericScripts; ++g)
-				{
-					T.Generic[g] = DictString(D, *FString::Printf(TEXT("teamGenericScriptHook%d"), g));
-				}
+				GenScriptIO::ReadTeamProto(D, Teams.AddDefaulted_GetRef());
 			}
 		}
 		R.Pos = C.End;

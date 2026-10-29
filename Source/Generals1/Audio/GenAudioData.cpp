@@ -203,6 +203,147 @@ bool FGenAudioData::Initialize()
 	return true;
 }
 
+namespace
+{
+	uint32 ReadLE32(const uint8* P) { return uint32(P[0]) | (uint32(P[1]) << 8) | (uint32(P[2]) << 16) | (uint32(P[3]) << 24); }
+	uint16 ReadLE16(const uint8* P) { return uint16(P[0] | (P[1] << 8)); }
+
+	/** RIFF WAVE: the "fact" chunk's sample count if there is one (compressed formats), else the data size over the block size. */
+	float WavLength(TConstArrayView<uint8> B)
+	{
+		if (B.Num() < 12 || FMemory::Memcmp(B.GetData(), "RIFF", 4) != 0 || FMemory::Memcmp(B.GetData() + 8, "WAVE", 4) != 0)
+		{
+			return 0.f;
+		}
+		uint32 Rate = 0, BytesPerSec = 0, BlockAlign = 0, SamplesPerBlock = 0, FactSamples = 0, DataSize = 0;
+		uint16 Format = 0;
+		for (int32 At = 12; At + 8 <= B.Num();)
+		{
+			const uint32 Size = ReadLE32(&B[At + 4]);
+			const uint8* Body = &B[At + 8];
+			const int32 Avail = B.Num() - (At + 8);
+			if (FMemory::Memcmp(&B[At], "fmt ", 4) == 0 && Avail >= 16)
+			{
+				Format = ReadLE16(Body);
+				Rate = ReadLE32(Body + 4);
+				BytesPerSec = ReadLE32(Body + 8);
+				BlockAlign = ReadLE16(Body + 12);
+				if (Size >= 20 && Avail >= 20)
+				{
+					SamplesPerBlock = ReadLE16(Body + 18); // (IMA ADPCM: after cbSize)
+				}
+			}
+			else if (FMemory::Memcmp(&B[At], "fact", 4) == 0 && Avail >= 4)
+			{
+				FactSamples = ReadLE32(Body);
+			}
+			else if (FMemory::Memcmp(&B[At], "data", 4) == 0)
+			{
+				DataSize = FMath::Min<uint32>(Size, uint32(Avail));
+			}
+			At += 8 + int32(Size + (Size & 1));
+		}
+		if (Rate == 0)
+		{
+			return 0.f;
+		}
+		if (FactSamples > 0)
+		{
+			return float(FactSamples) / float(Rate);
+		}
+		if (Format == 0x11 && BlockAlign > 0 && SamplesPerBlock > 0)
+		{
+			return float((DataSize / BlockAlign) * SamplesPerBlock) / float(Rate);
+		}
+		return BytesPerSec > 0 ? float(DataSize) / float(BytesPerSec) : 0.f;
+	}
+
+	/** MPEG audio: the frames' headers, one after another (a Xing header's frame count if there is one). */
+	float Mp3Length(TConstArrayView<uint8> B)
+	{
+		static const int32 Bitrates[2][3][16] = {
+			{ { 0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0 },   // MPEG-1 layer I
+			  { 0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0 },      // layer II
+			  { 0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0 } },     // layer III
+			{ { 0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0 },      // MPEG-2/2.5 layer I
+			  { 0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0 },
+			  { 0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0 } } };
+		static const int32 Rates[3][3] = { { 44100, 48000, 32000 }, { 22050, 24000, 16000 }, { 11025, 12000, 8000 } };
+		int32 At = 0;
+		if (B.Num() >= 10 && FMemory::Memcmp(B.GetData(), "ID3", 3) == 0)
+		{
+			At = 10 + ((B[6] & 0x7f) << 21 | (B[7] & 0x7f) << 14 | (B[8] & 0x7f) << 7 | (B[9] & 0x7f));
+		}
+		double Seconds = 0.0;
+		while (At + 4 <= B.Num())
+		{
+			if (B[At] != 0xff || (B[At + 1] & 0xe0) != 0xe0)
+			{
+				++At;
+				continue;
+			}
+			const int32 Version = (B[At + 1] >> 3) & 3;   // 3: MPEG-1, 2: MPEG-2, 0: MPEG-2.5
+			const int32 Layer = (B[At + 1] >> 1) & 3;     // 3: I, 2: II, 1: III
+			const int32 BitIndex = B[At + 2] >> 4;
+			const int32 RateIndex = (B[At + 2] >> 2) & 3;
+			if (Version == 1 || Layer == 0 || BitIndex == 0 || BitIndex == 15 || RateIndex == 3)
+			{
+				++At;
+				continue;
+			}
+			const int32 V = Version == 3 ? 0 : 1;
+			const int32 L = 3 - Layer;
+			const int32 Rate = Rates[Version == 3 ? 0 : (Version == 2 ? 1 : 2)][RateIndex];
+			const int32 Bitrate = Bitrates[V][L][BitIndex] * 1000;
+			const int32 Padding = (B[At + 2] >> 1) & 1;
+			const int32 Samples = L == 0 ? 384 : (L == 2 && V == 1 ? 576 : 1152);
+			const int32 Size = L == 0 ? (12 * Bitrate / Rate + Padding) * 4 : (Samples / 8) * Bitrate / Rate + Padding;
+			if (Size <= 0)
+			{
+				++At;
+				continue;
+			}
+			Seconds += double(Samples) / double(Rate);
+			At += Size;
+		}
+		return float(Seconds);
+	}
+}
+
+float FGenAudioData::GetFileLengthSeconds(const FString& VfsPath)
+{
+	TArray<uint8> Bytes;
+	if (!FGenFileSystem::Get().ReadFile(VfsPath, Bytes))
+	{
+		return 0.f;
+	}
+	return VfsPath.EndsWith(TEXT(".mp3"), ESearchCase::IgnoreCase) ? Mp3Length(Bytes) : WavLength(Bytes);
+}
+
+float FGenAudioData::GetEventLengthSeconds(const FString& Name) const
+{
+	const FString Key = Name.ToLower();
+	{
+		FScopeLock Lock(&LengthLock);
+		if (const float* Found = LengthCache.Find(Key))
+		{
+			return *Found;
+		}
+	}
+	float Seconds = 0.f;
+	if (const FGenAudioEventInfo* Info = Find(Name))
+	{
+		const FString File = Info->SoundType == EGenAudioType::SoundEffect ? (Info->Sounds.Num() > 0 ? Info->Sounds[0] : FString()) : Info->Filename;
+		if (!File.IsEmpty())
+		{
+			Seconds = GetFileLengthSeconds(ResolvePath(Info->SoundType, File));
+		}
+	}
+	FScopeLock Lock(&LengthLock);
+	LengthCache.Add(Key, Seconds);
+	return Seconds;
+}
+
 const FGenAudioEventInfo* FGenAudioData::Find(const FString& Name) const
 {
 	if (Name.IsEmpty() || Name.Equals(TEXT("NoSound"), ESearchCase::IgnoreCase))

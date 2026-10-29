@@ -1,0 +1,180 @@
+#pragma once
+
+#include "CoreMinimal.h"
+
+/** GameDifficulty of a computer player; scripts are tagged with the levels they run on. */
+enum class EGenDifficulty : uint8 { Easy, Normal, Hard };
+
+// ---- script data (Scripts.cpp) ----------------------------------------------------------------
+
+// The conditions and actions the skirmish scripts and the ported campaign maps use. Anything else in a script
+// file loads as Unknown (conditions: false, actions: nothing).
+#define GEN_SCRIPT_CONDITIONS(X) \
+	X(CONDITION_FALSE) X(CONDITION_TRUE) X(COUNTER) X(FLAG) X(TIMER_EXPIRED) \
+	X(PLAYER_HAS_OBJECT_COMPARISON) X(NAMED_NOT_DESTROYED) X(BUILT_BY_PLAYER) X(PLAYER_HAS_CREDITS) \
+	X(START_POSITION_IS) X(SKIRMISH_SPECIAL_POWER_READY) X(TEAM_HAS_UNITS) \
+	X(PLAYER_HAS_COMPARISON_UNIT_TYPE_IN_TRIGGER_AREA) X(PLAYER_POWER_COMPARE_PERCENT) X(SKIRMISH_VALUE_IN_AREA) \
+	X(TEAM_INSIDE_AREA_PARTIALLY) X(PLAYER_HAS_POWER) X(MUSIC_TRACK_HAS_COMPLETED) X(SKIRMISH_PLAYER_FACTION) \
+	X(PLAYER_HAS_NO_POWER) X(SUPPLY_SOURCE_SAFE) X(PLAYER_BUILT_UPGRADE) X(SKIRMISH_UNOWNED_FACTION_UNIT_EXISTS) \
+	X(TEAM_DESTROYED) X(PLAYER_ALL_DESTROYED) X(SKIRMISH_TECH_BUILDING_WITHIN_DISTANCE) X(PLAYER_LOST_OBJECT_TYPE) \
+	X(UNIT_HEALTH) X(PLAYER_ACQUIRED_SCIENCE) X(TEAM_ENTERED_AREA_ENTIRELY) X(PLAYER_TRIGGERED_SPECIAL_POWER) \
+	X(PLAYER_COMPLETED_SPECIAL_POWER) X(TEAM_SOME_HAVE_OBJECT_STATUS) X(TEAM_OUTSIDE_AREA_ENTIRELY) \
+	/* campaign maps */ \
+	X(PLAYER_HAS_COMPARISON_UNIT_KIND_IN_TRIGGER_AREA) X(NAMED_ENTERED_AREA) X(NAMED_ATTACKED_BY_PLAYER) \
+	X(HAS_FINISHED_SPEECH) X(HAS_FINISHED_AUDIO) X(NAMED_HAS_FREE_CONTAINER_SLOTS) X(NAMED_DESTROYED) \
+	X(TEAM_DISCOVERED) X(UNIT_HAS_OBJECT_STATUS) X(TEAM_ATTACKED_BY_PLAYER) X(TEAM_ATTACKED_BY_OBJECTTYPE) \
+	X(NAMED_OWNED_BY_PLAYER) X(CAMERA_MOVEMENT_FINISHED)
+
+#define GEN_SCRIPT_ACTIONS(X) \
+	X(NO_OP) X(SET_FLAG) X(SET_COUNTER) X(INCREMENT_COUNTER) X(DECREMENT_COUNTER) X(SET_TIMER) X(SET_MILLISECOND_TIMER) \
+	X(SET_RANDOM_TIMER) X(SET_RANDOM_MSEC_TIMER) X(ENABLE_SCRIPT) X(DISABLE_SCRIPT) X(CALL_SUBROUTINE) \
+	X(OBJECTLIST_ADDOBJECTTYPE) X(SET_ATTACK_PRIORITY_THING) X(TEAM_APPLY_ATTACK_PRIORITY_SET) \
+	X(TEAM_GUARD_AREA) X(TEAM_HUNT) X(TEAM_ATTACK_AREA) X(TEAM_STOP) X(TEAM_STOP_AND_DISBAND) \
+	X(TEAM_EXECUTE_SEQUENTIAL_SCRIPT) X(TEAM_STOP_SEQUENTIAL_SCRIPT) X(TEAM_AVAILABLE_FOR_RECRUITMENT) \
+	X(TEAM_MERGE_INTO_TEAM) X(TEAM_DECREASE_PRIORITY) X(TEAM_INCREASE_PRIORITY) X(TEAM_SET_ATTITUDE) \
+	X(TEAM_MOVE_TOWARDS_NEAREST_OBJECT_TYPE) X(TEAM_HUNT_WITH_COMMAND_BUTTON) \
+	X(SKIRMISH_BUILD_BUILDING) X(SKIRMISH_BUILD_STRUCTURE_FRONT) X(SKIRMISH_BUILD_STRUCTURE_FLANK) \
+	X(SKIRMISH_BUILD_BASE_DEFENSE_FRONT) X(SKIRMISH_BUILD_BASE_DEFENSE_FLANK) X(AI_PLAYER_BUILD_SUPPLY_CENTER) \
+	X(AI_PLAYER_BUILD_TYPE_NEAREST_TEAM) X(AI_PLAYER_BUILD_UPGRADE) X(BUILD_TEAM) X(RECRUIT_TEAM) \
+	X(SKIRMISH_MOVE_TO_APPROACH_PATH) X(SKIRMISH_FOLLOW_APPROACH_PATH) \
+	X(PLAYER_GIVE_MONEY) X(PLAYER_SELL_EVERYTHING) X(PLAYER_ENABLE_UNIT_CONSTRUCTION) X(PLAYER_ENABLE_BASE_CONSTRUCTION) \
+	X(TEAM_ENTER_NAMED) X(TEAM_USE_COMMANDBUTTON_ABILITY) X(SKIRMISH_FIRE_SPECIAL_POWER_AT_MOST_COST) X(MUSIC_SET_TRACK) \
+	X(TEAM_LOAD_TRANSPORTS) X(TEAM_CAPTURE_NEAREST_UNOWNED_FACTION_UNIT) X(TEAM_PARTIAL_USE_COMMANDBUTTON) \
+	X(TEAM_ALL_USE_COMMANDBUTTON_ON_NEAREST_OBJECTTYPE) X(TEAM_EXIT_ALL) X(TEAM_GARRISON_NEAREST_BUILDING) \
+	X(SKIRMISH_WAIT_FOR_COMMANDBUTTON_AVAILABLE_ALL) X(TEAM_GUARD_IN_TUNNEL_NETWORK) \
+	/* campaign maps: units and teams */ \
+	X(NAMED_DELETE) X(TEAM_DELETE) X(NAMED_KILL) X(NAMED_FOLLOW_WAYPOINTS) X(NAMED_FOLLOW_WAYPOINTS_EXACT) \
+	X(TEAM_FOLLOW_WAYPOINTS) X(TEAM_FOLLOW_WAYPOINTS_EXACT) X(MOVE_TEAM_TO) X(MOVE_NAMED_UNIT_TO) X(NAMED_GUARD) \
+	X(TEAM_GUARD_POSITION) X(NAMED_HUNT) X(TEAM_WANDER_IN_PLACE) X(TEAM_PANIC) X(IDLE_ALL_UNITS) X(NAMED_SET_HELD) \
+	X(SET_TRAIN_HELD) X(NAMED_SET_EVAC_LEFT_OR_RIGHT) X(EXIT_SPECIFIC_BUILDING) X(NAMED_EXIT_ALL) X(NAMED_ENTER_NAMED) \
+	X(NAMED_GARRISON_SPECIFIC_BUILDING) X(TEAM_GARRISON_SPECIFIC_BUILDING) X(NAMED_USE_COMMANDBUTTON_ABILITY) \
+	X(NAMED_USE_COMMANDBUTTON_ABILITY_ON_NAMED) X(NAMED_USE_COMMANDBUTTON_ABILITY_AT_WAYPOINT) \
+	X(NAMED_FIRE_SPECIAL_POWER_AT_WAYPOINT) X(NAMED_SET_SPECIAL_POWER_COUNTDOWN) X(CREATE_NAMED_ON_TEAM_AT_WAYPOINT) \
+	X(CREATE_UNNAMED_ON_TEAM_AT_WAYPOINT) X(UNIT_SPAWN_NAMED_LOCATION_ORIENTATION) X(CREATE_REINFORCEMENT_TEAM) \
+	X(UNIT_AFFECT_OBJECT_PANEL_FLAGS) X(NAMED_FLASH_WHITE) X(OBJECT_CREATE_RADAR_EVENT) X(DISABLE_OBJECT_SOUND) \
+	X(SCRIPTING_OVERRIDE_HULK_LIFETIME) X(OBJECT_ALLOW_BONUSES) \
+	/* campaign maps: players and the game */ \
+	X(PLAYER_RELATES_PLAYER) X(TEAM_SET_OVERRIDE_RELATION_TO_TEAM) X(PLAYER_SCIENCE_AVAILABILITY) \
+	X(PLAYER_SET_RANKLEVELLIMIT) X(PLAYER_SET_MONEY) X(PLAYER_EXCLUDE_FROM_SCORE_SCREEN) \
+	X(COMMANDBAR_REMOVE_BUTTON_OBJECTTYPE) X(VICTORY) X(DEFEAT) X(DISABLE_SCORING) X(ENABLE_SCORING) \
+	X(FREEZE_TIME) X(UNFREEZE_TIME) X(SET_FPS_LIMIT) X(DISABLE_COUNTDOWN_TIMER_DISPLAY) \
+	/* campaign maps: the map, the fog */ \
+	X(MAP_REVEAL_ALL_PERM) X(MAP_REVEAL_ALL_UNDO_PERM) X(MAP_SHROUD_ALL) X(MAP_REVEAL_PERMANENTLY_AT_WAYPOINT) \
+	X(ENABLE_BORDER_SHROUD) X(DISABLE_BORDER_SHROUD) X(MAP_SWITCH_BORDER) X(OVERSIZE_TERRAIN) X(RESIZE_VIEW_GUARDBAND) \
+	X(DRAW_SKYBOX_BEGIN) X(DRAW_SKYBOX_END) \
+	/* campaign maps: what is seen and heard */ \
+	X(SPEECH_PLAY) X(MUSIC_SET_VOLUME) X(SOUND_SET_VOLUME) X(PLAY_SOUND_EFFECT) X(PLAY_SOUND_EFFECT_AT) \
+	X(SOUND_DISABLE_TYPE) X(SOUND_ENABLE_TYPE) X(SOUND_REMOVE_ALL_DISABLED) X(SOUND_ENABLE_ALL) \
+	X(AUDIO_OVERRIDE_VOLUME_TYPE) X(AUDIO_RESTORE_VOLUME_ALL_TYPE) X(EVA_SET_ENABLED_DISABLED) X(SHOW_MILITARY_CAPTION) \
+	X(SCREEN_SHAKE) X(SETUP_CAMERA) X(MOVE_CAMERA_TO) X(ZOOM_CAMERA) X(PITCH_CAMERA) X(ROTATE_CAMERA) X(RESET_CAMERA) \
+	X(CAMERA_LOOK_TOWARD_WAYPOINT) X(CAMERA_MOD_SET_FINAL_ZOOM) X(CAMERA_MOD_SET_FINAL_PITCH) \
+	X(CAMERA_LETTERBOX_BEGIN) X(CAMERA_LETTERBOX_END) X(CAMERA_FADE_ADD) X(CAMERA_FADE_MULTIPLY) \
+	X(CAMERA_BW_MODE_BEGIN) X(CAMERA_BW_MODE_END) X(DISABLE_INPUT) X(ENABLE_INPUT) \
+	X(OPTIONS_SET_DRAWICON_UI_MODE) X(OPTIONS_SET_OCCLUSION_MODE) X(OPTIONS_SET_PARTICLE_CAP_MODE)
+
+enum class EGenScriptCondition : uint8
+{
+	Unknown,
+#define GEN_X(Name) C_##Name,
+	GEN_SCRIPT_CONDITIONS(GEN_X)
+#undef GEN_X
+};
+
+enum class EGenScriptAction : uint8
+{
+	Unknown,
+#define GEN_X(Name) A_##Name,
+	GEN_SCRIPT_ACTIONS(GEN_X)
+#undef GEN_X
+};
+
+/** Parameter of a condition or action: which of the fields matters depends on what it is used for. */
+struct GENERALS1_API FGenScriptParam
+{
+	int32 Int = 0;
+	float Real = 0.f;
+	FString String;
+	FVector3f Coord = FVector3f::ZeroVector;   // Parameter::COORD3D
+};
+
+struct GENERALS1_API FGenScriptCondition
+{
+	EGenScriptCondition Type = EGenScriptCondition::Unknown;
+	FString TypeName;
+	TArray<FGenScriptParam> Params;
+	// Result cache of conditions that are expensive to evaluate (Condition::m_customData / m_customFrame).
+	mutable int32 CustomData = 0;
+	mutable uint32 CustomFrame = 0;
+};
+
+struct GENERALS1_API FGenScriptAction
+{
+	EGenScriptAction Type = EGenScriptAction::Unknown;
+	FString TypeName;
+	TArray<FGenScriptParam> Params;
+};
+
+/** One script: IF (any of the OR blocks, each an AND of conditions) THEN actions ELSE false-actions. */
+struct GENERALS1_API FGenScript
+{
+	FString Name;
+	bool bActive = true;
+	bool bOneShot = false;
+	bool bEasy = true, bNormal = true, bHard = true;
+	bool bSubroutine = false;
+	int32 DelaySeconds = 0;                  // evaluate only every N seconds
+	TArray<TArray<FGenScriptCondition>> Conditions;
+	TArray<FGenScriptAction> Actions;
+	TArray<FGenScriptAction> FalseActions;
+	uint32 FrameToEvaluate = 0;
+	FString ConditionTeam;                   // team named in the conditions: evaluated once per instance of it
+};
+
+struct GENERALS1_API FGenScriptGroup
+{
+	FString Name;
+	bool bActive = true;
+	bool bSubroutine = false;
+	TArray<FGenScript> Scripts;
+};
+
+struct GENERALS1_API FGenScriptList
+{
+	TArray<FGenScript> Scripts;
+	TArray<FGenScriptGroup> Groups;
+};
+
+/** Team definition (TeamTemplateInfo): which units, when it may be built, which scripts drive it. */
+struct GENERALS1_API FGenTeamProto
+{
+	static constexpr int32 MaxGenericScripts = 16;
+
+	struct FUnits { FString Unit; int32 Min = 0; int32 Max = 0; };
+
+	FString Name;
+	FString Owner;                           // "SkirmishChina"
+	bool bSingleton = false;
+	TArray<FUnits> Units;
+	int32 ProductionPriority = 0;
+	int32 SuccessIncrease = 0;
+	int32 FailureDecrease = 0;
+	int32 MaxInstances = 0;
+	int32 InitialIdleFrames = 0;
+	bool bExecuteActions = false;            // run the production condition's actions on the team while it is built
+	bool bAutoReinforce = false;
+	bool bRecruitable = false;
+	float DestroyedThreshold = 0.f;
+	FString ProductionCondition;
+	FString OnCreate, OnDestroyed, OnIdle, OnEnemySighted, OnAllClear, OnUnitDestroyed;
+	FString Generic[MaxGenericScripts];
+	// Reinforcements (a map's teams): where they come from, in what, and whether they arrive inside it.
+	FString ReinforcementOrigin;
+	FString TransportUnitType;
+	bool bStartsFull = false;
+	bool bTransportsReturn = false;
+
+	// Runtime state of the prototype (TeamPrototype)
+	const FGenScript* ConditionScript = nullptr;
+	bool bConditionAlwaysFalse = false;
+	uint32 ConditionFrameToEvaluate = 0;
+};

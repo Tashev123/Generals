@@ -2,148 +2,23 @@
 
 #include "CoreMinimal.h"
 #include "Logic/GenLogicTypes.h"
+#include "Logic/GenScriptTypes.h"
+#include "Map/GenMapData.h"
 
 class UGenGameLogic;
 class FGenObject;
 struct FGenThingTemplate;
 struct FGenPolygonTrigger;
+class FGenChunkReader;
 
-/** GameDifficulty of a computer player; scripts are tagged with the levels they run on. */
-enum class EGenDifficulty : uint8 { Easy, Normal, Hard };
-
-// ---- script data (Scripts.cpp) ----------------------------------------------------------------
-
-// The conditions and actions the skirmish scripts use. Anything else in a script file loads as Unknown
-// (conditions: false, actions: nothing).
-#define GEN_SCRIPT_CONDITIONS(X) \
-	X(CONDITION_FALSE) X(CONDITION_TRUE) X(COUNTER) X(FLAG) X(TIMER_EXPIRED) \
-	X(PLAYER_HAS_OBJECT_COMPARISON) X(NAMED_NOT_DESTROYED) X(BUILT_BY_PLAYER) X(PLAYER_HAS_CREDITS) \
-	X(START_POSITION_IS) X(SKIRMISH_SPECIAL_POWER_READY) X(TEAM_HAS_UNITS) \
-	X(PLAYER_HAS_COMPARISON_UNIT_TYPE_IN_TRIGGER_AREA) X(PLAYER_POWER_COMPARE_PERCENT) X(SKIRMISH_VALUE_IN_AREA) \
-	X(TEAM_INSIDE_AREA_PARTIALLY) X(PLAYER_HAS_POWER) X(MUSIC_TRACK_HAS_COMPLETED) X(SKIRMISH_PLAYER_FACTION) \
-	X(PLAYER_HAS_NO_POWER) X(SUPPLY_SOURCE_SAFE) X(PLAYER_BUILT_UPGRADE) X(SKIRMISH_UNOWNED_FACTION_UNIT_EXISTS) \
-	X(TEAM_DESTROYED) X(PLAYER_ALL_DESTROYED) X(SKIRMISH_TECH_BUILDING_WITHIN_DISTANCE) X(PLAYER_LOST_OBJECT_TYPE) \
-	X(UNIT_HEALTH) X(PLAYER_ACQUIRED_SCIENCE) X(TEAM_ENTERED_AREA_ENTIRELY) X(PLAYER_TRIGGERED_SPECIAL_POWER) \
-	X(PLAYER_COMPLETED_SPECIAL_POWER) X(TEAM_SOME_HAVE_OBJECT_STATUS) X(TEAM_OUTSIDE_AREA_ENTIRELY)
-
-#define GEN_SCRIPT_ACTIONS(X) \
-	X(NO_OP) X(SET_FLAG) X(SET_COUNTER) X(INCREMENT_COUNTER) X(DECREMENT_COUNTER) X(SET_TIMER) X(SET_MILLISECOND_TIMER) \
-	X(SET_RANDOM_TIMER) X(SET_RANDOM_MSEC_TIMER) X(ENABLE_SCRIPT) X(DISABLE_SCRIPT) X(CALL_SUBROUTINE) \
-	X(OBJECTLIST_ADDOBJECTTYPE) X(SET_ATTACK_PRIORITY_THING) X(TEAM_APPLY_ATTACK_PRIORITY_SET) \
-	X(TEAM_GUARD_AREA) X(TEAM_HUNT) X(TEAM_ATTACK_AREA) X(TEAM_STOP) X(TEAM_STOP_AND_DISBAND) \
-	X(TEAM_EXECUTE_SEQUENTIAL_SCRIPT) X(TEAM_STOP_SEQUENTIAL_SCRIPT) X(TEAM_AVAILABLE_FOR_RECRUITMENT) \
-	X(TEAM_MERGE_INTO_TEAM) X(TEAM_DECREASE_PRIORITY) X(TEAM_INCREASE_PRIORITY) X(TEAM_SET_ATTITUDE) \
-	X(TEAM_MOVE_TOWARDS_NEAREST_OBJECT_TYPE) X(TEAM_HUNT_WITH_COMMAND_BUTTON) \
-	X(SKIRMISH_BUILD_BUILDING) X(SKIRMISH_BUILD_STRUCTURE_FRONT) X(SKIRMISH_BUILD_STRUCTURE_FLANK) \
-	X(SKIRMISH_BUILD_BASE_DEFENSE_FRONT) X(SKIRMISH_BUILD_BASE_DEFENSE_FLANK) X(AI_PLAYER_BUILD_SUPPLY_CENTER) \
-	X(AI_PLAYER_BUILD_TYPE_NEAREST_TEAM) X(AI_PLAYER_BUILD_UPGRADE) X(BUILD_TEAM) X(RECRUIT_TEAM) \
-	X(SKIRMISH_MOVE_TO_APPROACH_PATH) X(SKIRMISH_FOLLOW_APPROACH_PATH) \
-	X(PLAYER_GIVE_MONEY) X(PLAYER_SELL_EVERYTHING) X(PLAYER_ENABLE_UNIT_CONSTRUCTION) X(PLAYER_ENABLE_BASE_CONSTRUCTION) \
-	X(TEAM_ENTER_NAMED) X(TEAM_USE_COMMANDBUTTON_ABILITY) X(SKIRMISH_FIRE_SPECIAL_POWER_AT_MOST_COST) X(MUSIC_SET_TRACK) \
-	X(TEAM_LOAD_TRANSPORTS) X(TEAM_CAPTURE_NEAREST_UNOWNED_FACTION_UNIT) X(TEAM_PARTIAL_USE_COMMANDBUTTON) \
-	X(TEAM_ALL_USE_COMMANDBUTTON_ON_NEAREST_OBJECTTYPE) X(TEAM_EXIT_ALL) X(TEAM_GARRISON_NEAREST_BUILDING) \
-	X(SKIRMISH_WAIT_FOR_COMMANDBUTTON_AVAILABLE_ALL) X(TEAM_GUARD_IN_TUNNEL_NETWORK)
-
-enum class EGenScriptCondition : uint8
+/** Reading scripts and teams out of a script file or a map (Scripts.cpp, SidesList.cpp). */
+namespace GenScriptIO
 {
-	Unknown,
-#define GEN_X(Name) C_##Name,
-	GEN_SCRIPT_CONDITIONS(GEN_X)
-#undef GEN_X
-};
-
-enum class EGenScriptAction : uint8
-{
-	Unknown,
-#define GEN_X(Name) A_##Name,
-	GEN_SCRIPT_ACTIONS(GEN_X)
-#undef GEN_X
-};
-
-/** Parameter of a condition or action: which of the fields matters depends on what it is used for. */
-struct GENERALS1_API FGenScriptParam
-{
-	int32 Int = 0;
-	float Real = 0.f;
-	FString String;
-};
-
-struct GENERALS1_API FGenScriptCondition
-{
-	EGenScriptCondition Type = EGenScriptCondition::Unknown;
-	FString TypeName;
-	TArray<FGenScriptParam> Params;
-	// Result cache of conditions that are expensive to evaluate (Condition::m_customData / m_customFrame).
-	mutable int32 CustomData = 0;
-	mutable uint32 CustomFrame = 0;
-};
-
-struct GENERALS1_API FGenScriptAction
-{
-	EGenScriptAction Type = EGenScriptAction::Unknown;
-	FString TypeName;
-	TArray<FGenScriptParam> Params;
-};
-
-/** One script: IF (any of the OR blocks, each an AND of conditions) THEN actions ELSE false-actions. */
-struct GENERALS1_API FGenScript
-{
-	FString Name;
-	bool bActive = true;
-	bool bOneShot = false;
-	bool bEasy = true, bNormal = true, bHard = true;
-	bool bSubroutine = false;
-	int32 DelaySeconds = 0;                  // evaluate only every N seconds
-	TArray<TArray<FGenScriptCondition>> Conditions;
-	TArray<FGenScriptAction> Actions;
-	TArray<FGenScriptAction> FalseActions;
-	uint32 FrameToEvaluate = 0;
-	FString ConditionTeam;                   // team named in the conditions: evaluated once per instance of it
-};
-
-struct GENERALS1_API FGenScriptGroup
-{
-	FString Name;
-	bool bActive = true;
-	bool bSubroutine = false;
-	TArray<FGenScript> Scripts;
-};
-
-struct GENERALS1_API FGenScriptList
-{
-	TArray<FGenScript> Scripts;
-	TArray<FGenScriptGroup> Groups;
-};
-
-/** Team definition (TeamTemplateInfo): which units, when it may be built, which scripts drive it. */
-struct GENERALS1_API FGenTeamProto
-{
-	static constexpr int32 MaxGenericScripts = 16;
-
-	struct FUnits { FString Unit; int32 Min = 0; int32 Max = 0; };
-
-	FString Name;
-	FString Owner;                           // "SkirmishChina"
-	bool bSingleton = false;
-	TArray<FUnits> Units;
-	int32 ProductionPriority = 0;
-	int32 SuccessIncrease = 0;
-	int32 FailureDecrease = 0;
-	int32 MaxInstances = 0;
-	int32 InitialIdleFrames = 0;
-	bool bExecuteActions = false;            // run the production condition's actions on the team while it is built
-	bool bAutoReinforce = false;
-	bool bRecruitable = false;
-	float DestroyedThreshold = 0.f;
-	FString ProductionCondition;
-	FString OnCreate, OnDestroyed, OnIdle, OnEnemySighted, OnAllClear, OnUnitDestroyed;
-	FString Generic[MaxGenericScripts];
-
-	// Runtime state of the prototype (TeamPrototype)
-	const FGenScript* ConditionScript = nullptr;
-	bool bConditionAlwaysFalse = false;
-	uint32 ConditionFrameToEvaluate = 0;
-};
+	/** A PlayerScriptsList chunk: one script list per side (or per player of a script file), in order. */
+	GENERALS1_API void ReadScriptLists(FGenChunkReader& R, int32 ChunkEnd, TArray<FGenScriptList>& Out, int32* OutNumScripts = nullptr);
+	/** A team's dictionary (TeamTemplateInfo). */
+	GENERALS1_API void ReadTeamProto(const FGenDict& D, FGenTeamProto& T);
+}
 
 /** Data\Scripts\SkirmishScripts.scb: the scripts and teams of every skirmish computer player, by faction. */
 class GENERALS1_API FGenScriptLibrary

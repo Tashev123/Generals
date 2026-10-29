@@ -26,7 +26,11 @@ struct GENERALS1_API FGenSkirmishSlot
  */
 struct GENERALS1_API FGenMatchSettings
 {
-	FString Map;                    // its name in the map cache ("Tournament Desert")
+	FString Map;                    // its name in the map cache ("Tournament Desert"); a campaign's: its folder ("MD_USA01")
+	// A campaign mission (Campaign.ini): the players, their teams and what happens come from the map's own sides and
+	// scripts, not from slots. DefaultDifficulty is the campaign's difficulty.
+	FString Campaign;               // "USA"; empty: a skirmish
+	FString Mission;                // "Mission01"
 	int32 StartingCash = 10000;
 	int32 Seed = 0;                 // the simulation's random numbers
 	TArray<FGenSkirmishSlot> Slots;
@@ -81,7 +85,7 @@ namespace GenBuild
 struct GENERALS1_API FGenReplay
 {
 	static constexpr uint32 Magic = 0x52504547; // "GEPR"
-	static constexpr uint32 Version = 2;
+	static constexpr uint32 Version = 3;
 
 	FString BuildId;
 	uint32 DataHash = 0;

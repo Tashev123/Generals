@@ -206,6 +206,7 @@ struct FGenTrain
 	bool bEverHitched = false;
 	bool bWall = false;                  // standing at a station: an obstacle to paths
 	bool bPlaced = false;
+	bool bHeld = false;                  // RailroadBehavior::setHeld (scripts): it doesn't leave the station it waits at
 	int32 WaitTimer = 0;
 	int32 CurrentPointHandle = -1;
 	uint32 WhistleFrame = 0;
@@ -531,6 +532,9 @@ public:
 	void ApplyTopplingForce(const FVector2f& Direction, float Speed, uint32 Options);
 	/** ToppleUpdate::isAbleToBeToppled */
 	bool IsAbleToBeToppled() const;
+	bool IsToppled() const { return ToppleState != EToppleState::Upright; }
+	/** OBJECT_STATUS_BURNED: burned out (a tree's black skeleton). */
+	bool IsBurned() const { return bBurned; }
 
 	float GetHealth() const { return Health; }
 	float GetMaxHealth() const { return MaxHealth; }
@@ -622,6 +626,17 @@ public:
 	bool bMapAmbientOverride = false;     // "objectSoundAmbient": this sound instead of the template's (empty: none)
 	FString MapAmbientSound;
 	int8 MapAmbientEnabled = -1;          // "objectSoundAmbientEnabled": 0 off, 1 on, -1 not said
+	// What a map's scripts know and set (Object::setName, BodyModule::setIndestructible, DISABLED_HELD).
+	FString ScriptName;
+	bool bIndestructible = false;         // takes no damage, and can't be killed
+	bool bScriptHeld = false;             // DISABLED_HELD: stands where it is, does nothing
+	uint8 EvacDisposition = 0;            // ContainModuleInterface::setEvacDisposition: 0 as usual, 1 out to the left, 2 to the right
+	// BodyModule::getLastDamageInfo: who hurt it last (the scripts' "attacked by").
+	FGenObjectID LastDamageSource = GenInvalidObjectID;
+	int32 LastDamageSourcePlayer = INDEX_NONE;
+	const FGenThingTemplate* LastDamageSourceTemplate = nullptr;
+	/** AIFollowWaypointPathExactState: along the points as they are, without looking for a way round anything. */
+	void CommandFollowPathExact(const TArray<FVector2f>& Points);
 	/** W3DDebrisDraw::setAnimNames: what the chunk plays first (0), in flight (1) and once it has come down (2), and the effect of landing. */
 	const FString& GetDebrisAnim(int32 Which) const { return DebrisAnims[Which]; }
 	const FString& GetDebrisFXFinal() const { return DebrisFXFinal; }
@@ -2113,4 +2128,5 @@ private:
 	friend class UGenGameLogic;
 	friend class FGenSkirmishAI;
 	friend class FGenParkingPlace;
+	friend class FGenMapScripts;
 };

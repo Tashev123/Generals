@@ -182,7 +182,7 @@ void UGenGameLogic::ExecSpecialPower(const FGenCommand& C)
 		S ? *S->GetTemplate()->Name : TEXT("nothing"), C.Pos.X, C.Pos.Y, Module == INDEX_NONE ? TEXT("no such power there") : TEXT("not ready"));
 }
 
-bool UGenGameLogic::FireSpecialPower(FGenObject& Source, int32 Module, const FVector3f& InTargetPos, FGenObjectID TargetObj)
+bool UGenGameLogic::FireSpecialPower(FGenObject& Source, int32 Module, const FVector3f& InTargetPos, FGenObjectID TargetObj, bool bFromScript)
 {
 	// (A particle cannon whose beam is burning: the order says where the beam goes next.)
 	if (Source.GetTemplate()->ParticleCannon.bValid && Source.GetTemplate()->PowerModules.IsValidIndex(Module)
@@ -191,12 +191,18 @@ bool UGenGameLogic::FireSpecialPower(FGenObject& Source, int32 Module, const FVe
 	{
 		return true;
 	}
-	if (!IsPowerReady(Source, Module))
+	if (bFromScript ? (!Source.GetTemplate()->PowerModules.IsValidIndex(Module) || Source.IsDead()) : !IsPowerReady(Source, Module))
 	{
 		return false;
 	}
 	const FGenSpecialPowerModule& M = Source.GetTemplate()->PowerModules[Module];
-	const FGenSpecialPowerTemplate& T = *FGenUpgradeData::Get().FindPower(M.Power);
+	const FGenSpecialPowerTemplate* PowerTemplate = FGenUpgradeData::Get().FindPower(M.Power);
+	if (!PowerTemplate)
+	{
+		return false;
+	}
+	const FGenSpecialPowerTemplate& T = *PowerTemplate;
+	const bool bAtNoSpot = InTargetPos.X == FLT_MAX;
 	const int32 Player = Source.GetOwner();
 	FVector3f TargetPos = InTargetPos;
 	const FGenObject* Victim = FindObject(TargetObj);
@@ -206,7 +212,11 @@ bool UGenGameLogic::FireSpecialPower(FGenObject& Source, int32 Module, const FVe
 	}
 	TargetPos.Z = GetGroundHeight(TargetPos.X, TargetPos.Y);
 
-	const bool bCannon = Source.BeginParticleCannon(M.Power, TargetPos, Frame) || DeployGunship(Source, M.Power, TargetPos);
+	if (bAtNoSpot)
+	{
+		TargetPos = Source.GetPosition();
+	}
+	const bool bCannon = !bAtNoSpot && (Source.BeginParticleCannon(M.Power, TargetPos, Frame) || DeployGunship(Source, M.Power, TargetPos));
 	switch (bCannon ? EGenPowerModule::Other : M.Type)
 	{
 	case EGenPowerModule::Other:
@@ -289,6 +299,27 @@ bool UGenGameLogic::FireSpecialPower(FGenObject& Source, int32 Module, const FVe
 		RunPowerOCL(OCLName, Source, CreatePos, TargetPos, Reference ? &Reference->PlacementViewAngle : nullptr);
 		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [power f%u] p%d fires %s (%s) at (%.0f, %.0f) from (%.0f, %.0f)"), Frame, Player, *T.Name, *OCLName,
 			TargetPos.X, TargetPos.Y, CreatePos.X, CreatePos.Y);
+		break;
+	}
+	case EGenPowerModule::BaikonurLaunch:
+	{
+		// BaikonurLaunchPower::doSpecialPower: the launch (the model's DOOR_1_OPENING); doSpecialPowerAtLocation: the
+		// rocket's detonation object is made there.
+		if (Source.IsDisabled())
+		{
+			return false;
+		}
+		if (bAtNoSpot)
+		{
+			Source.SetModelCondition(GenConditions::Index(TEXT("DOOR_1_OPENING")), true);
+			UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [power f%u] #%u %s launches (%s)"), Frame, Source.GetID(), *Source.GetTemplate()->Name, *T.Name);
+		}
+		else if (const FGenThingTemplate* Detonation = FGenGameData::Get().FindTemplate(M.DetonationObject))
+		{
+			CreateObject(Detonation, Player, TargetPos, 0.f);
+			UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [power f%u] #%u %s: %s at (%.0f, %.0f)"), Frame, Source.GetID(), *Source.GetTemplate()->Name,
+				*M.DetonationObject, TargetPos.X, TargetPos.Y);
+		}
 		break;
 	}
 	case EGenPowerModule::CashHack:

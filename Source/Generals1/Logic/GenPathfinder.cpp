@@ -42,7 +42,7 @@ void FGenPathfinder::Build(const FGenMapData& Map, const TArray<FGenBridgeInfo>&
 	ClosedStamp.Reset();
 	++ObstacleVersion;
 
-	const FBox2f Playable = Map.GetPlayableBounds();
+	const FBox2f Playable = Map.GetLargestBounds();
 	for (int32 Y = 0; Y < Height; ++Y)
 	{
 		for (int32 X = 0; X < Width; ++X)

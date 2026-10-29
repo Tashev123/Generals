@@ -363,6 +363,11 @@ bool FGenUpgradeData::ParseSpecialPowerModule(const FString& Type, const FGenIni
 		Out.InitiateSound = Block.GetString(TEXT("InitiateSound"));
 		Out.CleanupMoveRange = Block.GetFloat(TEXT("MaxMoveDistanceFromLocation"), 0.f);
 	}
+	else if (Type.Equals(TEXT("BaikonurLaunchPower"), ESearchCase::IgnoreCase))
+	{
+		Out.Type = EGenPowerModule::BaikonurLaunch;
+		Out.DetonationObject = Block.GetString(TEXT("DetonationObject"));
+	}
 	return true;
 }
 

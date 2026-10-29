@@ -402,7 +402,7 @@ void FGenObject::UpdateTrain(uint32 Frame)
 			}
 			break;
 		case FGenTrain::EConductor::WaitAtStation:
-			if (--T.WaitTimer <= 0)
+			if (--T.WaitTimer <= 0 && !T.bHeld)
 			{
 				T.State = FGenTrain::EConductor::Accelerate;
 				C.Speed = 0.05f * C.Direction;

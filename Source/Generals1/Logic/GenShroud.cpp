@@ -212,6 +212,35 @@ void FGenShroud::RevealMapForPlayerPermanently(int32 Player)
 	}
 }
 
+void FGenShroud::UndoRevealMapForPlayerPermanently(int32 Player)
+{
+	if (Player < 0 || Player >= PlayerCount)
+	{
+		return;
+	}
+	for (int32 i = 0, Num = CellsX * CellsY; i < Num; ++i)
+	{
+		RemoveLooker(Player, i);
+	}
+}
+
+void FGenShroud::ShroudMapForPlayer(int32 Player)
+{
+	if (Player < 0 || Player >= PlayerCount)
+	{
+		return;
+	}
+	for (int32 i = 0, Num = CellsX * CellsY; i < Num; ++i)
+	{
+		int16& C = Current[Player * CellsX * CellsY + i];
+		if (C == 0)
+		{
+			C = 1;
+			++Serials[Player];
+		}
+	}
+}
+
 // ---- objects looking ----------------------------------------------------------------------------
 
 void FGenObject::InitShroud()
@@ -321,7 +350,7 @@ void UGenGameLogic::InitShroud()
 {
 	const FGenMapData* Map = GetMap();
 	const FGenGameData& GD = FGenGameData::Get();
-	const FBox2f Bounds = Map->GetPlayableBounds();
+	const FBox2f Bounds = Map->GetLargestBounds();
 	Shroud.Init(Bounds.Max, GD.PartitionCellSize, Players.Num());
 	RadarEvents.Reset();
 	bHasLastRadarEvent = false;
@@ -340,7 +369,7 @@ void UGenGameLogic::InitShroud()
 		}
 		// GameLogic::startNewGame: "remove shroud for the player in MP games" - unless Multiplayer.ini
 		// asks for it, a skirmish map is explored from the start, and only what moves on it is hidden.
-		if (!P.bNeutral && !GD.bShroudInMultiplayer)
+		if (!P.bNeutral && !GD.bShroudInMultiplayer && !IsCampaign())
 		{
 			Shroud.RevealMapForPlayer(P.Index);
 		}

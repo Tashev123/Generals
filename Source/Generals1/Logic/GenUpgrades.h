@@ -192,6 +192,7 @@ enum class EGenPowerModule : uint8
 	SpyVision,      // SpyVisionSpecialPower: for a while the player sees what the enemy's units see
 	SpecialAbility, // SpecialAbility: a unit's own ability; its SpecialAbilityUpdate carries it out
 	CleanupArea,    // CleanupAreaPower: the ambulance cleans up every hazard round a spot (its CleanupHazardUpdate)
+	BaikonurLaunch, // BaikonurLaunchPower (campaign only): the rocket goes up; aimed at a spot, its DetonationObject is made there
 };
 
 struct GENERALS1_API FGenSpecialPowerModule
@@ -212,6 +213,7 @@ struct GENERALS1_API FGenSpecialPowerModule
 	int32 Duration = 0;                         // SpyVisionSpecialPower: BaseDuration, frames
 	FString InitiateSound;                      // SpecialAbility: what the unit says when sent to do it
 	float CleanupMoveRange = 0.f;               // CleanupAreaPower: MaxMoveDistanceFromLocation
+	FString DetonationObject;                   // BaikonurLaunchPower
 };
 
 /**

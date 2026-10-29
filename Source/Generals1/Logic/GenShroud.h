@@ -106,6 +106,10 @@ public:
 	void RevealMapForPlayer(int32 Player);
 	/** revealMapForPlayerPermanently: the player sees the whole map from now on. */
 	void RevealMapForPlayerPermanently(int32 Player);
+	/** undoRevealMapForPlayerPermanently: the permanent look is taken back (what was seen stays explored). */
+	void UndoRevealMapForPlayerPermanently(int32 Player);
+	/** shroudMapForPlayer: everything the player isn't looking at right now is shrouded again. */
+	void ShroudMapForPlayer(int32 Player);
 
 	/** Goes up whenever a cell changes its status for that player. */
 	uint32 GetChangeSerial(int32 Player) const { return Serials.IsValidIndex(Player) ? Serials[Player] : 0; }

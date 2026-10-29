@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Logic/GenScriptTypes.h"
 
 /** Dict value from the map file (Common/Dict.h). */
 struct GENERALS1_API FGenDictValue
@@ -105,6 +106,8 @@ public:
 	int32 Height = 0;
 	int32 Border = 0;
 	TArray<FIntPoint> Boundaries;
+	/** TerrainLogic::setActiveBoundary: which of them is the playable area now (a campaign's scripts switch it). */
+	int32 ActiveBoundary = 0;
 	TArray<uint8> Heights;
 
 	// BlendTileData
@@ -123,6 +126,8 @@ public:
 	TArray<FGenMapObject> Objects;
 	FGenDict WorldInfo;
 	TArray<FGenMapSide> Sides;
+	/** PlayerScriptsList: the scripts of each side, in the order of Sides (campaign maps; skirmish maps have empty ones). */
+	TArray<FGenScriptList> ScriptLists;
 	TArray<FGenDict> Teams;
 	int32 TimeOfDay = 1;
 	TArray<FGenMapLighting> Lighting;       // [0..3] = MORNING, AFTERNOON, EVENING, NIGHT
@@ -142,6 +147,8 @@ public:
 
 	/** Playable area in world units (inside the border). */
 	FBox2f GetPlayableBounds() const;
+	/** The largest of the boundaries: everything any of them can show (the grids of the logic cover this). */
+	FBox2f GetLargestBounds() const;
 
 	const FGenMapObject* FindWaypoint(const FString& Name) const;
 	const FGenMapLighting* GetCurrentLighting() const;

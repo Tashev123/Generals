@@ -88,6 +88,7 @@ void FGenObject::TakeOverVehicle(FGenObject& Vehicle)
 		Vehicle.CommandStop();
 		Vehicle.SetOwner(Owner); // defect
 		Vehicle.bCarBomb = true;
+		Logic->OnObjectNameTransfer(*this, Vehicle); // (ConvertToCarBombCrateCollide: "transferObjectName")
 		Vehicle.SetVeterancyLevel(VeterancyLevel);
 		UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [hijack f%u] #%u %s makes #%u %s a car bomb for p%d (%s)"), Frame, ID, *Template->Name, Vehicle.ID,
 			*Vehicle.Template->Name, Owner, Vehicle.Weapons[0].Template ? *Vehicle.Weapons[0].Template->Name : TEXT("-"));
@@ -103,6 +104,7 @@ void FGenObject::TakeOverVehicle(FGenObject& Vehicle)
 	Vehicle.CommandStop();
 	Vehicle.SetOwner(Owner);
 	Vehicle.bHijacked = true;
+	Logic->OnObjectNameTransfer(*this, Vehicle);
 	Logic->PlaySoundAt(TEXT("HijackDriver"), *this);
 	const int32 Highest = FMath::Max(VeterancyLevel, Vehicle.VeterancyLevel);
 	SetVeterancyLevel(Highest, false);

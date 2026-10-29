@@ -124,7 +124,17 @@ public:
 
 	int32 NumEvents() const { return Events.Num(); }
 
+	/**
+	 * AudioManager::getAudioLengthMS: how long an event's sound lasts, in seconds, from its file's header (the first
+	 * of its sounds; 0 if there is none). Asked by the scripts from the simulation's thread too.
+	 */
+	float GetEventLengthSeconds(const FString& Name) const;
+	/** ... of a file in the archives (WAV or MP3). */
+	static float GetFileLengthSeconds(const FString& VfsPath);
+
 private:
+	mutable FCriticalSection LengthLock;
+	mutable TMap<FString, float> LengthCache;  // key: lower-case event name
 	bool bInitialized = false;
 	FGenAudioSettings Settings;
 	TMap<FString, FGenAudioEventInfo> Events;   // key: lower-case name

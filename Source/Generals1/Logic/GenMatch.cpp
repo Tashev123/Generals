@@ -52,7 +52,7 @@ void FGenSkirmishSlot::Serialize(FArchive& Ar)
 
 void FGenMatchSettings::Serialize(FArchive& Ar)
 {
-	Ar << Map << StartingCash << Seed;
+	Ar << Map << Campaign << Mission << StartingCash << Seed;
 	int32 NumSlots = Slots.Num();
 	Ar << NumSlots;
 	if (Ar.IsLoading())
@@ -77,6 +77,9 @@ FGenMatchSettings FGenMatchSettings::FromCommandLine()
 	S.Seed = int32(FDateTime::Now().GetTicks() & 0x7fffffff);
 	FParse::Value(Cmd, TEXT("GenSeed="), S.Seed);
 	S.bNoAI = FParse::Param(Cmd, TEXT("GenNoAI"));
+	// -GenCampaign=USA [-GenMission=Mission01]: a campaign mission (the map is the mission's).
+	FParse::Value(Cmd, TEXT("GenCampaign="), S.Campaign);
+	FParse::Value(Cmd, TEXT("GenMission="), S.Mission);
 	FString DifficultyName;
 	if (FParse::Value(Cmd, TEXT("GenDifficulty="), DifficultyName))
 	{
@@ -121,6 +124,11 @@ bool FGenMatchSettings::ApplyToSimulation(FString* OutWhy) const
 FString FGenMatchSettings::Describe() const
 {
 	FString Out = FString::Printf(TEXT("%s, $%d, seed %d, %d slots"), *Map, StartingCash, Seed, Slots.Num());
+	if (!Campaign.IsEmpty())
+	{
+		Out = FString::Printf(TEXT("campaign %s %s (%s), %s, seed %d"), *Campaign, *Mission, *Map,
+			DefaultDifficulty == 0 ? TEXT("easy") : (DefaultDifficulty == 2 ? TEXT("hard") : TEXT("normal")), Seed);
+	}
 	for (int32 i = 0; i < Slots.Num(); ++i)
 	{
 		const FGenSkirmishSlot& S = Slots[i];

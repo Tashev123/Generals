@@ -6,6 +6,7 @@
 #include "Logic/GenGameData.h"
 #include "Logic/GenGameLogic.h"
 #include "Logic/GenPathfinder.h"
+#include "Map/GenMapData.h"
 #include "Generals1.h"
 
 namespace
@@ -103,7 +104,7 @@ FGenObject::FGenObject(FGenObjectID InID, const FGenThingTemplate* InTemplate, i
 
 bool FGenObject::IsDisabled() const
 {
-	return bUnderpowered || bUnmanned || Logic->GetFrame() < FMath::Max(DisabledUntilFrame, HackedUntilFrame);
+	return bUnderpowered || bUnmanned || bScriptHeld || Logic->GetFrame() < FMath::Max(DisabledUntilFrame, HackedUntilFrame);
 }
 
 bool FGenObject::ShouldAnimate(bool bConsiderPower) const
@@ -166,6 +167,29 @@ void FGenObject::CommandMoveTo(const FVector3f& InGoal)
 	bHasResumeGoal = false;
 	MoveOutOfWayOf = GenInvalidObjectID;
 	StartPath(InGoal, false);
+}
+
+void FGenObject::CommandFollowPathExact(const TArray<FVector2f>& Points)
+{
+	// AIFollowWaypointPathExactState: one path through every point, straight from each to the next.
+	if (bDead || !CanMove() || Points.Num() == 0)
+	{
+		return;
+	}
+	if (bFlies || bJetAI)
+	{
+		CommandFollowPath(Points);
+		return;
+	}
+	StopDocking();
+	ClearAttack();
+	CommandStop();
+	AIMode = EGenAIMode::None;
+	const FVector2f& Last = Points.Last();
+	StartDirectMove(FVector3f(Last.X, Last.Y, Logic->GetGroundHeight(Last.X, Last.Y)));
+	Path = Points;
+	PathIndex = 0;
+	PathLayers.Reset();
 }
 
 void FGenObject::StartDirectMove(const FVector3f& InGoal)
@@ -407,6 +431,16 @@ void FGenObject::Update(uint32 Frame)
 	if (Template->BoneFX.Num() > 0)
 	{
 		UpdateBoneFX(Frame); // (dead or flying too: a tower's rubble, a flame in the air)
+	}
+	if (Template->bFloatLifts)
+	{
+		// FloatUpdate::update, Enabled: "snap to the water surface". (Its rocking is the drawing's.)
+		const FGenMapData* Map = Logic->GetMap();
+		float WaterZ = 0.f;
+		if (Map && Map->IsUnderwater(Position.X, Position.Y, &WaterZ))
+		{
+			SetPosition(FVector3f(Position.X, Position.Y, WaterZ));
+		}
 	}
 	if (Projectile.bActive)
 	{

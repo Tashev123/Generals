@@ -813,7 +813,7 @@ bool UGenGameLogic::CanPurchaseScience(int32 Player, const FString& Science, FSt
 	// Player::isCapableOfPurchasingScience
 	auto No = [OutWhy](const FString& Why) { if (OutWhy) { *OutWhy = Why; } return false; };
 	const FGenScience* S = FGenUpgradeData::Get().FindScience(Science);
-	if (!S || !Players.IsValidIndex(Player))
+	if (!S || !Players.IsValidIndex(Player) || (MapScripts && MapScripts->IsScienceHidden(Player, Science)))
 	{
 		return No(TEXT("Not available"));
 	}
@@ -937,7 +937,8 @@ void UGenGameLogic::AddSkillPoints(int32 Player, int32 Points)
 	}
 	// (Capped at what the highest rank needs.)
 	P.SkillPoints = FMath::Min(P.SkillPoints + Points, Ranks.Last().SkillPointsNeeded);
-	while (P.RankLevel < Ranks.Num() && P.SkillPoints >= Ranks[P.RankLevel].SkillPointsNeeded)
+	// (Player::setRankLevel: a campaign's scripts may hold the general below some rank.)
+	while (P.RankLevel < Ranks.Num() && P.SkillPoints >= Ranks[P.RankLevel].SkillPointsNeeded && (RankLevelLimit <= 0 || P.RankLevel < RankLevelLimit))
 	{
 		const FGenRank& Next = Ranks[P.RankLevel];
 		++P.RankLevel;

@@ -3,6 +3,7 @@
 #include "Core/GenCoords.h"
 #include "Core/GenFileSystem.h"
 #include "Map/GenDataChunk.h"
+#include "Logic/GenSkirmishAI.h"
 #include "Generals1.h"
 
 namespace
@@ -229,6 +230,16 @@ bool FGenMapData::LoadFromMemory(TConstArrayView<uint8> InData)
 				const int32 NumTeams = R.I32();
 				for (int32 i = 0; i < NumTeams; ++i) { Teams.Add(R.Dict()); }
 			}
+			// SidesList::ParseSidesDataChunk: the sides' scripts follow, one list per side.
+			FChunkReader::FChunk SC;
+			while (R.NextChunk(C.End, SC))
+			{
+				if (SC.Name == TEXT("PlayerScriptsList"))
+				{
+					GenScriptIO::ReadScriptLists(R, SC.End, ScriptLists);
+				}
+				R.Pos = SC.End;
+			}
 		}
 		else if (C.Name == TEXT("GlobalLighting"))
 		{
@@ -303,7 +314,21 @@ FVector3f FGenMapData::GetGroundNormal(float WorldX, float WorldY) const
 
 FBox2f FGenMapData::GetPlayableBounds() const
 {
-	const FIntPoint B = Boundaries.Num() > 0 ? Boundaries[0] : FIntPoint(Width - 2 * Border, Height - 2 * Border);
+	const FIntPoint B = Boundaries.Num() > 0 ? Boundaries[FMath::Clamp(ActiveBoundary, 0, Boundaries.Num() - 1)] : FIntPoint(Width - 2 * Border, Height - 2 * Border);
+	return FBox2f(FVector2f(0.f, 0.f), FVector2f(float(B.X), float(B.Y)) * GenCoords::MapXYFactor);
+}
+
+FBox2f FGenMapData::GetLargestBounds() const
+{
+	FIntPoint B(Width - 2 * Border, Height - 2 * Border);
+	if (Boundaries.Num() > 0)
+	{
+		B = FIntPoint(0, 0);
+		for (const FIntPoint& Each : Boundaries)
+		{
+			B = FIntPoint(FMath::Max(B.X, Each.X), FMath::Max(B.Y, Each.Y));
+		}
+	}
 	return FBox2f(FVector2f(0.f, 0.f), FVector2f(float(B.X), float(B.Y)) * GenCoords::MapXYFactor);
 }
 

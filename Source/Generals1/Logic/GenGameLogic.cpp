@@ -267,6 +267,7 @@ void UGenGameLogic::Deinitialize()
 	DelayedDamage.Reset();
 	FloatingTexts.Reset();
 	AIPlayers.Reset();
+	MapScripts.Reset();
 	ObstacleOwners.Reset();
 	PendingCommands.Reset();
 	PendingLocal.Reset();
@@ -464,6 +465,18 @@ bool UGenGameLogic::StartSkirmish(AGenMapActor* InMapActor, const FGenMatchSetti
 	Neutral.Name = TEXT("Neutral");
 	Neutral.Template = GD.FindPlayerTemplate(TEXT("FactionCivilian"));
 	Neutral.bNeutral = true;
+	LocalPlayer = INDEX_NONE;
+	MapScripts.Reset();
+	RankLevelLimit = 0;
+	bScoringEnabled = true;
+	if (IsCampaign())
+	{
+		// A campaign mission: the map's sides are the players, and its scripts run the game (the objects of the
+		// map join their teams as they are made).
+		SetupCampaignPlayers();
+		MapScripts = MakeUnique<FGenMapScripts>(this);
+		MapScripts->NewMap(*Map, Match.DefaultDifficulty == 0 ? EGenDifficulty::Easy : (Match.DefaultDifficulty == 2 ? EGenDifficulty::Hard : EGenDifficulty::Normal));
+	}
 
 	SpawnMapObjects();
 
@@ -481,8 +494,7 @@ bool UGenGameLogic::StartSkirmish(AGenMapActor* InMapActor, const FGenMatchSetti
 		FreeStarts.Remove(S.StartPosition);
 	}
 
-	LocalPlayer = INDEX_NONE;
-	for (int32 SlotIdx = 0; SlotIdx < Slots.Num(); ++SlotIdx)
+	for (int32 SlotIdx = 0; SlotIdx < Slots.Num() && !IsCampaign(); ++SlotIdx)
 	{
 		const FGenSkirmishSlot& S = Slots[SlotIdx];
 		FGenPlayer& P = Players.AddDefaulted_GetRef();
@@ -530,8 +542,9 @@ bool UGenGameLogic::StartSkirmish(AGenMapActor* InMapActor, const FGenMatchSetti
 	// (AIData.ini also says how groups of units move, whoever plays.)
 	FGenAIData::Get().Initialize();
 
-	// Computer players: every slot that isn't played by a human (-GenNoAI leaves them passive).
-	if (!Match.bNoAI)
+	// Computer players: every slot that isn't played by a human (-GenNoAI leaves them passive). (A campaign's computer
+	// players have no skirmish brain: their map's scripts move them.)
+	if (!Match.bNoAI && !IsCampaign())
 	{
 		const EGenDifficulty Difficulty = Match.DefaultDifficulty == 0 ? EGenDifficulty::Easy
 			: (Match.DefaultDifficulty == 2 ? EGenDifficulty::Hard : EGenDifficulty::Normal);
@@ -607,7 +620,12 @@ void UGenGameLogic::SpawnMapObjects()
 			continue;
 		}
 		const float Ground = Map->GetGroundHeight(O.Location.X, O.Location.Y);
-		FGenObject* New = CreateObject(T, 0, FVector3f(O.Location.X, O.Location.Y, O.Location.Z + Ground), O.Angle);
+		const int32 Owner = MapScripts ? MapScripts->GetMapObjectOwner(O) : 0;
+		FGenObject* New = CreateObject(T, Owner, FVector3f(O.Location.X, O.Location.Y, O.Location.Z + Ground), O.Angle);
+		if (New && MapScripts)
+		{
+			MapScripts->OnMapObjectCreated(*New, O);
+		}
 		if (New)
 		{
 			// Object::updateObjValuesFromMapProperties: the ambient sound the map gives it, or takes away.
@@ -979,6 +997,11 @@ void UGenGameLogic::CreatePendingVisuals()
 		DS.Object = O;
 		DS.Model = MC;
 		DS.DrawTemplate = Template;
+		// W3DTreeBuffer::addTree / updateSway, SwayClientUpdate: one of the breeze's ten motions, at random (the
+		// client's), from its foot.
+		const int32 SwayType = Template->Sway != FGenThingTemplate::ESway::None && O->GetDebrisModel().IsEmpty() && !O->IsToppled() ? FMath::RandRange(1, 10) : 0;
+		const float SwayBaseZ = float(MapActor->GetActorTransform().TransformPosition(MC->GetRelativeLocation()).Z);
+		MC->SetSway(SwayType, SwayBaseZ);
 		if (!O->GetDebrisModel().IsEmpty())
 		{
 			continue;
@@ -1168,6 +1191,12 @@ EGenRelationship UGenGameLogic::GetRelationship(int32 A, int32 B) const
 	if (!Players.IsValidIndex(A) || !Players.IsValidIndex(B) || Players[A].bNeutral || Players[B].bNeutral)
 	{
 		return EGenRelationship::Neutral;
+	}
+	if (Players[A].bScriptRelations)
+	{
+		// Player::getRelationship: what the map (or a script since) says; anybody else is neutral.
+		const EGenRelationship* R = Players[A].Relations.Find(B);
+		return R ? *R : EGenRelationship::Neutral;
 	}
 	const int32 TA = Players[A].Team, TB = Players[B].Team;
 	return (TA >= 0 && TA == TB) ? EGenRelationship::Allies : EGenRelationship::Enemies;
@@ -2114,6 +2143,19 @@ void UGenGameLogic::StepLogic()
 		}
 	}
 
+	// A campaign's scripts (GameLogic::update: "update (execute) scripts" before anything else moves). While they
+	// have frozen time, only they run.
+	if (MapScripts)
+	{
+		MapScripts->Update(Frame);
+		SimYield(TEXT("the map's scripts"));
+		if (MapScripts->IsTimeFrozen())
+		{
+			UpdateShroud();
+			return;
+		}
+	}
+
 	// Computer players think (scripts, base building, teams) before their units act.
 	for (const TUniquePtr<FGenSkirmishAI>& AI : AIPlayers)
 	{
@@ -2333,7 +2375,7 @@ void UGenGameLogic::UpdateDrawables()
 			continue;
 		}
 		const bool bLook = !DS.bPlaced || DS.bBusy || DS.bStatePending || ((It.Key + Turn) & 3) == 0;
-		if (!bLook && (DS.bFrozen || !(O->IsDynamic() || DS.bHasTurret || DS.bRider)))
+		if (!bLook && (DS.bFrozen || !(O->IsDynamic() || DS.bHasTurret || DS.bRider || DS.bAnimatedBones || DS.PoliceFrame >= 0.f || O->GetTemplate()->bFloat)))
 		{
 			continue;
 		}
@@ -2763,6 +2805,7 @@ void UGenGameLogic::UpdateDrawables()
 				bNewStateSystems = true;
 				DS.StateSystemsFor = State;
 				DestroySystems(DS.StateSystems);
+				DS.StateSystemBones.Reset();
 				if (State)
 				{
 					for (const TPair<FString, FString>& PB : State->ParticleBones)
@@ -2770,7 +2813,9 @@ void UGenGameLogic::UpdateDrawables()
 						FTransform3f BoneXf;
 						if (MC->GetBoneTransformW3D(PB.Key, BoneXf))
 						{
+							const int32 Before = DS.StateSystems.Num();
 							Attach(PB.Value, BoneXf, DS.StateSystems);
+							if (DS.StateSystems.Num() > Before) { DS.StateSystemBones.Add(PB.Key); }
 						}
 					}
 				}
@@ -2785,6 +2830,7 @@ void UGenGameLogic::UpdateDrawables()
 				E.StateSystemsFor = E.State.Cur;
 				bNewStateSystems = true;
 				DestroySystems(E.StateSystems);
+				E.StateSystemBones.Reset();
 				UGenModelComponent* Extra = E.Model.Get();
 				for (int32 b = 0; Extra && E.State.Cur && b < E.State.Cur->ParticleBones.Num(); ++b)
 				{
@@ -2792,8 +2838,20 @@ void UGenGameLogic::UpdateDrawables()
 					FTransform3f BoneXf;
 					if (Extra->GetBoneTransformW3D(PB.Key, BoneXf))
 					{
+						const int32 Before = E.StateSystems.Num();
 						Attach(PB.Value, BoneXf, E.StateSystems);
+						if (E.StateSystems.Num() > Before) { E.StateSystemBones.Add(PB.Key); }
 					}
+				}
+			}
+			if (bNewStateSystems)
+			{
+				// W3DModelDraw's ParticlesAttachedToAnimatedBones, and AnimatedParticleSysBoneClientUpdate for all of
+				// them: such systems are moved with their bones every frame (below).
+				DS.bAnimatedBones = Draw && (Draw->bParticlesOnAnimatedBones || DrawT->bAnimatedParticleBones) && DS.StateSystems.Num() > 0;
+				for (const FExtraDraw& E : DS.Extras)
+				{
+					DS.bAnimatedBones |= (DrawT->Draws[E.DrawIndex].bParticlesOnAnimatedBones || DrawT->bAnimatedParticleBones) && E.StateSystems.Num() > 0;
 				}
 			}
 
@@ -2873,6 +2931,92 @@ void UGenGameLogic::UpdateDrawables()
 					}
 				}
 			}
+		}
+
+		// W3DModelDraw::updateBonesForClientParticleSystems: bone systems that go where the animation takes their bones
+		// (a railway bridge's burning beams falling with it, a gunship's smoke).
+		if (FX && DS.bAnimatedBones && !DS.bHidden)
+		{
+			// (-GenTrace: where the last of them is, every second of game time.)
+			const bool bTraceBones = bTrace && PublishedFrame % 30 == 0 && DS.BoneTraceFrame != PublishedFrame;
+			auto Follow = [this, &DS, &It, O, bTraceBones](UGenModelComponent* Model, const TArray<uint32>& Ids, const TArray<FString>& Bones)
+			{
+				for (int32 i = 0; i < Ids.Num() && i < Bones.Num(); ++i)
+				{
+					FTransform3f BoneXf;
+					FGenParticleSystem* Sys = FX->FindSystem(Ids[i]);
+					if (Sys && Model->GetBoneTransformW3D(Bones[i], BoneXf))
+					{
+						Sys->SetLocalTransform(BoneXf);
+						if (bTraceBones && i == Ids.Num() - 1 && DS.BoneTraceFrame != PublishedFrame)
+						{
+							DS.BoneTraceFrame = PublishedFrame;
+							const FVector3f B = BoneXf.GetTranslation();
+							UE_LOG(LogGenerals, Log, TEXT("  [bones f%u] #%u %s: %d systems follow the animation (frame %.1f), %s at (%.1f, %.1f, %.1f)"),
+								PublishedFrame, It.Key, *O->GetTemplate()->Name, Ids.Num(), Model->GetAnimFrame(), *Bones[i], B.X, B.Y, B.Z);
+						}
+					}
+				}
+			};
+			if (Draw && (Draw->bParticlesOnAnimatedBones || DrawT->bAnimatedParticleBones))
+			{
+				Follow(MC, DS.StateSystems, DS.StateSystemBones);
+			}
+			for (const FExtraDraw& E : DS.Extras)
+			{
+				UGenModelComponent* Extra = E.Model.Get();
+				if (Extra && (DrawT->Draws[E.DrawIndex].bParticlesOnAnimatedBones || DrawT->bAnimatedParticleBones))
+				{
+					Follow(Extra, E.StateSystems, E.StateSystemBones);
+				}
+			}
+		}
+
+		// W3DPoliceCarDraw::doDrawModule: the light bar's animation is put on its frame by hand - a quarter of a frame
+		// each drawn 30 Hz frame, from a random one - and a light the colour of the bar at that frame floats over the car.
+		if (Draw && Draw->bPoliceLights && !DS.bHidden && !O->IsDead())
+		{
+			if (DS.PoliceFrame < 0.f)
+			{
+				DS.PoliceFrame = FMath::FRandRange(0.f, 10.f);
+			}
+			if (MC->HasAnimation())
+			{
+				DS.PoliceFrame += 0.25f * DeltaFrames * 30.f / float(GenLogic::GetLogicFPS());
+				if (DS.PoliceFrame > float(MC->GetAnimNumFrames() - 1))
+				{
+					DS.PoliceFrame = 0.f;
+				}
+				MC->SetAnimationPaused(true); // (only ever where this puts it)
+				MC->SetAnimFrame(DS.PoliceFrame);
+			}
+			const float F = DS.PoliceFrame;
+			float Red = 0.f, Green = 0.f, Blue = 0.f;
+			if (F < 3.f) { Red = 1.f; Green = 0.5f; }
+			else if (F < 6.f) { Red = 1.f; }
+			else if (F < 7.f) { Red = 1.f; Green = 0.5f; }
+			else if (F < 9.f) { Red = 0.5f + (9.f - F) / 4.f; Blue = (F - 5.f) / 6.f; }
+			else if (F < 12.f) { Blue = 1.f; }
+			else if (F <= 14.f) { Green = (F - 11.f) / 3.f; Blue = (14.f - F) / 2.f; Red = (F - 11.f) / 3.f; }
+			if (FX)
+			{
+				const float FloatAmt = 8.f;
+				const FVector3f At = GetRenderPosition(*O) + FVector3f(0.f, 0.f, FloatAmt);
+				FX->SetObjectLight(It.Key, At, FLinearColor(FMath::Min(Red, 1.f), FMath::Min(Green, 1.f), FMath::Min(Blue, 1.f)), 20.f); // Set_Far_Attenuation_Range(3, 20)
+			}
+			if (bTrace && PublishedFrame % 10 == 0 && DS.BoneTraceFrame != PublishedFrame)
+			{
+				DS.BoneTraceFrame = PublishedFrame;
+				UE_LOG(LogGenerals, Log, TEXT("  [police f%u] #%u %s: light bar frame %.2f of %d, light (%.2f, %.2f, %.2f)"), PublishedFrame, It.Key,
+					*O->GetTemplate()->Name, F, MC->GetAnimNumFrames(), Red, Green, Blue);
+			}
+		}
+
+		// SwayClientUpdate: "burned things don't sway" (stopSway). Nor does a tree going over, or down.
+		if (bLook && MC->GetSwayType() != 0
+			&& (O->IsToppled() || O->IsDead() || (DrawT->Sway == FGenThingTemplate::ESway::ClientUpdate && O->IsBurned())))
+		{
+			MC->SetSway(0, 0.f);
 		}
 
 		if (State && (O->HasWeapons() || Draw->ProjectileBoneFeedbackSlots != 0))
@@ -3020,12 +3164,14 @@ void UGenGameLogic::UpdateDrawables()
 			}
 			continue;
 		}
-		if (O->IsDynamic() || !DS.bPlaced || DS.State.AdjustZ != DS.AppliedAdjustZ)
+		// (What floats rocks all the time, moving or not.)
+		const bool bFloat = O->GetTemplate()->bFloat;
+		if (O->IsDynamic() || bFloat || !DS.bPlaced || DS.State.AdjustZ != DS.AppliedAdjustZ)
 		{
 			// In the same place, facing the same way, in both logic frames the screen blends between, and
 			// its model already there: nothing to do (most units, most of the time).
 			const bool bStill = O->GetPrevPosition() == O->GetDrawPosition() && O->GetPrevOrientation() == O->GetDrawOrientation()
-				&& O->GetPrevRotation() == O->GetDrawRotation() && O->GetPrevChassis() == O->GetDrawChassis();
+				&& O->GetPrevRotation() == O->GetDrawRotation() && O->GetPrevChassis() == O->GetDrawChassis() && !bFloat;
 			if (bStill && DS.bAtRest && DS.State.AdjustZ == DS.AppliedAdjustZ)
 			{
 				continue;
@@ -3055,20 +3201,33 @@ void UGenGameLogic::UpdateDrawables()
 			DS.AppliedAdjustZ = DS.State.AdjustZ;
 			const FGenObject::FChassisPose& ChassisA = O->GetPrevChassis();
 			const FGenObject::FChassisPose& ChassisB = O->GetDrawChassis();
+			// FloatUpdate::update: the drawable's instance matrix rocks it in its own frame, by the logic's frame count
+			// ("Rotate_Y(yaw); Rotate_X(pitch)"; here by the frame the screen shows, so the rocking is smooth).
+			FQuat4f Rock = FQuat4f::Identity;
+			if (bFloat)
+			{
+				const float Angle = float(FrameNow);
+				Rock = FQuat4f(FVector3f::RightVector, FMath::Sin(Angle * 0.0291f) * 0.05f) * FQuat4f(FVector3f::ForwardVector, FMath::Sin(Angle * 0.0515f) * 0.05f);
+			}
 			if (!(ChassisA == FGenObject::FChassisPose()) || !(ChassisB == FGenObject::FChassisPose()))
 			{
 				// A vehicle's body on the ground (Drawable::applyPhysicsXform): its lift, then pitch and roll in its own frame.
 				const FQuat4f Base = O->HasFreeRotation() ? FQuat4f::Slerp(O->GetPrevRotation(), O->GetDrawRotation(), Alpha)
 					: FQuat4f(FVector3f::UpVector, GetRenderOrientation(*O));
 				const FQuat4f Q = Base * FQuat4f(FVector3f::RightVector, FMath::Lerp(ChassisA.Pitch, ChassisB.Pitch, Alpha))
-					* FQuat4f(FVector3f::ForwardVector, -FMath::Lerp(ChassisA.Roll, ChassisB.Roll, Alpha));
+					* FQuat4f(FVector3f::ForwardVector, -FMath::Lerp(ChassisA.Roll, ChassisB.Roll, Alpha)) * Rock;
 				const FVector LiftedPos = GenCoords::ToUE(P.X, P.Y, P.Z + FMath::Lerp(ChassisA.Z, ChassisB.Z, Alpha));
 				MC->SetRelativeLocationAndRotation(LiftedPos, GenCoords::QuatToUE(Q.X, Q.Y, Q.Z, Q.W));
 			}
 			else if (O->HasFreeRotation())
 			{
 				// Projectiles and tumbling debris: full orientation, interpolated between logic frames.
-				const FQuat4f Q = FQuat4f::Slerp(O->GetPrevRotation(), O->GetDrawRotation(), Alpha);
+				const FQuat4f Q = FQuat4f::Slerp(O->GetPrevRotation(), O->GetDrawRotation(), Alpha) * Rock;
+				MC->SetRelativeLocationAndRotation(NewPos, GenCoords::QuatToUE(Q.X, Q.Y, Q.Z, Q.W));
+			}
+			else if (bFloat)
+			{
+				const FQuat4f Q = FQuat4f(FVector3f::UpVector, GetRenderOrientation(*O)) * Rock;
 				MC->SetRelativeLocationAndRotation(NewPos, GenCoords::QuatToUE(Q.X, Q.Y, Q.Z, Q.W));
 			}
 			else
