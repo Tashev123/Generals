@@ -416,11 +416,11 @@ void FGenMapScripts::CallSubroutine(const FString& Name)
 	{
 		if (G->bActive)
 		{
-			for (FGenScript& S : G->Scripts)
+			for (FGenScript& Sub : G->Scripts)
 			{
-				if (S.bActive)
+				if (Sub.bActive)
 				{
-					ExecuteScript(S);
+					ExecuteScript(Sub);
 				}
 			}
 		}
