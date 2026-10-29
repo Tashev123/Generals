@@ -62,6 +62,12 @@ public:
 
 	void AddScorch(const FVector3f& Pos, float Radius, int32 Type);
 
+	/**
+	 * A light an object keeps throwing (W3DPoliceCarDraw's flashing light bar): set every frame it shows, with its
+	 * colour as it is now; one not set in a frame goes out. Radius: W3D's far attenuation end (Generals units).
+	 */
+	void SetObjectLight(FGenObjectID Object, const FVector3f& Pos, const FLinearColor& Color, float Radius);
+
 	int32 GetParticleCount() const { return Particles.GetParticleCount(); }
 	int32 GetSystemCount() const { return Particles.GetSystems().Num(); }
 
@@ -110,6 +116,7 @@ private:
 	void RenderParticles();
 	void FlushBatches();
 	void UpdateLights();
+	void UpdateSway();
 	void RebuildScorchMesh();
 	UMaterialInterface* GetParticleMaterial(EGenParticleShader Shader);
 
@@ -142,6 +149,24 @@ private:
 	TArray<FLightPulse> Pulses;
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<UPointLightComponent>> PulseLights;
+
+	// SetObjectLight: the lights wanted this frame, and the ones lit for them (by object).
+	struct FObjectLight { FVector3f Pos; FLinearColor Color; float Radius; };
+	TMap<FGenObjectID, FObjectLight> WantedObjectLights;
+	UPROPERTY(Transient)
+	TMap<uint32, TObjectPtr<UPointLightComponent>> ObjectLights;
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UPointLightComponent>> FreeObjectLights;
+
+	// The breeze (ScriptEngine's BreezeInfo, default as the script engine starts; no official map's scripts change
+	// it) and W3DTreeBuffer's ten sway motions made from it, handed to the tree materials through MPC_GenSway.
+	enum { NumSwayEntries = 100, MaxSwayTypes = 10 };
+	FVector3f SwayOffsets[NumSwayEntries];
+	float SwayStep[MaxSwayTypes] = {};
+	float SwayFactor[MaxSwayTypes] = {};
+	bool bSwayReady = false;
+	UPROPERTY(Transient)
+	TObjectPtr<class UMaterialParameterCollection> SwayCollection;
 
 	// Camera shake (W3DView::shake): a stiff spring that flips direction every client frame.
 	float ShakeIntensity = 0.f;

@@ -19,6 +19,8 @@
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "Materials/MaterialParameterCollection.h"
+#include "Materials/MaterialParameterCollectionInstance.h"
 #include "ProceduralMeshComponent.h"
 
 namespace
@@ -76,6 +78,9 @@ void UGenFXManager::Deinitialize()
 	BatchLookup.Reset();
 	Tracers.Reset();
 	Pulses.Reset();
+	WantedObjectLights.Reset();
+	ObjectLights.Reset();
+	FreeObjectLights.Reset();
 	MapActor = nullptr;
 	Logic = nullptr;
 	Super::Deinitialize();
@@ -104,6 +109,9 @@ void UGenFXManager::Start(AGenMapActor* InMapActor, UGenGameLogic* InLogic)
 		const FGenObject* O = Logic && Logic->IsShroudOn() ? Logic->FindObject(Id) : nullptr;
 		return O && O->GetLocalShroud() >= EGenObjectShroud::Fogged;
 	};
+	// (Missing until ue_setup.py has been run again: then nothing sways.)
+	SwayCollection = LoadObject<UMaterialParameterCollection>(nullptr, TEXT("/Game/Generals/Materials/MPC_GenSway.MPC_GenSway"));
+	bSwayReady = false;
 }
 
 // ---- FX lists -----------------------------------------------------------------------------------
@@ -463,6 +471,7 @@ void UGenFXManager::Update(double LogicFrameTime)
 	RenderParticles();
 	FlushBatches();
 	UpdateLights();
+	UpdateSway();
 	if (bScorchDirty)
 	{
 		bScorchDirty = false;
@@ -908,7 +917,7 @@ void UGenFXManager::UpdateLights()
 			Pulses.RemoveAt(i);
 		}
 	}
-	while (PulseLights.Num() < Pulses.Num())
+	auto MakeLight = [this]()
 	{
 		UPointLightComponent* L = NewObject<UPointLightComponent>(MapActor, NAME_None, RF_Transient);
 		L->SetupAttachment(MapActor->GetRootComponent());
@@ -917,7 +926,12 @@ void UGenFXManager::UpdateLights()
 		L->LightFalloffExponent = 2.f;
 		L->SetCastShadows(false);
 		L->RegisterComponent();
-		PulseLights.Add(L);
+		return L;
+	};
+	auto ToLinear = [](const FLinearColor& C) { return FLinearColor(FMath::Pow(C.R, 2.2f), FMath::Pow(C.G, 2.2f), FMath::Pow(C.B, 2.2f)); };
+	while (PulseLights.Num() < Pulses.Num())
+	{
+		PulseLights.Add(MakeLight());
 	}
 	for (int32 i = 0; i < PulseLights.Num(); ++i)
 	{
@@ -934,9 +948,101 @@ void UGenFXManager::UpdateLights()
 		// Lifted above the flash point so the light reaches the ground around it instead of grazing it.
 		L->SetWorldLocation(ToUE(P.Pos) + FVector(0.0, 0.0, double(P.Radius) * 0.4 * GenCoords::UnitsToCm));
 		L->SetAttenuationRadius(P.Radius * 1.5f * float(GenCoords::UnitsToCm));
-		L->SetLightColor(FLinearColor(FMath::Pow(P.Color.R, 2.2f), FMath::Pow(P.Color.G, 2.2f), FMath::Pow(P.Color.B, 2.2f)));
+		L->SetLightColor(ToLinear(P.Color));
 		L->SetIntensity(PI * ExposureCompensation * FMath::Clamp(Factor, 0.f, 1.f));
 		if (!L->IsVisible()) { L->SetVisibility(true); }
+	}
+
+	// SetObjectLight's lights: lit where wanted this frame; the others go out and wait for the next to want one.
+	for (auto It = ObjectLights.CreateIterator(); It; ++It)
+	{
+		if (!WantedObjectLights.Contains(It.Key()))
+		{
+			if (UPointLightComponent* L = It.Value())
+			{
+				L->SetVisibility(false);
+				FreeObjectLights.Add(L);
+			}
+			It.RemoveCurrent();
+		}
+	}
+	for (const TPair<FGenObjectID, FObjectLight>& W : WantedObjectLights)
+	{
+		TObjectPtr<UPointLightComponent>& L = ObjectLights.FindOrAdd(W.Key);
+		if (!L && FreeObjectLights.Num() > 0)
+		{
+			L = FreeObjectLights.Pop();
+		}
+		else if (!L)
+		{
+			L = MakeLight();
+		}
+		L->SetWorldLocation(ToUE(W.Value.Pos));
+		L->SetAttenuationRadius(W.Value.Radius * 1.5f * float(GenCoords::UnitsToCm)); // (as the pulses above)
+		L->SetLightColor(ToLinear(W.Value.Color));
+		// (W3D: the colour as diffuse and half of it as ambient - lighting what faces away from it too.)
+		L->SetIntensity(PI * ExposureCompensation * 1.5f);
+		if (!L->IsVisible()) { L->SetVisibility(true); }
+	}
+	WantedObjectLights.Reset();
+}
+
+void UGenFXManager::SetObjectLight(FGenObjectID Object, const FVector3f& Pos, const FLinearColor& Color, float Radius)
+{
+	WantedObjectLights.Add(Object, { Pos, Color, Radius });
+}
+
+void UGenFXManager::UpdateSway()
+{
+	// W3DTreeBuffer::updateSway - made once, as the breeze never changes here - and drawTrees' "m_curSwayOffset[i]
+	// += m_curSwayStep[i]" every drawn 30 Hz frame, worked out from the client clock (it stands still with the
+	// game, and is smooth at any frame rate). The motions go to the tree materials (ue_setup.py, SWAY_HLSL).
+	UWorld* World = GetWorld();
+	UMaterialParameterCollectionInstance* Inst = SwayCollection && World ? World->GetParameterCollectionInstance(SwayCollection) : nullptr;
+	if (!Inst)
+	{
+		return;
+	}
+	if (!bSwayReady)
+	{
+		bSwayReady = true;
+		// ScriptEngine::init's BreezeInfo.
+		const float Direction = PI / 3.f;
+		const FVector2f DirectionVec(FMath::Sin(Direction), FMath::Cos(Direction));
+		const float Intensity = 0.07f * PI / 4.f;
+		const float Lean = 0.07f * PI / 4.f;
+		const float BreezePeriod = float(GenCoords::LogicFps * 5);
+		const float Randomness = 0.2f;
+		for (int32 i = 0; i < NumSwayEntries; ++i)
+		{
+			const float Factor = FMath::Cos(float(i) * 2.f * PI / (float(NumSwayEntries) + 1.f));
+			const float Angle = Lean + Intensity * Factor;
+			const float S = FMath::Sin(Angle);
+			const float C = FMath::Cos(Angle);
+			SwayOffsets[i] = FVector3f(DirectionVec.X * S, DirectionVec.Y * S, C - 1.f);
+		}
+		const float Delta = Randomness * 0.5f;
+		for (int32 i = 0; i < MaxSwayTypes; ++i)
+		{
+			SwayStep[i] = FMath::Max(0.f, float(NumSwayEntries) / BreezePeriod * FMath::FRandRange(1.f - Delta, 1.f + Delta));
+			SwayFactor[i] = FMath::FRandRange(1.f - Delta, 1.f + Delta);
+		}
+	}
+	static const FName Names[MaxSwayTypes] = { TEXT("Sway1"), TEXT("Sway2"), TEXT("Sway3"), TEXT("Sway4"), TEXT("Sway5"),
+		TEXT("Sway6"), TEXT("Sway7"), TEXT("Sway8"), TEXT("Sway9"), TEXT("Sway10") };
+	for (int32 i = 0; i < MaxSwayTypes; ++i)
+	{
+		const double Offset = FMath::Fmod(ClientTime * double(SwayStep[i]), double(NumSwayEntries - 1));
+		const int32 MinOffset = FMath::FloorToInt32(float(Offset));
+		FVector3f Sway = FVector3f::ZeroVector;
+		if (MinOffset >= 0 && MinOffset + 1 < NumSwayEntries)
+		{
+			const float F2 = float(Offset) - float(MinOffset);
+			Sway = ((1.f - F2) * SwayOffsets[MinOffset] + F2 * SwayOffsets[MinOffset + 1]) * SwayFactor[i];
+		}
+		// (Generals' frame to Unreal's: the shader multiplies it by a height already in Unreal units.)
+		const FVector3f UE = GenCoords::DirToUE(Sway.X, Sway.Y, Sway.Z);
+		Inst->SetVectorParameterValue(Names[i], FLinearColor(UE.X, UE.Y, UE.Z, 0.f));
 	}
 }
 

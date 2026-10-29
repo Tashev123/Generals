@@ -39,6 +39,8 @@ public:
 	virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
 	virtual FBoxSphereBounds CalcBounds(const FTransform& LocalToWorld) const override;
 	virtual int32 GetNumMaterials() const override;
+	/** (Skins never sway: their materials' world position offset - the trees' - mustn't put them in the velocity pass every frame.) */
+	virtual bool SupportsWorldPositionOffsetVelocity() const override { return false; }
 
 private:
 	const FGenSkinData* Skin = nullptr; // (the asset subsystem's, kept for as long as the program runs)

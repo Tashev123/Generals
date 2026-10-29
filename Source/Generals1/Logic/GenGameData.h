@@ -785,7 +785,9 @@ struct GENERALS1_API FGenDrawModule
 	FString AttachToBoneInContainer;       // W3DDependencyModelDraw: riding in the open, it is drawn on this bone of what carries it
 	FString RequiredScience;               // W3DScienceModelDraw: only players with this science see it (a salvage crate)
 	bool bAnimationsRequirePower = true;   // AnimationsRequirePower: its animations stand still while the building is short of power
-	FGenVehicleDraw Vehicle;               // W3DTankDraw, W3DTruckDraw, W3DTankTruckDraw
+	bool bParticlesOnAnimatedBones = false; // ParticlesAttachedToAnimatedBones: its ParticleSysBone systems go where the animation takes their bones
+	bool bPoliceLights = false;            // W3DPoliceCarDraw: the light bar's animation and the coloured light it throws round the car
+	FGenVehicleDraw Vehicle;               // W3DTankDraw, W3DTruckDraw (W3DPoliceCarDraw), W3DTankTruckDraw
 	TMap<FString, FGenModelConditionState> Transitions;   // TransitionState blocks, by "<from> <to>" (lower case)
 	const FGenModelConditionState* FindTransition(const FString& FromKey, const FString& ToKey) const;
 
@@ -1056,6 +1058,13 @@ struct GENERALS1_API FGenThingTemplate
 		FString Name;
 	};
 	TArray<FBoneFX> BoneFX;
+	/** Swaying in the breeze: the trees of W3DTreeDraw (the tree buffer's vertex shader) and of SwayClientUpdate
+	 *  (which stops once the tree is burned). */
+	enum class ESway : uint8 { None, TreeBuffer, ClientUpdate };
+	ESway Sway = ESway::None;
+	bool bAnimatedParticleBones = false;        // AnimatedParticleSysBoneClientUpdate: every draw module's bone systems follow the animation
+	bool bFloat = false;                        // FloatUpdate: rocks on the water like a buoy (drawn so)
+	bool bFloatLifts = false;                   // ... and Enabled: kept on the water's surface
 	FGenAutoDeposit AutoDeposit;                // AutoDepositUpdate
 	FGenOCLUpdate OCLUpdate;                    // OCLUpdate
 	FGenCrateCollide Crate;                     // MoneyCrateCollide, SalvageCrateCollide, UnitCrateCollide

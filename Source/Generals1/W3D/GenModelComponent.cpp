@@ -130,6 +130,7 @@ void UGenModelComponent::ResetForReuse()
 	bAnimPaused = false;
 	SetStealthLook(0.f, 0.f);
 	SetTint(FLinearColor(0.f, 0.f, 0.f, 0.f));
+	SetSway(0, 0.f);
 	RefreshParts();
 	ResetSubObjectVisibility(); // (poses the model)
 }
@@ -352,6 +353,11 @@ void UGenModelComponent::BuildParts()
 		Sub.Component->SetCustomPrimitiveDataFloat(0, StealthFade);
 		Sub.Component->SetCustomPrimitiveDataFloat(1, StealthGlow);
 		Sub.Component->SetCustomPrimitiveDataVector4(2, FVector4(ObjectTint.R, ObjectTint.G, ObjectTint.B, 0.f));
+		if (SwayType != 0)
+		{
+			Sub.Component->SetCustomPrimitiveDataFloat(8, float(SwayType));
+			Sub.Component->SetCustomPrimitiveDataFloat(9, SwayBaseZ);
+		}
 		MeshComponents.Add(Sub.Component);
 		FSubObject& Added = SubObjects.Add_GetRef(MoveTemp(Sub));
 		ApplyMaterials(Added);
@@ -384,6 +390,7 @@ void UGenModelComponent::BuildParts()
 		UStaticMeshComponent* C = TakeStaticPart(Outer);
 		C->SetStaticMesh(Plan.MergedMesh.Mesh);
 		ConfigureMeshComponent(C, true);
+		C->SetEvaluateWorldPositionOffset(SwayType != 0); // (see SetSway)
 		C->SetupAttachment(this);
 		C->RegisterComponent();
 		FSubObject Sub;
@@ -447,6 +454,7 @@ void UGenModelComponent::BuildParts()
 			UStaticMeshComponent* C = TakeStaticPart(Outer);
 			C->SetStaticMesh(Built->Mesh);
 			ConfigureMeshComponent(C, bCastShadow);
+			C->SetEvaluateWorldPositionOffset(SwayType != 0);
 			C->SetupAttachment(this);
 			C->RegisterComponent();
 			Sub.Component = C;
@@ -576,6 +584,31 @@ void UGenModelComponent::SetTint(const FLinearColor& Tint)
 		if (C)
 		{
 			C->SetCustomPrimitiveDataVector4(2, FVector4(Tint.R, Tint.G, Tint.B, 0.f));
+		}
+	}
+}
+
+void UGenModelComponent::SetSway(int32 Type, float BaseZ)
+{
+	if (Type == SwayType && (Type == 0 || FMath::IsNearlyEqual(BaseZ, SwayBaseZ, 0.5f)))
+	{
+		return;
+	}
+	SwayType = Type;
+	SwayBaseZ = BaseZ;
+	// (Custom primitive data 8..9, read by the materials' world position offset: see ue_setup.py. The offset is
+	// worked out only for the parts of what sways: a part whose material has one would otherwise be drawn into
+	// the velocity buffer every frame, moving or not.)
+	for (UMeshComponent* C : MeshComponents)
+	{
+		if (C)
+		{
+			C->SetCustomPrimitiveDataFloat(8, float(Type));
+			C->SetCustomPrimitiveDataFloat(9, BaseZ);
+			if (UStaticMeshComponent* SM = Cast<UStaticMeshComponent>(C))
+			{
+				SM->SetEvaluateWorldPositionOffset(Type != 0);
+			}
 		}
 	}
 }

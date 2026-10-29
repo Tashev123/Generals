@@ -20,7 +20,8 @@ Material parameters (set at runtime by UGenAssetSubsystem / UGenTerrainComponent
   IgnoreAlpha (an opaque section in the masked material), and per component, as custom primitive data:
   [0] StealthFade (0 solid .. 1 gone), [1] StealthGlow (0 .. 1: the look of a detected stealth unit),
   [2..4] ObjectTint (light added to the object: the white flash of something just selected),
-  [5..7] TreadLeft / TreadRight / TreadMiddle (how far a tank's treads have rolled; ScrollMode 2..4)
+  [5..7] TreadLeft / TreadRight / TreadMiddle (how far a tank's treads have rolled; ScrollMode 2..4),
+  [8] SwayType (a tree's motion in the breeze, 1..10 of MPC_GenSway's Sway1..10; 0 none), [9] SwayBaseZ (its foot)
   ScrollMode, UVScroll (UPerSec, VPerSec, UOffset, VOffset), UVScale: stage 0 LinearOffsetTextureMapperClass
   Atlas (terrain)
   Shroud, ShroudScale, ShroudOffset (fog of war: one texel per cell, and the world-to-texture mapping)
@@ -158,6 +159,76 @@ def build_lighting_collection():
     return mpc
 
 
+SWAY_MPC_PATH = MAT_DIR + "/MPC_GenSway"
+NUM_SWAY_TYPES = 10
+
+
+def build_sway_collection():
+    """The breeze's ten motions (W3DTreeBuffer's MAX_SWAY_TYPES), set every frame by UGenFXManager::UpdateSway.
+    A collection of its own, so that MPC_GenLighting's parameters (and the materials built on them) stay as they are."""
+    if EAL.does_asset_exist(SWAY_MPC_PATH):
+        mpc = EAL.load_asset(SWAY_MPC_PATH)
+        names = [str(p.get_editor_property("parameter_name")) for p in mpc.get_editor_property("vector_parameters")]
+        if len(names) == NUM_SWAY_TYPES:
+            return mpc
+    else:
+        mpc = ATL.create_asset("MPC_GenSway", MAT_DIR, unreal.MaterialParameterCollection,
+                               unreal.MaterialParameterCollectionFactoryNew())
+    params = []
+    for i in range(1, NUM_SWAY_TYPES + 1):
+        p = unreal.CollectionVectorParameter()
+        p.set_editor_property("parameter_name", f"Sway{i}")
+        p.set_editor_property("default_value", unreal.LinearColor(0, 0, 0, 0))
+        params.append(p)
+    mpc.set_editor_property("vector_parameters", params)
+    EAL.save_loaded_asset(mpc)
+    return mpc
+
+
+# Trees in the breeze (W3DTreeBuffer's Trees.nvv): "multiply the z value by wave value to get the xy skew value for
+# the wave motion" - each vertex moves by its height above the foot of the tree times the motion of the tree's sway
+# type (custom primitive data 8: 1..10, 0 for everything that doesn't sway; 9: the foot's world Z).
+SWAY_HLSL = r"""
+int t = (int)round(SwayType);
+if (t < 1 || t > 10)
+{
+    return float3(0.0, 0.0, 0.0);
+}
+float3 s = t == 1 ? S1.xyz : t == 2 ? S2.xyz : t == 3 ? S3.xyz : t == 4 ? S4.xyz : t == 5 ? S5.xyz
+    : t == 6 ? S6.xyz : t == 7 ? S7.xyz : t == 8 ? S8.xyz : t == 9 ? S9.xyz : S10.xyz;
+return s * max(WorldZ - BaseZ, 0.0);
+"""
+
+
+def add_sway_offset(mat, sway_mpc):
+    sway_type = scalar_param(mat, "SwayType", 0.0, -1300, 1900)
+    sway_type.set_editor_property("use_custom_primitive_data", True)
+    sway_type.set_editor_property("primitive_data_index", 8)
+    base_z = scalar_param(mat, "SwayBaseZ", 0.0, -1300, 2050)
+    base_z.set_editor_property("use_custom_primitive_data", True)
+    base_z.set_editor_property("primitive_data_index", 9)
+    world = expr(mat, unreal.MaterialExpressionWorldPosition, -1300, 2200)
+    world_z = mask(mat, world, "", (False, False, True, False), -1100, 2200)
+    node = expr(mat, unreal.MaterialExpressionCustom, -700, 1900)
+    node.set_editor_property("code", SWAY_HLSL)
+    node.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT3)
+    node.set_editor_property("description", "TreeSway")
+    names = ["SwayType", "BaseZ", "WorldZ"] + [f"S{i}" for i in range(1, NUM_SWAY_TYPES + 1)]
+    inputs = []
+    for n in names:
+        ci = unreal.CustomInput()
+        ci.set_editor_property("input_name", n)
+        inputs.append(ci)
+    node.set_editor_property("inputs", inputs)
+    MEL.connect_material_expressions(sway_type, "", node, "SwayType")
+    MEL.connect_material_expressions(base_z, "", node, "BaseZ")
+    MEL.connect_material_expressions(world_z, "", node, "WorldZ")
+    for i in range(1, NUM_SWAY_TYPES + 1):
+        p = collection_param(mat, sway_mpc, f"Sway{i}", -1100, 2300 + i * 80)
+        MEL.connect_material_expressions(p, "", node, f"S{i}")
+    MEL.connect_material_property(node, "", unreal.MaterialProperty.MP_WORLD_POSITION_OFFSET)
+
+
 def collection_param(mat, mpc, name, x, y):
     e = expr(mat, unreal.MaterialExpressionCollectionParameter, x, y)
     e.set_editor_property("collection", mpc)
@@ -205,7 +276,7 @@ def mask(mat, src, src_out, rgba, x, y):
     return m
 
 
-def build_w3d_material(name, lit, mpc=None):
+def build_w3d_material(name, lit, mpc=None, sway_mpc=None):
     mat = recreate_material(name)
     mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_OPAQUE if lit else unreal.BlendMode.BLEND_ADDITIVE)
     mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_DEFAULT_LIT if lit else unreal.MaterialShadingModel.MSM_UNLIT)
@@ -361,6 +432,8 @@ def build_w3d_material(name, lit, mpc=None):
         MEL.connect_material_property(rgb, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     MEL.connect_material_property(alpha, "", unreal.MaterialProperty.MP_OPACITY)
     MEL.connect_material_property(alpha, "", unreal.MaterialProperty.MP_OPACITY_MASK)
+    if sway_mpc:
+        add_sway_offset(mat, sway_mpc)
 
     MEL.recompile_material(mat)
     EAL.save_loaded_asset(mat)
@@ -903,8 +976,9 @@ def main():
         return
 
     mpc = build_lighting_collection()
-    lit = build_w3d_material("M_W3D_Lit", True, mpc)
-    unlit = build_w3d_material("M_W3D_Unlit", False, mpc)
+    sway_mpc = build_sway_collection()
+    lit = build_w3d_material("M_W3D_Lit", True, mpc, sway_mpc)
+    unlit = build_w3d_material("M_W3D_Unlit", False, mpc, sway_mpc)
     B = unreal.BlendMode
     for two_sided in (False, True):
         sfx = "_2S" if two_sided else ""

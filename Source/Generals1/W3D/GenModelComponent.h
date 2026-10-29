@@ -107,6 +107,14 @@ public:
 	void SetTint(const FLinearColor& Tint);
 
 	/**
+	 * Swaying in the breeze (W3DTreeBuffer's vertex shader, SwayClientUpdate): Type 1..10 is which of the breeze's
+	 * ten motions the model leans with (UGenFXManager::UpdateSway), 0 none. Every vertex is pushed along by its
+	 * height above BaseZ - the foot of the tree, in the world (Unreal units).
+	 */
+	void SetSway(int32 Type, float BaseZ);
+	int32 GetSwayType() const { return SwayType; }
+
+	/**
 	 * HLodClass::Cast_Ray, as W3DView::pickDrawable uses it: where a ray first meets what the model shows -
 	 * the triangles of its meshes as they are posed, and its boxes (PICKBOX, BOUNDINGBOX). Hidden parts
 	 * are not in the way, nor are those blended onto the picture (glass, lights, muzzle flashes). The ray
@@ -249,5 +257,7 @@ private:
 	float StealthFade = 0.f;
 	float StealthGlow = 0.f;
 	FLinearColor ObjectTint = FLinearColor(0.f, 0.f, 0.f, 0.f);
+	int32 SwayType = 0;               // SetSway
+	float SwayBaseZ = 0.f;
 	bool bFadeable = false;           // the sections use the materials that can fade
 };

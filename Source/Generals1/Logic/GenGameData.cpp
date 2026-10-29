@@ -1923,6 +1923,11 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 			{
 				T->bProjectileStream = true;
 			}
+			else if (Type.Equals(TEXT("FloatUpdate"), ESearchCase::IgnoreCase))
+			{
+				T->bFloat = true;
+				T->bFloatLifts = E.Block->GetBool(TEXT("Enabled"), false);
+			}
 			else if (Type.Equals(TEXT("BoneFXUpdate"), ESearchCase::IgnoreCase))
 			{
 				// "<BodyDamageState><FXList|OCL|ParticleSystem><index> = Bone:<BoneName> OnlyOnce:<Yes|No> <Min delay>
@@ -2707,6 +2712,14 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 			T->LaserMuzzleParticleSystem = E.Block->GetString(TEXT("MuzzleParticleSystem"));
 			T->LaserTargetParticleSystem = E.Block->GetString(TEXT("TargetParticleSystem"));
 		}
+		else if (E.Key.Equals(TEXT("ClientUpdate"), ESearchCase::IgnoreCase) && E.Value(0).Equals(TEXT("SwayClientUpdate"), ESearchCase::IgnoreCase))
+		{
+			T->Sway = FGenThingTemplate::ESway::ClientUpdate;
+		}
+		else if (E.Key.Equals(TEXT("ClientUpdate"), ESearchCase::IgnoreCase) && E.Value(0).Equals(TEXT("AnimatedParticleSysBoneClientUpdate"), ESearchCase::IgnoreCase))
+		{
+			T->bAnimatedParticleBones = true;
+		}
 		else if (E.Key.Equals(TEXT("Draw"), ESearchCase::IgnoreCase) && E.Block)
 		{
 			FGenDrawModule& D = T->Draws.AddDefaulted_GetRef();
@@ -2725,10 +2738,16 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				}
 			}
 			D.bAnimationsRequirePower = E.Block->GetBool(TEXT("AnimationsRequirePower"), true);
+			D.bParticlesOnAnimatedBones = E.Block->GetBool(TEXT("ParticlesAttachedToAnimatedBones"), false);
+			D.bPoliceLights = D.Type.Equals(TEXT("W3DPoliceCarDraw"), ESearchCase::IgnoreCase);
+			if (D.Type.Equals(TEXT("W3DTreeDraw"), ESearchCase::IgnoreCase))
+			{
+				T->Sway = FGenThingTemplate::ESway::TreeBuffer; // (every tree in the buffer sways)
+			}
 			{
 				FGenVehicleDraw& V = D.Vehicle;
 				V.Kind = D.Type.Equals(TEXT("W3DTankDraw"), ESearchCase::IgnoreCase) ? FGenVehicleDraw::Tank
-					: D.Type.Equals(TEXT("W3DTruckDraw"), ESearchCase::IgnoreCase) ? FGenVehicleDraw::Truck
+					: (D.Type.Equals(TEXT("W3DTruckDraw"), ESearchCase::IgnoreCase) || D.bPoliceLights) ? FGenVehicleDraw::Truck
 					: D.Type.Equals(TEXT("W3DTankTruckDraw"), ESearchCase::IgnoreCase) ? FGenVehicleDraw::TankTruck : FGenVehicleDraw::None;
 				const FGenIniBlock& B = *E.Block;
 				if (V.HasTreads())

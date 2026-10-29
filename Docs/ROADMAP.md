@@ -861,7 +861,7 @@ when a tank is done, three layers of scaffolding.
       test costs 0.01 ms a step)
 - [ ] Not done yet: DamageFXOverride of a weapon; FXListAtBonePos (only the garrison-clearing weapons'
       effects use it), FireWeaponCollide (a burning tree hurting what touches it), BoneFXUpdate /
-      BoneFXDamage (24 civilian buildings' own fire and debris by damage state), the BURNED model
+      BoneFXDamage (24 civilian buildings' own fire and debris by damage state - done 2026-10-28), the BURNED model
       condition, trees pushed aside without falling (MoveOutwardTime of bushes and grass), toppling
       by blast (the nuke, the wave of a broken dam); a laser's
       PunchThroughScalar and widening / decaying beams; OCL FireWeapon and Attack (the superweapons'
@@ -1188,7 +1188,7 @@ more selecting something by clicking near it.)
       add-on is simply placed on the bone every frame); the selection flash of an add-on with its
       carrier; MobMemberSlavedUpdate (the angry mob) and the slaves of a SpawnBehavior that are made
       anew; ExperienceScalarUpgrade; whether DRONE_SPOTTING lengthens any weapon's range was not
-      measured
+      measured. (Later: the angry mob and ExperienceScalarUpgrade are done - 2026-10-28)
 
 ## Done (M4k: crates - what the dead leave behind, salvage)
 - [x] Crate.ini's CrateData (the crate system: CreationChance, VeterancyLevel, KilledByType,
@@ -1672,9 +1672,10 @@ The user played Twilight Flame and listed what was wrong; fixed first, with what
       the target, the data asks for 250 - wider than the 200 attack area); flying 130 units up, it shows
       on screen about 170 units further away than the ground under it. Left as is until the user says how
       it should look
-- [ ] Not done yet for other generals: the Tank General's tank paradrop (SPECIAL_TANK_PARADROP), the
+- [x] Not done yet for other generals: the Tank General's tank paradrop (SPECIAL_TANK_PARADROP), the
       ambulance / hazmat cleanup (SPECIAL_CLEANUP_AREA), the GLA angry mob (MobNexusContain and the
-      spawner's budding exit). (Units getting stuck: the movement section of 2026-10-27 below.)
+      spawner's budding exit) - done 2026-10-28 ("the looks of the module audit" below). (Units getting stuck:
+      the movement section of 2026-10-27 below.)
 
 ## Done (MP1: network games - orders, replays, the host's server, coming back to a match)
 The user's wishes (2026-10-23): a modern client-server game; a player who drops out can come back; free
@@ -2076,6 +2077,72 @@ The play modules of the audit left after the gaps above ("remaining gameplay").
 - Tested together: replays of 4-player Alpine Assault (hard computer players, the train running; 29,045 frames) and
   8-player Twilight Flame (29,018 frames) - every frame the same
 
+## Done (2026-10-28/29: the looks of the module audit, and the other generals' last missing pieces)
+The rest of the audit's list ("Looks") and the three "not done yet for other generals" of the user's notes.
+Begun 2026-10-28 (the first five), finished 2026-10-29.
+- [x] The GLA angry mob (MobNexusContain, MobMemberSlavedUpdate, GenSpawner.cpp): an invisible, immortal nexus made
+      at the barracks spawns its ten members from its list of kinds in turn - the first five out of the door, the
+      rest "budded" from the member nearest the nexus - and a new one 30 s after each dies; its health is theirs
+      together (AggregateHealth); members keep with the nexus, take up its target or pick their own, and die if
+      left too far from it too long; selecting one selects the mob. `[spawn f..]`, `[mob f..]`. Tested
+      (2026-10-29): a nexus placed at 1005,800 makes five at f1, then one every ExitDelay (5 s); told to
+      attack-move at three Red Guards, its members take up its target, are worn down by them, and the nexus
+      goes with the last at f820. (The nexus needs the Palace as well as the barracks to be built.)
+- [x] The Tank General's tank paradrop (SPECIAL_TANK_PARADROP, Tank_SuperweaponTankParadrop): the power is
+      fired like the other paradrops (its OCL by science level). Tested: at rank 3, fired at 1005,1000 from
+      the map's edge at f60 - the cargo plane drops a Battlemaster at f244 at 1005,763 (it opens its doors
+      inbound within DeliveryDistance + PreOpenDistance, 0 + 300, as the original's), which comes down at
+      1005,886
+- [x] The ambulance's cleanup (CleanupHazardUpdate, CleanupAreaPower; GenCleanup.cpp): idle, it sprays the nearest
+      CLEANUP_HAZARD thing (toxin puddles, anthrax, radiation) within ScanRange with its HAZARD_CLEANUP weapon; sent
+      to a spot (Command_AmbulanceCleanupArea) it cleans everything within ScanRange + MaxMoveDistanceFromLocation,
+      moving as it needs to, and comes back to the spot - unless the player orders it elsewhere. `[cleanup f..]`.
+      Tested: an ambulance with poison fields at 70 and 260 away cleans the near one by itself at f1; sent to
+      clean round 1060,980 at f405, it cleans the far one at f541 and is done at f559
+- [x] Projectile streams (ProjectileStreamUpdate, W3DProjectileStreamDraw; GenStreams.cpp and UGenFXManager): a
+      weapon with a ProjectileStreamName (the toxin truck's spray, the Dragon tank's flame, the ambulance's hose)
+      keeps an invisible object that remembers its shots in flight; the drawing puts a strip of the texture,
+      additive, TileFactor times along each segment and scrolling at ScrollRate, through the newest MaxSegments
+      of them, broken where the aim changed, skimming the roof of a vehicle. `[stream f..]`. Tested: a toxin
+      truck firing at a Red Guard from f30 - at f38 one green strip from the nozzle to him (and the Dragon
+      tank's flame the day before)
+- [x] BoneFXUpdate / BoneFXDamage: FX lists, OCLs and particle systems at model bones for each body damage
+      state, once or again after a random wait (24 civilian buildings' fire and debris); the particle systems of
+      the old state go when it changes. (In the data: the Mogadishu towers, and the trails of the stream
+      projectiles above)
+- [x] Trees in the breeze (W3DTreeBuffer's vertex shader for every W3DTreeDraw tree, and SwayClientUpdate's
+      trees: Tournament Plains, Dark Night, Rogue Agent, the cherry trees of Mountain Guns, Tournament City and
+      Urban): the breeze as the script engine starts it (no official map's scripts change it - SET_TREE_SWAY
+      is in none), its 100-entry table and ten motions with their random speeds and sizes, stepped by the client
+      clock (`UGenFXManager::UpdateSway` -> MPC_GenSway); each tree takes one of them at random and every vertex
+      leans by its height above the tree's foot - a world position offset in the W3D materials, read from custom
+      primitive data 8 (the motion) and 9 (the foot), worked out only for the parts of what sways
+      (`UGenModelComponent::SetSway`; otherwise the parts would all go into the velocity pass every frame).
+      Stops for good when the tree is toppled, dies, or (SwayClientUpdate) is burned. Tested: Tournament
+      Desert's dogwoods and Tournament Plains' GenericTrees frozen at f60 and f135 - the crowns shift, the trunks'
+      feet stay put
+- [x] Boats rocking (FloatUpdate): the drawing turns the model in its own frame by sin(frame x 0.0291) x 0.05
+      and sin(frame x 0.0515) x 0.05, by the frame on screen (smooth); every boat in the data has Enabled = No,
+      so none is lifted onto the water (the lifting is there for Enabled = Yes). Tested: Hovercraft's PT boat at
+      f30 and f90 (it is not a mover here - the drawing now re-places what floats, moving or not)
+- [x] Particle systems that follow animated bones (W3DModelDraw's ParticlesAttachedToAnimatedBones - 69 draw
+      modules: the US dozer's exhaust, aircraft - and AnimatedParticleSysBoneClientUpdate for all of an object's
+      modules: the railway bridges of Alpine Assault and Killing Fields, rocket pads): their ParticleSysBone
+      systems are moved to their bones every drawn frame. `-Trace` adds `[bones f..]` (where the last of them
+      is, once a second). Tested: Alpine Assault's bridge destroyed at f40 - its EXPLOSION12 burning beam goes
+      from z 62 to -74 between f150 and f240 with the bridge falling, its fire with it
+- [x] The police car's light bar (W3DPoliceCarDraw: campaign maps only): its animation put on its frame by hand,
+      a quarter of a frame each 30 Hz frame from a random one, and a light the bar's colour at that frame (orange,
+      red, purple, blue, white) 8 above the car, out to 20 (`UGenFXManager::SetObjectLight`, a pool of point
+      lights). `[police f..]`. Tested: the bar's 15 frames go round in 56 logic frames with the original's colours
+- Build note (2026-10-29): the launcher updated the engine's Fab plugin (2026-10-28 21:54) with a module the
+  installed engine's precompiled build rules don't know, and every build stopped at "RulesError ... FabToolset".
+  `gen_build.ps1` and `gen_test.ps1 -Build` now pass `-DisablePlugin=Fab` (the project doesn't use Fab; the editor
+  still loads the plugin's own binaries). Not checked: Live Coding from the editor and the packaging command
+  (RunUAT), which don't pass the flag
+- Tested together: a replay of 8-player Twilight Flame against hard computer players, 57,774 frames (32 game
+  minutes) - every frame the same
+
 ## Next
 (Performance: no profiling between milestones - one review at the very end, the user's word of
 2026-10-12. Things to look at then are noted where they are made: FindGroundPath asks for the
@@ -2095,15 +2162,16 @@ one with somebody in its way predicts up to ~22 ways against each neighbour.)
       the maps' ambient sounds - M7c; the voices and sounds still missing - M7d. Left: volume settings
       (with the options, M8), surround output, the trucks' sounds (with the vehicles' wheels and treads)
 - [x] The vehicles' wheels, treads and dust, and their bodies on the ground - M2d
-- [ ] Modules of the game's objects nothing here reads yet (an audit of 2026-10-28: every Behavior / Draw /
+- [x] Modules of the game's objects nothing here reads yet (an audit of 2026-10-28: every Behavior / Draw /
       Body / ClientUpdate type in Data\INI\Object against the source - 61 of 201 types; the campaign's left
       out). Poison, hordes, Advanced Training, base regeneration, GLA holes, the Troop Crawler, deploying and
       the Battle Bus: done the same day (above); the rest of the play modules (fake buildings, puddles, the
       Patriots' shared targets, healing, weapon locks, wandering, trains) too (above). Looks:
       ProjectileStreamUpdate / W3DProjectileStreamDraw (the flame and toxin streams), BoneFXUpdate /
-      BoneFXDamage, SwayClientUpdate, FloatUpdate, AnimatedParticleSysBoneClientUpdate, W3DPoliceCarDraw.
-      With the not-done lines above: the tank paradrop, the cleanup of toxins (CleanupHazardUpdate /
-      CleanupAreaPower) and the angry mob (MobNexusContain / MobMemberSlavedUpdate)
+      BoneFXDamage, SwayClientUpdate (and W3DTreeDraw's sway), FloatUpdate, AnimatedParticleSysBoneClientUpdate,
+      W3DPoliceCarDraw - and the tank paradrop, the cleanup of toxins (CleanupHazardUpdate / CleanupAreaPower)
+      and the angry mob (MobNexusContain / MobMemberSlavedUpdate): done 2026-10-28/29 (above). Not taken up:
+      BeaconClientUpdate (the multiplayer chat beacon, which nothing here places)
 - [ ] M8 leftovers: see M8a. Next: M8b, the shell drawn from the original's window files - a small
       window manager over Core/GenWnd (the gadgets: push buttons, check boxes, combo boxes, list boxes,
       sliders, text entry, static text, with WindowTransitions.ini's transitions) and the menus' callbacks
