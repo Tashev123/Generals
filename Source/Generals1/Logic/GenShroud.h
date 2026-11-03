@@ -80,6 +80,16 @@ public:
 	void Init(const FVector2f& MapSize, float InCellSize, int32 NumPlayers);
 	void Reset();
 	bool IsValid() const { return CellsX > 0 && CellsY > 0; }
+	/** The cells that are in play: those of the map's active boundary. (The grid is made for the largest one.) */
+	void SetActiveCells(int32 InX, int32 InY) { ActiveX = FMath::Clamp(InX, 0, CellsX); ActiveY = FMath::Clamp(InY, 0, CellsY); }
+	/**
+	 * TerrainLogic::setActiveBoundary's part: what is fogged or clear is noted, Forget makes the objects forget their
+	 * looks, everything is shrouded anew on the new area, and what was noted comes back - but
+	 * PartitionManager::restoreFoggedCells stops altogether at the first row past the new area, so when the area
+	 * gets shorter only the first (neutral) player gets anything back. Missions count on that: USA 3 reveals its whole
+	 * map for the intro and never takes it back, the border switch does. Look makes the objects look again.
+	 */
+	void SwitchActiveArea(int32 NewX, int32 NewY, TFunctionRef<void()> Forget, TFunctionRef<void()> Look);
 
 	int32 GetCellsX() const { return CellsX; }
 	int32 GetCellsY() const { return CellsY; }
@@ -110,6 +120,8 @@ public:
 	void UndoRevealMapForPlayerPermanently(int32 Player);
 	/** shroudMapForPlayer: everything the player isn't looking at right now is shrouded again. */
 	void ShroudMapForPlayer(int32 Player);
+	/** PartitionManager::doShroudCover + undoShroudCover: what those players don't see just now is shrouded again. */
+	void ShroudCells(const FGenSighting& S);
 
 	/** Goes up whenever a cell changes its status for that player. */
 	uint32 GetChangeSerial(int32 Player) const { return Serials.IsValidIndex(Player) ? Serials[Player] : 0; }
@@ -125,6 +137,8 @@ private:
 
 	int32 CellsX = 0;
 	int32 CellsY = 0;
+	int32 ActiveX = 0;
+	int32 ActiveY = 0;
 	float CellSize = 40.f;
 	int32 PlayerCount = 0;
 	TArray<int16> Current;                  // PartitionCell::m_currentShroud, [player][cell]: 1 shrouded, 0 fogged, -n n lookers

@@ -262,9 +262,13 @@ void UGenGameLogic::Deinitialize()
 	ClearGhosts();
 	Shroud.Reset();
 	RadarEvents.Reset();
+	bUnderAttackGlow = false;
 	ShroudTexture = nullptr;
 	ShroudMaterial = nullptr;
 	DelayedDamage.Reset();
+	HistoricDamage.Reset();
+	AttackPriorities.Reset();
+	BuildableOverrides.Reset();
 	FloatingTexts.Reset();
 	AIPlayers.Reset();
 	MapScripts.Reset();
@@ -428,13 +432,14 @@ bool UGenGameLogic::StartSkirmish(AGenMapActor* InMapActor, const FGenMatchSetti
 	GameOverFrame = 0;
 	WinningPlayer = INDEX_NONE;
 
-	Pathfinder.Build(*Map, MapActor->GetBridges());
+	Pathfinder.Build(*Map, MapActor->GetBridges(), IsCampaign());
 	Partition.Init(Pathfinder.CellCenter(0, 0) - FVector2f(GenLogic::PathfindCellSize * 0.5f),
 		Pathfinder.CellCenter(Pathfinder.GetWidth() - 1, Pathfinder.GetHeight() - 1) + FVector2f(GenLogic::PathfindCellSize * 0.5f));
 	StepObjects.Reset();
 	OwnedObjects.Reset();
 	bOwnedDirty = true;
 	bNight = Map->TimeOfDay == 4; // TIME_OF_DAY_NIGHT
+	bSnowy = Map->IsSnowy();
 
 	// The simulation's own random stream (the match's seed: the same for everybody playing it).
 	Random.Initialize(Match.Seed);
@@ -479,6 +484,10 @@ bool UGenGameLogic::StartSkirmish(AGenMapActor* InMapActor, const FGenMatchSetti
 	}
 
 	SpawnMapObjects();
+	if (IsChallenge() && Players.IsValidIndex(LocalPlayer))
+	{
+		PlaceStartingObjects(Players[LocalPlayer]); // (placeNetworkBuildingsForPlayer: its game info's one slot)
+	}
 
 	// Count available start positions (Player_N_Start waypoints).
 	TArray<int32> FreeStarts;
@@ -542,15 +551,15 @@ bool UGenGameLogic::StartSkirmish(AGenMapActor* InMapActor, const FGenMatchSetti
 	// (AIData.ini also says how groups of units move, whoever plays.)
 	FGenAIData::Get().Initialize();
 
-	// Computer players: every slot that isn't played by a human (-GenNoAI leaves them passive). (A campaign's computer
-	// players have no skirmish brain: their map's scripts move them.)
-	if (!Match.bNoAI && !IsCampaign())
+	// Computer players: every slot that isn't played by a human (-GenNoAI leaves them passive). In a campaign mission
+	// the same brain builds the side's base from the map's own build list; the scripts that move it are the map's.
+	if (!Match.bNoAI)
 	{
 		const EGenDifficulty Difficulty = Match.DefaultDifficulty == 0 ? EGenDifficulty::Easy
 			: (Match.DefaultDifficulty == 2 ? EGenDifficulty::Hard : EGenDifficulty::Normal);
 		for (FGenPlayer& P : Players)
 		{
-			if (!P.bHuman && !P.bNeutral && P.Template && P.StartPosition >= 0)
+			if (!P.bHuman && !P.bNeutral && P.Template && (IsCampaign() || P.StartPosition >= 0))
 			{
 				P.bSkirmishAI = true;
 				const EGenDifficulty Own = P.Difficulty == 0 ? EGenDifficulty::Easy : (P.Difficulty == 1 ? EGenDifficulty::Normal
@@ -570,6 +579,7 @@ bool UGenGameLogic::StartSkirmish(AGenMapActor* InMapActor, const FGenMatchSetti
 	}
 	UpdateShroud();
 	InitShroudView();
+	InitBehindBuildings();
 	Frame = CompletedFrame = PublishedFrame = 0;
 	SimClock = 0.0;
 	RenderDelay = 0.0;
@@ -639,8 +649,56 @@ void UGenGameLogic::SpawnMapObjects()
 			{
 				New->MapAmbientEnabled = Enabled->Bool ? 1 : 0;
 			}
+			ApplyMapAmbientCustomization(*New, O);
 		}
 	}
+}
+
+void UGenGameLogic::ApplyMapAmbientCustomization(FGenObject& New, const FGenMapObject& O)
+{
+	// Object::updateObjValuesFromMapProperties: how far the sound carries and how loud it is, as this object makes it - an
+	// event of its own (Drawable::mangleCustomAudioName). A cut scene's explosion is heard from half a mountain away.
+	const FGenDictValue* Customized = O.Properties.Find(TEXT("objectSoundAmbientCustomized"));
+	if (!Customized || !Customized->Bool || (New.bMapAmbientOverride && New.MapAmbientSound.IsEmpty()))
+	{
+		return;
+	}
+	UGenAudioManager* AudioManager = GetWorld()->GetSubsystem<UGenAudioManager>();
+	const FGenAudioEventInfo* Base = FGenAudioData::Get().Find(New.bMapAmbientOverride || !AudioManager
+		? New.MapAmbientSound : AudioManager->GetTemplateSound(*New.GetTemplate(), TEXT("SoundAmbient")));
+	if (!Base)
+	{
+		return;
+	}
+	FGenAudioEventInfo Custom = *Base;
+	Custom.Name = FString::Printf(TEXT(" %s %u"), *Base->Name, New.GetID());
+	if (const FGenDictValue* V = O.Properties.Find(TEXT("objectSoundAmbientLooping")))
+	{
+		Custom.Control = V->Bool ? (Custom.Control | GenAudioControl::Loop) : (Custom.Control & ~GenAudioControl::Loop);
+	}
+	if (const FGenDictValue* V = O.Properties.Find(TEXT("objectSoundAmbientLoopCount")); V && (Custom.Control & GenAudioControl::Loop) != 0)
+	{
+		Custom.LoopCount = V->Int;
+	}
+	if (const FGenDictValue* V = O.Properties.Find(TEXT("objectSoundAmbientVolume")))
+	{
+		Custom.Volume = V->Real;
+	}
+	if (const FGenDictValue* V = O.Properties.Find(TEXT("objectSoundAmbientMinRange")))
+	{
+		Custom.MinRange = V->Real;
+	}
+	if (const FGenDictValue* V = O.Properties.Find(TEXT("objectSoundAmbientMaxRange")))
+	{
+		Custom.MaxRange = V->Real;
+	}
+	if (const FGenDictValue* V = O.Properties.Find(TEXT("objectSoundAmbientPriority")))
+	{
+		Custom.Priority = EGenAudioPriority(FMath::Clamp(V->Int, 0, 4));
+	}
+	New.bMapAmbientOverride = true;
+	New.MapAmbientSound = Custom.Name;
+	FGenAudioData::Get().AddCustomEvent(Custom);
 }
 
 FString UGenGameLogic::GetAmbientSound(const FGenObject& O, const FString& TemplateSound) const
@@ -828,9 +886,17 @@ FGenObject* UGenGameLogic::CreateObject(const FGenThingTemplate* Template, int32
 	Obj->SetOrientation(Angle);
 	Obj->SnapshotPrevious();
 	Obj->SetModelCondition(GenConditions::Night(), bNight);
+	Obj->SetModelCondition(GenConditions::Snow(), bSnowy); // (Object::Object: "m_weather == WEATHER_SNOWY")
+	Obj->SafeOcclusionFrame = Frame + uint32(FGenGameData::Get().DefaultOcclusionDelay);
 	FGenObject* Raw = Obj.Get();
 	Objects.Add(Id, MoveTemp(Obj));
 	ObjectOrder.Add(Id);
+	if (MapScripts)
+	{
+		// ScriptEngine::notifyOfObjectCreationOrDestruction: the conditions that keep an answer cached want to know
+		// that something was made, because it could be in the area they are asked about.
+		MapScripts->NoteObjectChange();
+	}
 	if (!bOwnedDirty)
 	{
 		if (OwnedObjects.IsValidIndex(OwnerPlayer))
@@ -855,7 +921,8 @@ FGenObject* UGenGameLogic::CreateObject(const FGenThingTemplate* Template, int32
 		Pathfinder.AddFence(*Raw);
 		ObstacleOwners.Add(Id);
 	}
-	else if (Template->IsKindOf(TEXT("STRUCTURE")) && !Template->bGeometryIsSmall && !Raw->CanMove())
+	// ("Don't add bounds that are up in the air": a railway bridge on its piers has open ground under its box.)
+	else if (Template->IsKindOf(TEXT("STRUCTURE")) && !Template->bGeometryIsSmall && !Raw->CanMove() && Position.Z - GetGroundHeight(Position.X, Position.Y) <= GenLogic::PathfindCellSize)
 	{
 		Pathfinder.AddObstacle(*Raw);
 		ObstacleOwners.Add(Id);
@@ -863,6 +930,11 @@ FGenObject* UGenGameLogic::CreateObject(const FGenThingTemplate* Template, int32
 
 	// Object::Object: "if (controller->getNumBattlePlansActive() > 0) controller->applyBattlePlanBonusesForObject(this)".
 	AddBattlePlanBonuses(*Raw, OwnerPlayer);
+	// Object::initObject: "if (!getReceivingDifficultyBonus() && TheScriptEngine->getObjectsShouldReceiveDifficultyBonus())".
+	if (MapScripts && MapScripts->ObjectsReceiveDifficultyBonus())
+	{
+		Raw->SetReceivingDifficultyBonus(true);
+	}
 
 	// (Its model is made by the drawing pass: see CreatePendingVisuals.)
 	PendingVisuals.Add(Id);
@@ -981,10 +1053,11 @@ void UGenGameLogic::CreatePendingVisuals()
 		}
 		if (!MC)
 		{
-			// (Nothing to draw - but a sound to make: W3DDefaultDraw objects like the map's Amb_... ones.)
-			if (Audio && !GetAmbientSound(*O, Audio->GetTemplateSound(*O->GetTemplate(), TEXT("SoundAmbient"))).IsEmpty())
+			// (Nothing to draw - but a sound to make: W3DDefaultDraw objects like the map's Amb_... ones. Or one the scripts
+			// will start when the time comes: a cut scene's explosions.)
+			if (Audio && !(O->bMapAmbientOverride ? O->MapAmbientSound : Audio->GetTemplateSound(*O->GetTemplate(), TEXT("SoundAmbient"))).IsEmpty())
 			{
-				SoundOnly.Add(Id, FString());
+				SoundOnly.Add(Id, FSoundOnlyObject());
 			}
 			continue;
 		}
@@ -1094,6 +1167,18 @@ void UGenGameLogic::DestroyObject(FGenObjectID ID)
 	{
 		Obj.EndSpawns(true); // SpawnBehavior::onDelete
 	}
+	// Object::destroy tells the team it was on: a team's own script runs when one of its members dies. The team
+	// has to be looked up while the object is still here. In a mission the map's engine owns the scripts; in a
+	// skirmish the player's own copy does.
+	if (MapScripts)
+	{
+		MapScripts->NoteObjectChange();
+		MapScripts->NotifyTeamOfObjectDeath(Obj);
+	}
+	else if (FGenSkirmishAI* AI = GetAI(Obj.GetOwner()))
+	{
+		AI->NotifyTeamOfObjectDeath(Obj);
+	}
 	// (Removed in the middle of a step - a shrub under a new building: nobody may come across it any more.)
 	Partition.Remove(&Obj);
 	const int32 StepIndex = StepObjects.Find(&Obj);
@@ -1202,6 +1287,59 @@ EGenRelationship UGenGameLogic::GetRelationship(int32 A, int32 B) const
 	return (TA >= 0 && TA == TB) ? EGenRelationship::Allies : EGenRelationship::Enemies;
 }
 
+EGenRelationship UGenGameLogic::GetRelationship(const FGenObject& A, const FGenObject& B) const
+{
+	if (bTeamRelationOverrides)
+	{
+		// Team::getRelationship: that team, then that team's player, then Player::getRelationship: that team.
+		const int32 TeamB = TeamFactory.GetObjectTeam(B.GetID());
+		if (const FGenTeam* Team = TeamFactory.FindTeam(TeamFactory.GetObjectTeam(A.GetID())))
+		{
+			if (const EGenRelationship* R = Team->OverrideRelations.Find(TeamB))
+			{
+				return *R;
+			}
+			if (const EGenRelationship* R = Team->OverridePlayerRelations.Find(B.GetOwner()))
+			{
+				return *R;
+			}
+		}
+		if (Players.IsValidIndex(A.GetOwner()))
+		{
+			if (const EGenRelationship* R = Players[A.GetOwner()].TeamRelations.Find(TeamB))
+			{
+				return *R;
+			}
+		}
+	}
+	return GetRelationship(A.GetOwner(), B.GetOwner());
+}
+
+EGenRelationship UGenGameLogic::GetRelationship(int32 Player, const FGenObject& B) const
+{
+	if (bTeamRelationOverrides)
+	{
+		if (Players.IsValidIndex(Player))
+		{
+			if (const EGenRelationship* R = Players[Player].TeamRelations.Find(TeamFactory.GetObjectTeam(B.GetID())))
+			{
+				return *R;
+			}
+		}
+		if (const int32* TeamId = TeamFactory.DefaultTeams.Find(Player))
+		{
+			if (const FGenTeam* Team = TeamFactory.FindTeam(*TeamId))
+			{
+				if (const EGenRelationship* R = Team->OverrideRelations.Find(TeamFactory.GetObjectTeam(B.GetID())))
+				{
+					return *R;
+				}
+			}
+		}
+	}
+	return GetRelationship(Player, B.GetOwner());
+}
+
 // ---- commands -----------------------------------------------------------------------------------
 
 void UGenGameLogic::IssueMove(const TArray<FGenObjectID>& Units, const FVector3f& Goal)
@@ -1261,12 +1399,37 @@ void UGenGameLogic::IssueAttackMove(const TArray<FGenObjectID>& Units, const FVe
 	SubmitCommand(MoveTemp(C));
 }
 
+bool UGenGameLogic::OrderToDeck(FGenObject* O, EGenCommandType Type, const FVector3f& Pos, FGenObjectID Target, int32 Slot)
+{
+	FGenParkingPlace* Deck = O ? O->GetParking() : nullptr;
+	return Deck && Deck->OrderDeck(Type, Pos, Target, Slot);
+}
+
+void UGenGameLogic::OrderStandingDecks(const FGenCommand& C)
+{
+	// (FlightDeckBehavior::aiDoCommand: "The carrier is a dumb stump that only propagates orders to it's aircraft." It
+	// doesn't move itself, so it isn't among those of a group that are sent anywhere.)
+	for (FGenObjectID Id : C.Units)
+	{
+		FGenObject* O = FindObject(Id);
+		if (O && !O->CanMove() && !O->IsDead())
+		{
+			OrderToDeck(O, C.Type, C.Pos, GenInvalidObjectID);
+		}
+	}
+}
+
 void UGenGameLogic::ExecAttackMove(const FGenCommand& C)
 {
+	OrderStandingDecks(C);
 	for (const TPair<FGenObject*, FVector3f>& It : SpreadGroup(C.Units, C.Pos))
 	{
 		It.Key->StopConstructing();
 		It.Key->OnPlayerCommand(false);
+		if (OrderToDeck(It.Key, EGenCommandType::AttackMove, It.Value, GenInvalidObjectID))
+		{
+			continue; // the order is kept for the aircraft standing on its deck
+		}
 		It.Key->CommandAttackMove(It.Value);
 		if (It.Key->GetTemplate()->AssaultTransport.bValid)
 		{
@@ -1289,6 +1452,7 @@ void UGenGameLogic::IssueGuard(const TArray<FGenObjectID>& Units, const FVector3
 
 void UGenGameLogic::ExecGuard(const FGenCommand& C)
 {
+	OrderStandingDecks(C);
 	for (const TPair<FGenObject*, FVector3f>& It : SpreadGroup(C.Units, C.Pos))
 	{
 		if (It.Key->GetID() == C.Target)
@@ -1297,6 +1461,10 @@ void UGenGameLogic::ExecGuard(const FGenCommand& C)
 		}
 		It.Key->StopConstructing();
 		It.Key->OnPlayerCommand(false);
+		if (OrderToDeck(It.Key, EGenCommandType::Guard, It.Value, GenInvalidObjectID))
+		{
+			continue; // a deck holds a spot through its aircraft, not through itself
+		}
 		It.Key->CommandGuardPosition(FVector2f(It.Value.X, It.Value.Y), EGenGuardMode(C.A), C.Target);
 		SimYield(TEXT("a group's order"));
 	}
@@ -1321,6 +1489,10 @@ void UGenGameLogic::ExecStop(const FGenCommand& C)
 				O->AssaultRetrieveMembers(); // AICMD_IDLE: "retrieveMembers()" - everybody back in
 			}
 			O->OnPlayerCommand(false);
+			if (OrderToDeck(O, EGenCommandType::Stop, FVector3f::ZeroVector, GenInvalidObjectID))
+			{
+				continue; // the deck's "do nothing" is what sends its aircraft back
+			}
 			O->CommandIdle();
 			for (FGenObjectID SpawnId : O->GetSpawns()) // (SpawnBehavior::orderSlavesToGoIdle)
 			{
@@ -1401,6 +1573,10 @@ void UGenGameLogic::ExecForceAttack(const FGenCommand& C)
 			continue;
 		}
 		O->OnPlayerCommand(false);
+		if (OrderToDeck(O, EGenCommandType::ForceAttack, FVector3f::ZeroVector, C.Target))
+		{
+			continue; // aiForceAttackObject goes to the deck's aircraft, not to the ship
+		}
 		O->CommandStop();
 		O->ClearAttack();
 		O->CommandAttack(C.Target, true);
@@ -1522,6 +1698,10 @@ void UGenGameLogic::ExecAttack(const FGenCommand& C)
 		if (FGenObject* O = FindObject(Id))
 		{
 			O->OnPlayerCommand(false);
+			if (OrderToDeck(O, EGenCommandType::Attack, FVector3f::ZeroVector, C.Target))
+			{
+				continue;
+			}
 			O->CommandStop();
 			O->CommandAttack(C.Target);
 			O->bAssaultAttackObject = O->GetTemplate()->AssaultTransport.bValid; // AICMD_ATTACK_OBJECT
@@ -1559,6 +1739,10 @@ void UGenGameLogic::DealDamage(const FGenWeaponTemplate& Weapon, FGenObjectID So
 
 	// WeaponBonus: what the shooter's upgrades add to this weapon's damage.
 	const float DamageBonus = Source ? Source->GetWeaponBonus(Weapon, int32(FGenWeaponBonus::Damage)) : 1.f;
+	if (Weapon.HistoricBonusCount > 0 && Source)
+	{
+		CheckHistoricBonus(Weapon, *Source, InPos);
+	}
 	const float Radius = FMath::Max(Weapon.PrimaryDamageRadius, Weapon.SecondaryDamageRadius);
 	if (Radius <= 0.f)
 	{
@@ -1572,6 +1756,7 @@ void UGenGameLogic::DealDamage(const FGenWeaponTemplate& Weapon, FGenObjectID So
 	}
 
 	const uint32 Affects = Weapon.RadiusDamageAffects;
+	const bool bSubdualMissile = Weapon.DamageType.Equals(TEXT("SUBDUAL_MISSILE"), ESearchCase::IgnoreCase);
 	// Only what stands near enough to be reached is looked at (a little wider than the blast: tall things
 	// are measured by their bounding sphere), in the order the objects were made, as before. Damage can
 	// kill objects, but never adds or removes any.
@@ -1580,12 +1765,17 @@ void UGenGameLogic::DealDamage(const FGenWeaponTemplate& Weapon, FGenObjectID So
 	Near.Sort([](const FGenObject& A, const FGenObject& B) { return A.GetID() < B.GetID(); });
 	for (FGenObject* O : Near)
 	{
-		if (!O->IsTargetable())
+		// (ActiveBody::onSubdualChange's other half: SUBDUAL_MISSILE reaches missiles in flight, and jams them.)
+		const bool bJams = bSubdualMissile && O->Projectile.bActive && O->GetTemplate()->SubdualDamageCap > 0.f && !O->bDead && !O->bPendingDestroy;
+		if (!O->IsTargetable() && !bJams)
 		{
 			continue;
 		}
-		// DAMAGE_RANGE_CALC_TYPE (FROM_BOUNDINGSPHERE_3D)
-		const float Dist = FMath::Max(0.f, (O->GetPosition() - Pos).Size() - O->GetTemplate()->GetBoundingSphereRadius());
+		// DAMAGE_RANGE_CALC_TYPE (FROM_BOUNDINGSPHERE_3D): "object positions are defined as the bottom center of the
+		// geometry, thus we must add the radius to the z coord to get the proper center of the bounding sphere."
+		const FGenThingTemplate* VictimT = O->GetTemplate();
+		const float ZToCenter = VictimT->GeometryType.Equals(TEXT("SPHERE"), ESearchCase::IgnoreCase) ? 0.f : VictimT->GeometryHeight * 0.5f;
+		const float Dist = FMath::Max(0.f, (O->GetPosition() + FVector3f(0.f, 0.f, ZToCenter) - Pos).Size() - VictimT->GetBoundingSphereRadius());
 		if (Dist > Radius)
 		{
 			continue;
@@ -1609,7 +1799,7 @@ void UGenGameLogic::DealDamage(const FGenWeaponTemplate& Weapon, FGenObjectID So
 				{
 					continue; // isSignificantlyAboveTerrain
 				}
-				const EGenRelationship Rel = GetRelationship(O->GetOwner(), Source->GetOwner());
+				const EGenRelationship Rel = GetRelationship(*O, *Source);
 				if ((Affects & GenWeaponAffects::NotSimilar) != 0 && Rel == EGenRelationship::Allies && O->GetTemplate()->Canonical() == Source->GetTemplate()->Canonical())
 				{
 					continue;
@@ -1623,9 +1813,110 @@ void UGenGameLogic::DealDamage(const FGenWeaponTemplate& Weapon, FGenObjectID So
 			}
 		}
 		const float Amount = bKillSelf ? 1e9f : (Dist <= Weapon.PrimaryDamageRadius ? Weapon.PrimaryDamage : Weapon.SecondaryDamage) * DamageBonus;
-		O->AttemptDamage(Amount, Weapon.DamageType, Weapon.DeathType, SourceId);
+		O->AttemptDamage(Amount, Weapon.DamageType, Weapon.DeathType, SourceId, bJams);
 		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [hit f%u] %s from #%u -> #%u %s hp=%.0f%s"), Frame, *Weapon.Name, SourceId, O->GetID(),
 			*O->GetTemplate()->Name, O->GetHealth(), O->IsDead() ? TEXT(" DEAD") : TEXT(""));
+		if (Weapon.ShockWaveAmount > 0.f)
+		{
+			// ("the vector between the source object causing the damage and the victim": a shot's source is the shot
+			// itself, where it went off. Killed or not, it is thrown.)
+			O->ApplyShockWave(O->GetPosition() - ((bProjectileDetonation || !Source) ? Pos : Source->GetPosition()), Weapon);
+		}
+	}
+}
+
+FGenAttackPriority& UGenGameLogic::FindOrAddAttackPriority(const FString& Name)
+{
+	TUniquePtr<FGenAttackPriority>& Set = AttackPriorities.FindOrAdd(Name);
+	if (!Set)
+	{
+		Set = MakeUnique<FGenAttackPriority>();
+		Set->Name = Name;
+	}
+	return *Set;
+}
+
+const FGenAttackPriority* UGenGameLogic::FindAttackPriority(const FString& Name) const
+{
+	const TUniquePtr<FGenAttackPriority>* Set = AttackPriorities.Find(Name);
+	return Set ? Set->Get() : nullptr;
+}
+
+bool UGenGameLogic::IsBehindStructure(const FGenObject& O, const FVector3f& CameraPos) const
+{
+	// RTS3DScene::flagOccludedObjects: the line from the camera to the thing goes through a structure. (That line only
+	// matters as far up as buildings go; a look along that bit of it through what is near.)
+	static constexpr float MaxStructureHeight = 160.f;
+	const FVector3f From = O.GetPosition() + FVector3f(0.f, 0.f, O.GetTemplate()->GeometryHeight * 0.5f);
+	const FVector3f Way = CameraPos - From;
+	if (Way.Z <= 1.f)
+	{
+		return false;
+	}
+	const float Scale = FMath::Min(1.f, MaxStructureHeight / Way.Z);
+	const FVector3f Seg = Way * Scale;
+	const FVector2f Mid(From.X + Seg.X * 0.5f, From.Y + Seg.Y * 0.5f);
+	bool bBehind = false;
+	const int32 Steps = FMath::Clamp(FMath::CeilToInt32(Seg.Size() / 6.f), 2, 32);
+	Partition.ForEachInRange(Mid, FVector2f(Seg.X, Seg.Y).Size() * 0.5f, [&](FGenObject& Other)
+	{
+		if (bBehind || &Other == &O || !Other.bImmobile || Other.bDead || !Other.IsKindOf(TEXT("STRUCTURE")))
+		{
+			return;
+		}
+		for (int32 i = 1; i <= Steps && !bBehind; ++i)
+		{
+			bBehind = Other.ContainsPoint(From + Seg * (float(i) / float(Steps)));
+		}
+	});
+	return bBehind;
+}
+
+void UGenGameLogic::CheckHistoricBonus(const FGenWeaponTemplate& Weapon, const FGenObject& Source, const FVector3f& Pos)
+{
+	// WeaponTemplate::dealDamageInternal (the list is the template's: it counts across units).
+	TArray<FHistoricDamage>& History = HistoricDamage.FindOrAdd(&Weapon);
+	const uint32 Limit = uint32(FGenGameData::Get().HistoricDamageLimit);
+	int32 Expired = 0;
+	while (Expired < History.Num() && Frame >= Limit && History[Expired].Frame <= Frame - Limit)
+	{
+		++Expired;
+	}
+	History.RemoveAt(0, Expired, EAllowShrinking::No);
+	const FGenWeaponTemplate* Bonus = FGenGameData::Get().FindWeapon(Weapon.HistoricBonusWeapon);
+	if (!Bonus || Bonus == &Weapon)
+	{
+		return;
+	}
+	const float RadiusSq = FMath::Square(Weapon.HistoricBonusRadius);
+	const uint32 Oldest = Frame >= uint32(Weapon.HistoricBonusTime) ? Frame - uint32(Weapon.HistoricBonusTime) : 0;
+	int32 Count = 0;
+	for (const FHistoricDamage& H : History)
+	{
+		if (H.Frame >= Oldest && FVector2f::DistSquared(FVector2f(Pos.X, Pos.Y), FVector2f(H.Pos.X, H.Pos.Y)) <= RadiusSq)
+		{
+			++Count;
+		}
+	}
+	if (Count >= Weapon.HistoricBonusCount - 1) // "minus 1 since we include ourselves implicitly"
+	{
+		// (createAndFireTempWeapon, from the shot where it went off: what it makes is made there.)
+		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [historic f%u] %s: %d hits (of %d) at (%.0f, %.0f) within %.0f, %d frames, make %s"), Frame, *Weapon.Name, Count + 1, Weapon.HistoricBonusCount,
+			Pos.X, Pos.Y, Weapon.HistoricBonusRadius, Weapon.HistoricBonusTime, *Bonus->Name);
+		DoFXPos(Bonus->FireFX, Pos, nullptr, 0.f, &Pos, Bonus->PrimaryDamageRadius);
+		if (!Bonus->FireOCL.IsEmpty())
+		{
+			DoOCL(Bonus->FireOCL, Source, &Pos);
+		}
+		if (Bonus->PrimaryDamage > 0.f)
+		{
+			DealDamage(*Bonus, Source.GetID(), GenInvalidObjectID, Pos, false);
+		}
+		History.Reset(); // ("Clear the list for now to make sure we don't have multiple firestorms")
+	}
+	else
+	{
+		History.Add({ Frame, Pos });
 	}
 }
 
@@ -1735,6 +2026,7 @@ void UGenGameLogic::Tick(float DeltaTime)
 	}
 	// Fast forward (a test hurrying through an hour of game) has no time to spare between steps: they
 	// run here then, as many a frame as it takes, like they did before there was a thread for them.
+	bCatchingUp |= bCinematicSkip || bResuming;
 	const bool bThreaded = SimThread && CVarGenSimThread.GetValueOnGameThread() != 0 && TimeScale <= 2.01f && !bCatchingUp;
 	if (SimThread && !bThreaded)
 	{
@@ -1777,7 +2069,10 @@ void UGenGameLogic::Tick(float DeltaTime)
 			RenderDelay = 0.0;
 		}
 	}
-	SimClock += bUserPaused ? 0.0 : double(DeltaTime) * double(TimeScale) * FramesPerSecond * Pace;
+	// SET_FPS_LIMIT: a campaign's cinematic slowed the original to that frame rate (from its 30), game and camera alike.
+	const int32 FpsLimit = MapScripts ? MapScripts->GetFpsLimit() : 0;
+	const double ScriptPace = FpsLimit > 0 ? FMath::Min(1.0, double(FpsLimit) / 30.0) : 1.0;
+	SimClock += bUserPaused ? 0.0 : double(DeltaTime) * double(TimeScale) * FramesPerSecond * Pace * ScriptPace;
 	// Avoid a spiral of death after hitches: never more than a quarter second of logic to catch up on.
 	const int32 MaxSteps = FMath::Max(1, GenLogic::GetLogicFPS() / 4);
 	SimClock = FMath::Min(SimClock, double(PublishedFrame) + RenderDelay + double(MaxSteps));
@@ -1788,7 +2083,8 @@ void UGenGameLogic::Tick(float DeltaTime)
 			PublishFrame();
 			continue;
 		}
-		const bool bFrozen = PauseAtFrame != 0 && Frame >= PauseAtFrame; // (-GenPauseFrame: show exactly the state of this logic frame)
+		// (-GenPauseFrame: show exactly the state of this logic frame. Loading a saved game the steps are CatchUp's, which stops where the game was saved.)
+		const bool bFrozen = (PauseAtFrame != 0 && Frame >= PauseAtFrame) || bResuming;
 		const bool bRunning = SimThread && SimThread->IsStepRunning();
 		const bool bOrdersHere = !OrderSource || OrderSource->IsFrameReady(Frame);
 		if (!bRunning && CompletedFrame == PublishedFrame && Frame == CompletedFrame && !bFrozen && bOrdersHere && SimClock >= double(Frame + 1))
@@ -1832,6 +2128,12 @@ void UGenGameLogic::Tick(float DeltaTime)
 	{
 		ReportPerf(DeltaTime);
 	}
+	// The models' clock: the game's, not the wall's. The original moves its models on by the same time every game
+	// frame (W3DDisplay::draw), so they go slower with a cinematic's SET_FPS_LIMIT, stop with a pause or FREEZE_TIME
+	// and hurry with the game. A flight made for a shot ends when the shot does.
+	const double ModelClockNow = GetRenderFrameTime();
+	const float ModelSeconds = MapScripts && MapScripts->IsTimeFrozen() ? 0.f : float(FMath::Max(0.0, ModelClockNow - ModelClock) / FramesPerSecond);
+	ModelClock = ModelClockNow;
 	// The step's turn: until the next world tick begins (but for the HUD, which comes in between).
 	if (SimThread && bGateHeldForFrame)
 	{
@@ -1841,7 +2143,7 @@ void UGenGameLogic::Tick(float DeltaTime)
 	// What follows needs nothing of the logic, and so is done while the step gets on with its work:
 	// the models' animation, and reading in what isn't loaded yet of the things that may turn up (a few
 	// milliseconds' worth per frame, less when frames are already long).
-	UGenModelComponent::TickManaged(DeltaTime);
+	UGenModelComponent::TickManaged(ModelSeconds);
 	if (MapActor)
 	{
 		// (The camera has been moved for this frame by now.)
@@ -1908,7 +2210,7 @@ void UGenGameLogic::QueuePreloads()
 					bool bWanted = State.ConditionSets.Num() == 0;
 					for (const FGenConditionBits& Bits : State.ConditionSets)
 					{
-						bWanted |= !Bits.Test(SnowBit) && (bNight || !Bits.Test(NightBit));
+						bWanted |= (bSnowy || !Bits.Test(SnowBit)) && (bNight || !Bits.Test(NightBit));
 					}
 					if (!bWanted)
 					{
@@ -1930,7 +2232,7 @@ void UGenGameLogic::QueuePreloads()
 						bool bWanted = State.ConditionSets.Num() == 0;
 						for (const FGenConditionBits& Bits : State.ConditionSets)
 						{
-							bWanted |= !Bits.Test(SnowBit) && (bNight || !Bits.Test(NightBit));
+							bWanted |= (bSnowy || !Bits.Test(SnowBit)) && (bNight || !Bits.Test(NightBit));
 						}
 						if (bWanted && !State.Model.IsEmpty())
 						{
@@ -2483,12 +2785,25 @@ void UGenGameLogic::UpdateDrawables()
 					bTurning |= !FMath::IsNearlyEqual(O->GetDrawTurretAngle(t), O->GetPrevTurretAngle(t), 1.e-4f)
 						|| !FMath::IsNearlyEqual(O->GetDrawTurretPitch(t), O->GetPrevTurretPitch(t), 1.e-4f);
 				}
+				for (int32 t = 0; t < 2 && bAudible; ++t)
+				{
+					// TurretAI::updateTurretAI: "the recent firing will not interrupt the moving sound"
+					bTurning |= DS.bSoundTurret && O->GetTemplate()->Turrets[t].bFiresWhileTurning && O->HasTurretJustFired(t, Frame);
+				}
 				if (bTurning != DS.bSoundTurret)
 				{
 					DS.bSoundTurret = bTurning;
 					Audio->SetObjectLoop(It.Key, 7, bTurning ? DS.TurretLoopSound : FString()); // (7: the turret)
 					UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [audio f%u] #%u %s turret %s"), Frame, It.Key, *O->GetTemplate()->Name, bTurning ? TEXT("turning") : TEXT("still"));
 				}
+			}
+			if (DS.SoundScriptCount != O->MapAmbientScriptCount)
+			{
+				// Drawable::enableAmbientSoundFromScript: "Allow ENABLE_OBJECT_SOUND to trigger one-shot attached sound multiple times".
+				DS.SoundScriptCount = O->MapAmbientScriptCount;
+				DS.AmbientSound[0] = GetAmbientSound(*O, Audio->GetTemplateSound(*O->GetTemplate(), TEXT("SoundAmbient")));
+				Audio->SetObjectLoop(It.Key, 1, FString());
+				DS.SoundAmbient = -2;
 			}
 			const int32 DamageState = O->GetDamageState();
 			const int32 Ambient = (!bAudible || !O->AreEnginesOn()) ? -1 : (O->IsUnderConstruction() ? 4 : DamageState);
@@ -2535,9 +2850,23 @@ void UGenGameLogic::UpdateDrawables()
 					const float MinOpacity = O->GetTemplate()->Stealth.FriendlyOpacityMin;
 					Fade = 1.f - (MinOpacity + (1.f - MinOpacity) * Pulse);
 				}
-				if (Look != EGenStealthLook::VisibleFriendly)
+				// RTS3DScene::renderOneObject, the heat-vision pass: orange, at the opacity the detector's last look left
+				// (Drawable::draw: "m_secondMaterialPassOpacity *= 0.8" a frame); on an enemy's thing that is all that
+				// is drawn while it lasts (RINFO_OVERRIDE_ADDITIONAL_PASSES_ONLY).
+				if (O->GetHeatVisionFrame() != 0 && Look != EGenStealthLook::VisibleFriendly)
 				{
-					Glow = 0.25f + 0.35f * Pulse;
+					const float Age = float(FrameNow - O->GetHeatVisionFrame()) * (30.f / float(GenLogic::GetLogicFPS()));
+					const float HeatOpacity = FMath::Pow(0.8f, Age);
+					if (HeatOpacity > 0.001f)
+					{
+						Glow = HeatOpacity;
+						if (Look == EGenStealthLook::VisibleDetected)
+						{
+							// (Kept in sight: a pure additive ghost can't be told from the ground. A demo trap found is the
+							// whole model: the user's word, a small thing on the ground was too easily missed.)
+							Fade = O->IsKindOf(TEXT("DEMOTRAP")) ? 0.f : 0.75f * (1.f - HeatOpacity);
+						}
+					}
 				}
 			}
 			// Drawable::flashAsSelected (a building being captured): a few frames of light. (In the colour
@@ -2546,6 +2875,12 @@ void UGenGameLogic::UpdateDrawables()
 			{
 				Glow = FMath::Max(Glow, 0.9f);
 			}
+			// A disguise's change: it fades out, the model swaps, and it fades in as the other thing - for everybody.
+			if (const float DisguiseOpacity = O->GetDisguiseOpacity(); DisguiseOpacity >= 0.f)
+			{
+				Fade = 1.f - DisguiseOpacity;
+			}
+			UpdateOccludedMark(*O, DS, bHide, MC);
 			if (Fade != DS.StealthFade || Glow != DS.StealthGlow)
 			{
 				DS.StealthFade = Fade;
@@ -2591,6 +2926,16 @@ void UGenGameLogic::UpdateDrawables()
 				}
 			}
 			DS.Owner = ColorPlayer;
+			DS.CustomColor = FLinearColor::Transparent;
+		}
+		if (bLook && O->bCustomIndicatorColor && DS.CustomColor != O->CustomIndicatorColor)
+		{
+			DS.CustomColor = O->CustomIndicatorColor;
+			MC->SetHouseColor(DS.CustomColor);
+			for (const FExtraDraw& E : DS.Extras)
+			{
+				if (UGenModelComponent* Extra = E.Model.Get()) { Extra->SetHouseColor(DS.CustomColor); }
+			}
 		}
 		if (bLook && DS.AppliedVersion != O->GetConditionVersion() && StateBudgetLeft <= 0.0 && DS.bPlaced)
 		{
@@ -2612,6 +2957,7 @@ void UGenGameLogic::UpdateDrawables()
 					// transitions - a building site's scaffolding rises, it isn't just there.
 					FGenConditionBits Plain;
 					Plain.Set(GenConditions::Night(), bNight);
+					Plain.Set(GenConditions::Snow(), bSnowy);
 					const int32 First = Module.FindBestState(Plain);
 					if (Module.States.IsValidIndex(First))
 					{
@@ -2631,7 +2977,8 @@ void UGenGameLogic::UpdateDrawables()
 			{
 				if (Show(MC, *Draw, DS.State))
 				{
-					DS.AppliedTurret = 1e9f; // the model may have changed: re-apply the turret pose
+					// the model may have changed: re-apply the turrets' pose
+					DS.AppliedTurret = DS.AppliedTurretPitch = DS.AppliedAltTurret = DS.AppliedAltTurretPitch = 1e9f;
 				}
 				DS.bStateBusy |= DS.State.IsBusy();
 			}
@@ -2639,7 +2986,10 @@ void UGenGameLogic::UpdateDrawables()
 			{
 				if (UGenModelComponent* Extra = E.Model.Get())
 				{
-					Show(Extra, DrawT->Draws[E.DrawIndex], E.State);
+					if (Show(Extra, DrawT->Draws[E.DrawIndex], E.State))
+					{
+						E.AppliedTurret = E.AppliedTurretPitch = E.AppliedAltTurret = E.AppliedAltTurretPitch = 1e9f;
+					}
 					DS.bStateBusy |= E.State.IsBusy();
 				}
 			}
@@ -2657,7 +3007,7 @@ void UGenGameLogic::UpdateDrawables()
 				if (GenDrawable::UpdateModelState(MC, *Draw, DS.State, bNight))
 				{
 					bChanged = true;
-					DS.AppliedTurret = 1e9f;
+					DS.AppliedTurret = DS.AppliedTurretPitch = DS.AppliedAltTurret = DS.AppliedAltTurretPitch = 1e9f;
 				}
 				bStillBusy |= DS.State.IsBusy();
 			}
@@ -2665,7 +3015,11 @@ void UGenGameLogic::UpdateDrawables()
 			{
 				if (UGenModelComponent* Extra = E.Model.Get())
 				{
-					bChanged |= GenDrawable::UpdateModelState(Extra, DrawT->Draws[E.DrawIndex], E.State, bNight);
+					if (GenDrawable::UpdateModelState(Extra, DrawT->Draws[E.DrawIndex], E.State, bNight))
+					{
+						bChanged = true;
+						E.AppliedTurret = E.AppliedTurretPitch = E.AppliedAltTurret = E.AppliedAltTurretPitch = 1e9f;
+					}
 					bStillBusy |= E.State.IsBusy();
 				}
 			}
@@ -2748,6 +3102,24 @@ void UGenGameLogic::UpdateDrawables()
 					if (UGenModelComponent* Extra = E.Model.Get()) { Extra->ShowSubObject(Override.Key, Override.Value); }
 				}
 			}
+			// (Showing a part shows what hangs on it. handleClientRecoil hides a flash again every frame, whatever anything
+			// else said; here the only thing that can say otherwise is what was just done.)
+			auto RehideFlashes = [&DS](UGenModelComponent* Model, const FGenModelConditionState* FlashState)
+			{
+				for (int32 f = 0; Model && FlashState && f < FlashState->MuzzleFlashBones.Num(); ++f)
+				{
+					const int32 FlashSlot = FlashState->MuzzleFlashSlots.IsValidIndex(f) ? FlashState->MuzzleFlashSlots[f] : 0;
+					if (DS.MuzzleHideTime[FMath::Clamp(FlashSlot, 0, 2)] == 0.0)
+					{
+						Model->SetSubObjectsOnBonePrefixHidden(FlashState->MuzzleFlashBones[f], true);
+					}
+				}
+			};
+			RehideFlashes(MC, DS.State.Cur);
+			for (const FExtraDraw& E : DS.Extras)
+			{
+				RehideFlashes(E.Model.Get(), E.State.Cur);
+			}
 		}
 
 		// W3DSupplyDraw: the boxes of a supply pile sit on bones "<prefix>01..NN"; as the stock runs down,
@@ -2810,13 +3182,12 @@ void UGenGameLogic::UpdateDrawables()
 				{
 					for (const TPair<FString, FString>& PB : State->ParticleBones)
 					{
-						FTransform3f BoneXf;
-						if (MC->GetBoneTransformW3D(PB.Key, BoneXf))
-						{
-							const int32 Before = DS.StateSystems.Num();
-							Attach(PB.Value, BoneXf, DS.StateSystems);
-							if (DS.StateSystems.Num() > Before) { DS.StateSystemBones.Add(PB.Key); }
-						}
+						// (W3DModelDraw::setModelState: no such bone, or no model at all - "None" in the data: where the object is.)
+						FTransform3f BoneXf = FTransform3f::Identity;
+						MC->GetBoneTransformW3D(PB.Key, BoneXf);
+						const int32 Before = DS.StateSystems.Num();
+						Attach(PB.Value, BoneXf, DS.StateSystems);
+						if (DS.StateSystems.Num() > Before) { DS.StateSystemBones.Add(PB.Key); }
 					}
 				}
 			}
@@ -2835,13 +3206,11 @@ void UGenGameLogic::UpdateDrawables()
 				for (int32 b = 0; Extra && E.State.Cur && b < E.State.Cur->ParticleBones.Num(); ++b)
 				{
 					const TPair<FString, FString>& PB = E.State.Cur->ParticleBones[b];
-					FTransform3f BoneXf;
-					if (Extra->GetBoneTransformW3D(PB.Key, BoneXf))
-					{
-						const int32 Before = E.StateSystems.Num();
-						Attach(PB.Value, BoneXf, E.StateSystems);
-						if (E.StateSystems.Num() > Before) { E.StateSystemBones.Add(PB.Key); }
-					}
+					FTransform3f BoneXf = FTransform3f::Identity;
+					Extra->GetBoneTransformW3D(PB.Key, BoneXf);
+					const int32 Before = E.StateSystems.Num();
+					Attach(PB.Value, BoneXf, E.StateSystems);
+					if (E.StateSystems.Num() > Before) { E.StateSystemBones.Add(PB.Key); }
 				}
 			}
 			if (bNewStateSystems)
@@ -3019,27 +3388,60 @@ void UGenGameLogic::UpdateDrawables()
 			MC->SetSway(0, 0.f);
 		}
 
+		// W3DModelDraw::adjustTransformMtx: "override the mtx in this case. yes, call drawable, since the bone in question is
+		// likely to be in another module!" - the Technical's gunner stands on the truck's bed.
+		for (FExtraDraw& E : DS.Extras)
+		{
+			const FString& AttachBone = DrawT->Draws[E.DrawIndex].AttachToBone;
+			FTransform Place;
+			UGenModelComponent* Extra = E.Model.Get();
+			if (Extra && !AttachBone.IsEmpty() && MC->GetBoneTransform(AttachBone, Place) && !Place.Equals(E.AppliedAttach, 1e-3))
+			{
+				E.AppliedAttach = Place;
+				Extra->SetRelativeTransform(Place);
+			}
+		}
 		if (State && (O->HasWeapons() || Draw->ProjectileBoneFeedbackSlots != 0))
 		{
-			// Turret yaw, interpolated between logic frames.
-			if (!State->Turret.IsEmpty())
+			// W3DModelDraw::handleClientTurretPositioning, for both turrets of each module: the yaw, interpolated between
+			// logic frames, plus the way the art points (TurretArtAngle: a battleship's front guns are modelled facing backwards) ...
+			auto PoseTurrets = [&](UGenModelComponent* Model, const FGenModelConditionState& S, float& AppliedYaw0, float& AppliedPitch0, float& AppliedYaw1, float& AppliedPitch1)
 			{
-				const float Prev = O->GetPrevTurretAngle(0);
-				const float Angle = Prev + GenLogic::AngleDiff(O->GetDrawTurretAngle(0), Prev) * Alpha;
-				if (FMath::Abs(Angle - DS.AppliedTurret) > 1e-4f)
+				for (int32 t = 0; t < 2; ++t)
 				{
-					DS.AppliedTurret = Angle;
-					MC->SetBoneRotationOverride(State->Turret, FQuat(FVector::UpVector, double(Angle)));
+					const FString& YawBone = t == 0 ? S.Turret : S.AltTurret;
+					if (!YawBone.IsEmpty())
+					{
+						const float Prev = O->GetPrevTurretAngle(t);
+						const float Angle = Prev + GenLogic::AngleDiff(O->GetDrawTurretAngle(t), Prev) * Alpha + S.TurretArtAngle[t];
+						float& Applied = t == 0 ? AppliedYaw0 : AppliedYaw1;
+						if (FMath::Abs(Angle - Applied) > 1e-4f)
+						{
+							Applied = Angle;
+							Model->SetBoneRotationOverride(YawBone, FQuat(FVector::UpVector, double(Angle)));
+						}
+					}
+					// ... and the barrel's pitch (Rotate_Y(-turretPitch)).
+					const FString& PitchBone = t == 0 ? S.TurretPitch : S.AltTurretPitch;
+					if (!PitchBone.IsEmpty())
+					{
+						const float Pitch = FMath::Lerp(O->GetPrevTurretPitch(t), O->GetDrawTurretPitch(t), Alpha) + S.TurretArtPitch[t];
+						float& Applied = t == 0 ? AppliedPitch0 : AppliedPitch1;
+						if (FMath::Abs(Pitch - Applied) > 1e-4f)
+						{
+							Applied = Pitch;
+							Model->SetBoneRotationOverride(PitchBone, FQuat(FVector::RightVector, double(-Pitch)));
+						}
+					}
 				}
-			}
-			// ... and the barrel's pitch (W3DModelDraw::handleClientTurretPositioning: Rotate_Y(-turretPitch)).
-			if (!State->TurretPitch.IsEmpty())
+			};
+			PoseTurrets(MC, *State, DS.AppliedTurret, DS.AppliedTurretPitch, DS.AppliedAltTurret, DS.AppliedAltTurretPitch);
+			for (FExtraDraw& E : DS.Extras)
 			{
-				const float Pitch = FMath::Lerp(O->GetPrevTurretPitch(0), O->GetDrawTurretPitch(0), Alpha);
-				if (FMath::Abs(Pitch - DS.AppliedTurretPitch) > 1e-4f)
+				UGenModelComponent* Extra = E.Model.Get();
+				if (Extra && E.State.Cur)
 				{
-					DS.AppliedTurretPitch = Pitch;
-					MC->SetBoneRotationOverride(State->TurretPitch, FQuat(FVector::RightVector, double(-Pitch)));
+					PoseTurrets(Extra, *E.State.Cur, E.AppliedTurret, E.AppliedTurretPitch, E.AppliedAltTurret, E.AppliedAltTurretPitch);
 				}
 			}
 			// W3DModelDraw::updateProjectileClipStatus: "Loop through the projectile bones, and start hiding
@@ -3066,6 +3468,20 @@ void UGenGameLogic::UpdateDrawables()
 				DS.ClipSpentState = State;
 			}
 
+			// (-GenFlashTrace: a muzzle flash that shows with no shot to show it for.)
+			static const bool bFlashTrace = FParse::Param(FCommandLine::Get(), TEXT("GenFlashTrace"));
+			if (bFlashTrace && bLook && !bHide && DS.MuzzleHideTime[0] == 0.0 && DS.MuzzleHideTime[1] == 0.0 && DS.MuzzleHideTime[2] == 0.0)
+			{
+				TArray<FString> Shown;
+				MC->GetShownSubObjectsLike(TEXT("FX"), Shown);
+				MC->GetShownSubObjectsLike(TEXT("MUZZLE"), Shown);
+				static TSet<uint32> Told;
+				if (Shown.Num() > 0 && !Told.Contains(It.Key))
+				{
+					Told.Add(It.Key);
+					UE_LOG(LogGenerals, Log, TEXT("  [flash f%u] #%u %s model %s shows %s (state flashes: %s)"), Frame, It.Key, *O->GetTemplate()->Name, *State->Model, *FString::Join(Shown, TEXT(", ")), *FString::Join(State->MuzzleFlashBones, TEXT(", ")));
+				}
+			}
 			for (int32 Slot = 0; bLook && Slot < 3; ++Slot)
 			{
 				const bool bFired = O->GetWeapon(Slot).FireCount != DS.SeenFireCount[Slot];
@@ -3076,12 +3492,20 @@ void UGenGameLogic::UpdateDrawables()
 				if (bFired || bExpired)
 				{
 					DS.MuzzleHideTime[Slot] = bFired ? Now + MuzzleFlashSeconds : 0.0;
-					for (int32 f = 0; f < State->MuzzleFlashBones.Num(); ++f)
+					auto ShowFlashes = [&](UGenModelComponent* Model, const FGenModelConditionState* FlashState)
 					{
-						if (State->MuzzleFlashSlots.IsValidIndex(f) && State->MuzzleFlashSlots[f] == Slot)
+						for (int32 f = 0; Model && FlashState && f < FlashState->MuzzleFlashBones.Num(); ++f)
 						{
-							MC->SetSubObjectsOnBonePrefixHidden(State->MuzzleFlashBones[f], !bFired);
+							if (FlashState->MuzzleFlashSlots.IsValidIndex(f) && FlashState->MuzzleFlashSlots[f] == Slot)
+							{
+								Model->SetSubObjectsOnBonePrefixHidden(FlashState->MuzzleFlashBones[f], !bFired);
+							}
 						}
+					};
+					ShowFlashes(MC, State);
+					for (const FExtraDraw& E : DS.Extras)
+					{
+						ShowFlashes(E.Model.Get(), E.State.Cur);
 					}
 				}
 
@@ -3093,7 +3517,12 @@ void UGenGameLogic::UpdateDrawables()
 					DS.RecoilRate[Slot] = InitialRecoil;
 					DS.RecoilClock[Slot] = 0.f;
 				}
-				if (DS.RecoilState[Slot] == 0 || !State->RecoilSlots.Contains(Slot))
+				bool bAnyRecoil = State->RecoilSlots.Contains(Slot);
+				for (const FExtraDraw& E : DS.Extras)
+				{
+					bAnyRecoil = bAnyRecoil || (E.State.Cur && E.State.Cur->RecoilSlots.Contains(Slot));
+				}
+				if (DS.RecoilState[Slot] == 0 || !bAnyRecoil)
 				{
 					continue;
 				}
@@ -3128,12 +3557,20 @@ void UGenGameLogic::UpdateDrawables()
 				}
 				const float Shift = DS.RecoilState[Slot] == 0 ? 0.f
 					: FMath::Lerp(DS.RecoilPrevShift[Slot], DS.RecoilShift[Slot], FMath::Min(DS.RecoilClock[Slot], 1.f));
-				for (int32 r = 0; r < State->RecoilBones.Num(); ++r)
+				auto ApplyRecoil = [&](UGenModelComponent* Model, const FGenModelConditionState* RecoilState)
 				{
-					if (State->RecoilSlots[r] == Slot)
+					for (int32 r = 0; Model && RecoilState && r < RecoilState->RecoilBones.Num(); ++r)
 					{
-						MC->SetBoneOffsetOnPrefix(State->RecoilBones[r], FVector3f(-Shift, 0.f, 0.f));
+						if (RecoilState->RecoilSlots[r] == Slot)
+						{
+							Model->SetBoneOffsetOnPrefix(RecoilState->RecoilBones[r], FVector3f(-Shift, 0.f, 0.f));
+						}
 					}
+				};
+				ApplyRecoil(MC, State);
+				for (const FExtraDraw& E : DS.Extras)
+				{
+					ApplyRecoil(E.Model.Get(), E.State.Cur);
 				}
 			}
 		}
@@ -3141,8 +3578,12 @@ void UGenGameLogic::UpdateDrawables()
 		if (bLook)
 		{
 			DS.bHasTurret = State && O->HasWeapons() && !State->Turret.IsEmpty();
+			for (const FExtraDraw& E : DS.Extras)
+			{
+				DS.bHasTurret = DS.bHasTurret || (O->HasWeapons() && E.State.Cur && !E.State.Cur->Turret.IsEmpty());
+			}
 			DS.bRider = Draw && !Draw->AttachToBoneInContainer.IsEmpty() && O->IsContained();
-			DS.bBusy = DS.StealthFade != 0.f || DS.StealthGlow != 0.f || DS.bStateBusy || DS.FlashStart > 0.0
+			DS.bBusy = DS.StealthFade != 0.f || DS.StealthGlow != 0.f || O->GetDisguiseOpacity() >= 0.f || DS.bStateBusy || DS.FlashStart > 0.0
 				|| DS.RecoilState[0] != 0 || DS.RecoilState[1] != 0 || DS.RecoilState[2] != 0
 				|| DS.MuzzleHideTime[0] > 0.0 || DS.MuzzleHideTime[1] > 0.0 || DS.MuzzleHideTime[2] > 0.0;
 		}
@@ -3249,14 +3690,23 @@ void UGenGameLogic::UpdateDrawables()
 		{
 			const FGenObject* O = FindObject(It.Key());
 			FString Want;
-			if (O && !O->IsDead() && !(IsShroudOn() && O->GetLocalShroud() > EGenObjectShroud::PartialClear))
+			// (What a script starts is heard whatever the fog is doing: SoundManager::canPlayNow only asks ST_SHROUDED sounds.)
+			if (O && !O->IsDead() && (O->MapAmbientScriptCount > 0 || !(IsShroudOn() && O->GetLocalShroud() > EGenObjectShroud::PartialClear)))
 			{
 				Want = GetAmbientSound(*O, Audio->GetTemplateSound(*O->GetTemplate(), TEXT("SoundAmbient")));
 			}
-			if (Want != It.Value())
+			FSoundOnlyObject& Sound = It.Value();
+			if (O && Sound.ScriptCount != O->MapAmbientScriptCount)
+			{
+				// Drawable::enableAmbientSoundFromScript: "Allow ENABLE_OBJECT_SOUND to trigger one-shot attached sound multiple times".
+				Sound.ScriptCount = O->MapAmbientScriptCount;
+				Audio->SetObjectLoop(It.Key(), 1, FString());
+				Sound.Playing.Reset();
+			}
+			if (Want != Sound.Playing)
 			{
 				Audio->SetObjectLoop(It.Key(), 1, Want);
-				It.Value() = Want;
+				Sound.Playing = Want;
 			}
 			if (!O)
 			{

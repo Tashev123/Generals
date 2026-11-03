@@ -114,6 +114,8 @@ public:
 
 	/** Null for unknown names and for "NoSound". */
 	const FGenAudioEventInfo* Find(const FString& Name) const;
+	/** A map's own version of an event, under a name of its own (DynamicAudioEventInfo). Stays for as long as the game runs: voices keep pointers to it. */
+	void AddCustomEvent(const FGenAudioEventInfo& Info);
 	/** The event behind a MiscAudio.ini entry ("MoneyDepositSound"), or an empty string. */
 	const FString& GetMisc(const TCHAR* Key) const;
 	const FGenEvaEvent* FindEva(const FString& Name) const;
@@ -138,6 +140,7 @@ private:
 	bool bInitialized = false;
 	FGenAudioSettings Settings;
 	TMap<FString, FGenAudioEventInfo> Events;   // key: lower-case name
+	TMap<FString, TUniquePtr<FGenAudioEventInfo>> CustomEvents; // key: lower-case name
 	TMap<FString, FString> Misc;                // key: lower-case field name
 	TMap<FString, FGenEvaEvent> Eva;
 };

@@ -120,6 +120,10 @@ void FGenObject::BeginStructureTopple(uint32 Frame, FGenObjectID Killer)
 		Angle = Rand.FRandRange(0.f, 2.f * PI);
 	}
 	StructureToppleDirection = FVector2f(FMath::Cos(Angle), FMath::Sin(Angle));
+	if (const FGenMapScripts* Scripts = Logic->GetMapScripts())
+	{
+		Scripts->GetToppleDirection(*this, StructureToppleDirection); // ScriptEngine::adjustToppleDirection
+	}
 	const float BurstRadius = (Template->GeometryMajorRadius + Template->GeometryMinorRadius) * 0.5f * 0.9f;
 	DelayBurstLocation = FVector3f(Position.X + BurstRadius * StructureToppleDirection.X, Position.Y + BurstRadius * StructureToppleDirection.Y, 0.f);
 	DelayBurstLocation.Z = Logic->GetGroundHeight(DelayBurstLocation.X, DelayBurstLocation.Y);

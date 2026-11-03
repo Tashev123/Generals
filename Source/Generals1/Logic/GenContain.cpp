@@ -383,6 +383,43 @@ int32 UGenGameLogic::KillGarrisoned(FGenObject& Building, int32 Count, const TAr
 	return Killed;
 }
 
+void UGenGameLogic::GetRidersAbleToFire(const FGenObject& Container, TArray<const FGenObject*>& Out) const
+{
+	if (!Container.GetContain() || !IsPassengerAllowedToFireFrom(Container))
+	{
+		return;
+	}
+	TArray<FGenObjectID> Who = GetRiders(Container);
+	if (Container.GetTemplate()->Contain.bOverlord && Container.Contain->Portable != GenInvalidObjectID)
+	{
+		Who.Add(Container.Contain->Portable);
+	}
+	for (FGenObjectID Id : Who)
+	{
+		const FGenObject* R = FindObject(Id);
+		const FGenObject* In = R ? FindObject(R->GetContainedBy()) : nullptr;
+		if (R && In && !R->IsDead() && !R->IsDisabled() && R->HasWeapons() && IsPassengerAllowedToFire(*In, *R))
+		{
+			Out.Add(R);
+		}
+	}
+}
+
+bool UGenGameLogic::CanRidersAttack(const FGenObject& Container, const FGenObject& Victim) const
+{
+	TArray<const FGenObject*> Riders;
+	GetRidersAbleToFire(Container, Riders);
+	for (const FGenObject* R : Riders)
+	{
+		const int32 Slot = R->ChooseWeapon(Victim);
+		if (Slot != INDEX_NONE && R->AttackDistance(Victim) <= R->GetAttackRange(*R->GetWeapon(Slot).Template))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
 void UGenGameLogic::OrderRidersToAttack(const FGenObject& Container, FGenObjectID Target, bool bForce)
 {
 	if (!IsPassengerAllowedToFireFrom(Container))
@@ -432,6 +469,7 @@ void UGenGameLogic::AddToContain(FGenObject& Container, FGenObject& Rider)
 	{
 		return;
 	}
+	Container.PlayerWhoEntered = Rider.GetOwner();
 	// OverlordContain::addToContain: with a bunker on it, whoever comes aboard goes into the bunker.
 	FGenObject& Real = const_cast<FGenObject&>(ResolveContainer(Container));
 	if (&Real != &Container)
@@ -614,6 +652,7 @@ void UGenGameLogic::RemoveFromContain(FGenObject& Container, FGenObject& Rider)
 	Rider.Velocity = FVector3f::ZeroVector;
 	Rider.SnapshotPrevious();
 	Rider.NextAutoAcquireFrame = 0; // (wakeUpAndAttemptToTarget: looks around as soon as it is out)
+	Rider.SafeOcclusionFrame = Frame + uint32(FGenGameData::Get().DefaultOcclusionDelay);
 
 	if (D.Type == EGenContainType::Transport)
 	{
@@ -1094,6 +1133,17 @@ void UGenGameLogic::OnContainerDied(FGenObject& Container)
 				R->Kill(); // (flame proof troops included)
 			}
 		}
+		// TransportContain::killRidersWhoAreNotFreeToExit: nobody gets out of a helicopter in the air (and what cannot walk stays too).
+		const bool bStuck = D.Type == EGenContainType::Transport && !R->IsDead()
+			&& ((Container.GetTemplate()->bChinookAI && Container.GetChinookFlight() != EGenChinookFlight::Landed
+				&& Container.GetChinookFlight() != EGenChinookFlight::CombatDrop) || !R->GetLocomotorTemplate());
+		if (bStuck)
+		{
+			UE_CLOG(IsTracing(), LogGenerals, Log, TEXT("  [contain f%u] #%u %s can't get out of the dying #%u"), Frame, Id, *R->GetTemplate()->Name, Container.GetID());
+			if (D.bDestroyRidersNotFreeToExit) { DestroyObject(Id); }
+			else { R->Kill(); }
+			continue;
+		}
 		if (!R->IsDead())
 		{
 			// OpenContain::scatterToNearbyPosition
@@ -1137,19 +1187,27 @@ void UGenGameLogic::ExecEnter(const FGenCommand& Cmd)
 	}
 }
 
-void UGenGameLogic::IssueExit(FGenObjectID Rider)
+void UGenGameLogic::IssueExit(FGenObjectID Rider, FGenObjectID Container)
 {
 	FGenCommand C(EGenCommandType::Exit);
 	C.Units = { Rider };
+	C.Target = Container;
 	SubmitCommand(MoveTemp(C));
 }
 
 void UGenGameLogic::ExecExit(const FGenCommand& Cmd)
 {
+	const FGenObject* From = FindObject(Cmd.Target);
 	for (FGenObjectID Id : Cmd.Units)
 	{
 		if (FGenObject* R = FindObject(Id))
 		{
+			// (TunnelContain: all the network's tunnels hold the same riders. The one the button was pressed at is the
+			// one they come out of, as with "evacuate" - not the one they went in by.)
+			if (From && From->GetTemplate()->Contain.Type == EGenContainType::Tunnel && From->GetOwner() == R->GetOwner() && R->IsContained() && !From->IsDead())
+			{
+				R->ContainedBy = ResolveContainer(*From).GetID();
+			}
 			R->CommandExit();
 		}
 	}
@@ -1383,6 +1441,11 @@ void FGenObject::UpdateChinookFlight(uint32 Frame)
 	{
 		bWaiting = false; // on its way to a combat drop it lands for nobody
 	}
+	if (ChinookEvacStep == 1 && !bMoving)
+	{
+		ChinookEvacStep = 2; // there: LAND_AND_EVAC
+	}
+	bWaiting |= ChinookEvacStep == 2;
 	if (ChinookHealAirfield != GenInvalidObjectID)
 	{
 		// Sent for repairs: down once there (MOVE_TO_AND_LAND), mended by the airfield while on the ground, and
@@ -1403,7 +1466,13 @@ void FGenObject::UpdateChinookFlight(uint32 Frame)
 	switch (ChinookFlight)
 	{
 	case EGenChinookFlight::Flying:
-		if (bIdle && bWaiting)
+		if (bChinookPendingMove)
+		{
+			// ChinookAIUpdate::update: "reconstitute" what it was told while it couldn't.
+			bChinookPendingMove = false;
+			CommandMoveTo(ChinookPendingGoal);
+		}
+		else if (bIdle && bWaiting)
 		{
 			ChinookFlight = EGenChinookFlight::Landing;
 			SetBoxes(0); // (ChinookTakeoffOrLandingState: the supplies it carries are lost)
@@ -1411,16 +1480,52 @@ void FGenObject::UpdateChinookFlight(uint32 Frame)
 		}
 		break;
 	case EGenChinookFlight::Landing:
-		if (!bIdle || !bWaiting) { ChinookFlight = EGenChinookFlight::TakingOff; }
+		// (A landing, once begun, is finished: an order waits for it.)
+		if (!bChinookPendingMove && (!bIdle || !bWaiting)) { ChinookFlight = EGenChinookFlight::TakingOff; }
 		else if (Position.Z - Ground <= ChinookLandedHeight) { ChinookFlight = EGenChinookFlight::Landed; }
 		break;
 	case EGenChinookFlight::Landed:
-		if (!bIdle || !bWaiting) { ChinookFlight = EGenChinookFlight::TakingOff; }
+		if (bChinookPendingMove || !bIdle || !bWaiting) { ChinookFlight = EGenChinookFlight::TakingOff; }
 		break;
 	default: // TakingOff
-		if (bIdle && bWaiting) { ChinookFlight = EGenChinookFlight::Landing; }
+		if (!bChinookPendingMove && bIdle && bWaiting) { ChinookFlight = EGenChinookFlight::Landing; }
 		else if (!Locomotor || Position.Z - Ground >= Locomotor->PreferredHeight - ChinookLandedHeight) { ChinookFlight = EGenChinookFlight::Flying; }
 		break;
+	}
+	if (ChinookEvacStep == 2 && ChinookFlight == EGenChinookFlight::Landed)
+	{
+		// ChinookEvacuateState::onEnter: removeAllContained - all of them, at once.
+		const TArray<FGenObjectID> Riders = Logic->GetRiders(*this);
+		for (FGenObjectID Id : Riders)
+		{
+			if (FGenObject* R = Logic->FindObject(Id))
+			{
+				Contain->ExitNotBusyFrame = 0;
+				Logic->ExitViaDoor(*this, *R);
+			}
+		}
+		ChinookEvacStep = bChinookEvacAndExit ? 3 : 0;
+	}
+	else if (ChinookEvacStep == 3 && ChinookFlight == EGenChinookFlight::Flying)
+	{
+		ChinookEvacStep = 4;
+		CommandMoveTo(ChinookEvacOrigin); // ChinookHeadOffMapState: "I'm outta here"
+	}
+	else if (ChinookEvacStep == 4)
+	{
+		// ... gone once it is off the map. (The game leaves one that got home inside the map's border hanging there,
+		// where nobody can see it; it may as well go.)
+		FVector2f Lo, Hi, PlayLo, PlayHi;
+		Logic->GetMapExtent(Lo, Hi, true);
+		Logic->GetMapExtent(PlayLo, PlayHi, false);
+		const FVector2f At(Position.X, Position.Y);
+		const bool bOffAll = At.X < Lo.X || At.Y < Lo.Y || At.X > Hi.X || At.Y > Hi.Y;
+		const bool bOffPlay = At.X < PlayLo.X || At.Y < PlayLo.Y || At.X > PlayHi.X || At.Y > PlayHi.Y;
+		if (bOffAll || (!bMoving && bOffPlay))
+		{
+			bPendingDestroy = true;
+			return;
+		}
 	}
 	const bool bDown = ChinookFlight == EGenChinookFlight::Landing || ChinookFlight == EGenChinookFlight::Landed;
 	bLocoPreciseZ = bDown;
@@ -1430,6 +1535,25 @@ void FGenObject::UpdateChinookFlight(uint32 Frame)
 	{
 		UpdateCombatDropApproach(Frame);
 	}
+}
+
+void FGenObject::CommandMoveAndEvacuate(const FVector3f& Destination, bool bThenLeave)
+{
+	if (bDead || !CanMove())
+	{
+		return;
+	}
+	if (Template->bChinookAI && Contain)
+	{
+		ChinookEvacStep = 1;
+		bChinookEvacAndExit = bThenLeave;
+		ChinookEvacOrigin = Position;
+	}
+	else
+	{
+		bEvacuateOnArrival = Contain.IsValid();
+	}
+	CommandMoveTo(Destination);
 }
 
 void FGenObject::SetChinookHealAirfield(FGenObjectID Airfield)

@@ -84,6 +84,16 @@ void AGenPlayerController::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	Super::EndPlay(EndPlayReason);
 }
 
+void AGenPlayerController::EnterSceneInput()
+{
+	bLeftDown = bBoxSelecting = bRightDown = bRightScrolling = bMiddleDragging = false;
+	MousedOver = GenInvalidObjectID;
+	ScrollScreen = FVector2D::ZeroVector;
+	Selection.Reset();
+	EndTargeting();
+	CurrentMouseCursor = EMouseCursor::None;
+}
+
 AGenCameraPawn* AGenPlayerController::GetCameraPawn() const
 {
 	return Cast<AGenCameraPawn>(GetPawn());
@@ -128,11 +138,18 @@ void AGenPlayerController::PlayerTick(float DeltaTime)
 	const bool bPlaying = IsPlayingWithMouse();
 	UpdateMouseConfine(bPlaying);
 	UpdatePointerSpeed(bPlaying);
-	if (!bGenInputEnabled)
+	// (A saved game being played up to where it was left: the loading screen is all there is.)
+	const AGenGameMode* ResumeGM = GetWorld()->GetAuthGameMode<AGenGameMode>();
+	const bool bResumingSave = ResumeGM && ResumeGM->IsResumingSave();
+	if (!bGenInputEnabled || bScriptInputOff || bResumingSave)
 	{
 		if (bTestCursor)
 		{
 			UpdateCursor(float(TestCursorPos.X), float(TestCursorPos.Y), true); // (its animation goes on)
+		}
+		else if (bScriptInputOff || bResumingSave)
+		{
+			EnterSceneInput(); // ScriptActions::doDisableInput: "TheMouse->setVisibility(false)"
 		}
 		UpdateRadiusDecals();
 		return;
@@ -162,6 +179,13 @@ void AGenPlayerController::PlayerTick(float DeltaTime)
 		MousedOver = GenInvalidObjectID;
 		ScrollScreen = FVector2D::ZeroVector;
 		UpdateCursor(MX, MY, bHasMouse);
+		UpdateRadiusDecals();
+		return;
+	}
+	// (A scene that hasn't turned the input off - the black bars are up all the same: nothing in it is to be clicked on.)
+	if (GenHUD && GenHUD->IsLetterboxed())
+	{
+		EnterSceneInput();
 		UpdateRadiusDecals();
 		return;
 	}
@@ -448,18 +472,49 @@ void AGenPlayerController::ExecuteBarButton(const FGenBarButton& Button)
 	case EGenCommand::Stop:
 		Logic->IssueStop(Selection);
 		break;
+	case EGenCommand::SelectAllUnitsOfType:
+		// ControlBar::processCommandUI, GUI_COMMAND_SELECT_ALL_UNITS_OF_TYPE: what was selected goes, all of ours of that type come.
+		if (const FGenThingTemplate* Thing = Button.Button ? FGenGameData::Get().FindTemplate(Button.Button->Object) : nullptr)
+		{
+			TArray<FGenObjectID> All;
+			for (const FGenObject* O : Logic->GetObjectsOf(Logic->GetLocalPlayer()))
+			{
+				if (!O->IsDestroyed() && O->IsSelectable() && O->GetTemplate()->Canonical() == Thing->Canonical())
+				{
+					All.Add(O->GetID());
+				}
+			}
+			SetSelection(All);
+		}
+		break;
 	case EGenCommand::PlayerUpgrade:
 	case EGenCommand::ObjectUpgrade:
 		if (Button.Upgrade)
 		{
-			Logic->IssueQueueUpgrade(Button.Source, Button.Upgrade->Name);
+			if (Button.Upgrade->bObjectUpgrade && Selection.Contains(Button.Source))
+			{
+				// Beyond the original (the user, 2026-11-02): what a unit buys for itself - a drone - goes for everybody
+				// selected that can have it, for as long as the money lasts (each order finds out when it is carried out).
+				for (FGenObjectID Id : Selection)
+				{
+					const FGenObject* Unit = Logic->FindObject(Id);
+					if (Unit && FGenControlBar::CanBuyForItself(Logic, *Unit, *Button.Button, *Button.Upgrade))
+					{
+						Logic->IssueQueueUpgrade(Id, Button.Upgrade->Name);
+					}
+				}
+			}
+			else
+			{
+				Logic->IssueQueueUpgrade(Button.Source, Button.Upgrade->Name);
+			}
 		}
 		break;
 	case EGenCommand::PurchaseScience:
 		Logic->IssuePurchaseScience(Logic->GetLocalPlayer(), Button.Science);
 		break;
 	case EGenCommand::ExitContainer:
-		Logic->IssueExit(Button.Rider);
+		Logic->IssueExit(Button.Rider, Button.Source);
 		break;
 	case EGenCommand::AttackMove:
 	case EGenCommand::Guard:
@@ -1412,7 +1467,7 @@ bool AGenPlayerController::IsPlayingWithMouse() const
 	const AGenGameMode* GM = GetWorld() ? GetWorld()->GetAuthGameMode<AGenGameMode>() : nullptr;
 	const AGenHUD* GenHUD = Cast<AGenHUD>(GetHUD());
 	const UGenGameLogic* Logic = UGenGameLogic::Get(this);
-	return bGenInputEnabled && GM && !GM->IsShellActive() && !(GenHUD && GenHUD->IsOptionsOpen()) && Logic && Logic->IsRunning();
+	return bGenInputEnabled && !bScriptInputOff && GM && !GM->IsShellActive() && !(GenHUD && GenHUD->IsOptionsOpen()) && Logic && Logic->IsRunning();
 }
 
 void AGenPlayerController::UpdateMouseConfine(bool bPlaying)
@@ -1708,6 +1763,12 @@ void AGenPlayerController::UpdateSelectionInput(float MX, float MY, bool bHasMou
 	{
 		BeginOrderTargeting(FGenCommandData::Get().FindButton(TEXT("Command_Guard")));
 	}
+	// X (SCATTER): everybody away from the middle of the selection.
+	if (bHasMovers && Input.JustPressed(this, EGenAction::Scatter))
+	{
+		Logic->IssueScatter(Selection);
+		PlayMoveVoice(Selection);
+	}
 	// Ctrl+F (CREATE_FORMATION): the selected units keep their places relative to one another when they
 	// move, at the pace of the slowest - or, if they are a formation already, no longer.
 	if (bHasMovers && Input.JustPressed(this, EGenAction::Formation))
@@ -1767,11 +1828,12 @@ void AGenPlayerController::MaintainSelection(UGenGameLogic* Logic)
 			}
 		}
 	}
-	// Drop objects that died, no longer exist, or have gone back into the fog of war.
+	// Drop objects that died, no longer exist, or have gone back into the fog of war. (Not one's own, wherever they
+	// are: a gunship sent for comes in from beyond the edge of what has been explored.)
 	Selection.RemoveAll([Logic](FGenObjectID Id)
 	{
 		const FGenObject* O = Logic->FindObject(Id);
-		return O == nullptr || !O->IsSelectable() || !Logic->IsVisibleToLocalPlayer(*O);
+		return O == nullptr || !O->IsSelectable() || (O->GetOwner() != Logic->GetLocalPlayer() && !Logic->IsVisibleToLocalPlayer(*O));
 	});
 }
 
@@ -1792,7 +1854,7 @@ void AGenPlayerController::ExecuteClick(const FClickEval& Eval, bool bShift)
 	case EClickAction::Enter:
 	{
 		Logic->IssueEnter(Eval.Units, Eval.Hit);
-		const EGenRelationship Relation = Logic->GetRelationship(Logic->GetLocalPlayer(), HitObj->GetOwner());
+		const EGenRelationship Relation = Logic->GetRelationship(Logic->GetLocalPlayer(), *HitObj);
 		const TCHAR* Voice = TEXT("VoiceEnter");
 		if (HitObj->IsKindOf(TEXT("HEAL_PAD")))
 		{
@@ -1893,6 +1955,11 @@ void AGenPlayerController::ExecuteClick(const FClickEval& Eval, bool bShift)
 	case EClickAction::Move:
 		Logic->IssueMove(Eval.Units, Eval.Pos);
 		PlayMoveVoice(Eval.Units);
+		break;
+	case EClickAction::CaptureBuilding:
+		// The building goes to us: the soldier walks up to it and puts the flag up. It is the ability itself,
+		// from its own module, so what it says on the way (its InitiateSound) comes from there.
+		Logic->IssueCapture(Eval.Units, Eval.Hit);
 		break;
 	case EClickAction::Salvage:
 		// MSG_DO_SALVAGE "is intentionally set up to mimic the moveto": to where the crate lies.
@@ -2043,6 +2110,15 @@ void AGenPlayerController::BoxSelect(const FVector2D& A, const FVector2D& B, boo
 	{
 		Selection.Reset();
 	}
+	// Beyond the original (the user, 2026-11-02): an army is what is wanted out of a clump, not the dozer, the worker,
+	// the radar van that happen to stand in it - the ones the select-all key passes over. They are taken when the box
+	// has nothing else in it (or a click takes them on their own).
+	auto IsFighter = [](const FGenObject& O)
+	{
+		return !O.IsKindOf(TEXT("DOZER")) && !O.IsKindOf(TEXT("HARVESTER")) && !O.IsKindOf(TEXT("IGNORES_SELECT_ALL"));
+	};
+	TArray<FGenObjectID> InBox;
+	bool bAnyFighter = false;
 	for (FGenObjectID Id : Logic->GetObjectIDs())
 	{
 		const FGenObject* O = Logic->FindObject(Id);
@@ -2055,11 +2131,16 @@ void AGenPlayerController::BoxSelect(const FVector2D& A, const FVector2D& B, boo
 		FVector2D S;
 		if (ProjectWorldLocationToScreen(GenCoords::ToUE(P.X, P.Y, P.Z), S) && Box.IsInside(S))
 		{
-			if (!Selection.Contains(Id))
-			{
-				Selection.Add(Id);
-				Logic->FlashSelected(Id); // Drawable::onSelected
-			}
+			InBox.Add(Id);
+			bAnyFighter = bAnyFighter || IsFighter(*O);
+		}
+	}
+	for (FGenObjectID Id : InBox)
+	{
+		if ((!bAnyFighter || IsFighter(*Logic->FindObject(Id))) && !Selection.Contains(Id))
+		{
+			Selection.Add(Id);
+			Logic->FlashSelected(Id); // Drawable::onSelected
 		}
 	}
 	PlayVoice({ TEXT("VoiceSelect") }, Selection);
@@ -2112,7 +2193,18 @@ void AGenPlayerController::EvaluateClick(FGenObjectID Hit, float MX, float MY, F
 	Out.bCanCommand = Selection.ContainsByPredicate([Logic, Local](FGenObjectID Id)
 	{
 		const FGenObject* O = Logic->FindObject(Id);
-		return O && Logic->CanPlayerCommand(Local, *O) && !O->GetTemplate()->bForbidPlayerCommands && (O->CanMove() || O->HasWeapons() || O->GetSpawns().Num() > 0);
+		if (!O || !Logic->CanPlayerCommand(Local, *O) || O->GetTemplate()->bForbidPlayerCommands)
+		{
+			return false;
+		}
+		if (O->CanMove() || O->HasWeapons() || O->GetSpawns().Num() > 0)
+		{
+			return true;
+		}
+		// (A building with soldiers at its windows: its "weapons" are theirs.)
+		TArray<const FGenObject*> Riders;
+		Logic->GetRidersAbleToFire(*O, Riders);
+		return Riders.Num() > 0;
 	});
 	// Ctrl (MSG_META_BEGIN_FORCEATTACK): with something of ours to command, a click is a force attack - on the
 	// thing under the cursor, whoever's it is, or else on the ground there (CommandTranslator::evaluateForceAttack;
@@ -2246,6 +2338,19 @@ void AGenPlayerController::EvaluateClick(FGenObjectID Hit, float MX, float MY, F
 			if (O && Logic->CanPlayerCommand(Local, *O) && Logic->CanEnterObject(*O, *HitObj, true)) { Enterers.Add(Id); }
 		}
 	}
+	// Units of ours that have the capture ability, and have it ready, take the building clicked when it is one
+	// they may capture (ActionManager::canCaptureBuilding). A soldier who has the ability only because it has
+	// earned its rank is one of these; the click goes straight to the power, with no need to pick the button
+	// first (CommandXlat's ACTIONTYPE_CAPTURE_BUILDING branch), and the cursor says so beforehand.
+	TArray<FGenObjectID> Capturers;
+	if (HitObj)
+	{
+		for (FGenObjectID Id : Selection)
+		{
+			const FGenObject* O = Logic->FindObject(Id);
+			if (O && Logic->CanPlayerCommand(Local, *O) && Logic->CanCaptureBuilding(*O, *HitObj, true)) { Capturers.Add(Id); }
+		}
+	}
 	if (Gatherers.Num() > 0)
 	{
 		Out.Action = EClickAction::Dock;
@@ -2294,6 +2399,7 @@ void AGenPlayerController::EvaluateClick(FGenObjectID Hit, float MX, float MY, F
 	{
 		TArray<FGenObjectID> Movers, Shooters;
 		bool bSalvager = false;
+		bool bOnlyGarrisons = true;
 		for (FGenObjectID Id : Selection)
 		{
 			const FGenObject* O = Logic->FindObject(Id);
@@ -2301,16 +2407,32 @@ void AGenPlayerController::EvaluateClick(FGenObjectID Hit, float MX, float MY, F
 			{
 				if (O->CanMove()) { Movers.Add(Id); }
 				bSalvager |= O->IsKindOf(TEXT("SALVAGER"));
+				bOnlyGarrisons &= !O->CanMove() && !O->HasWeapons() && O->GetSpawns().Num() == 0;
 				// ("For the case of dozers, we don't ever want to see an attack cursor unless it's valid on a mine":
 				// only what has a weapon for the thing clicked attacks it.)
-				if ((O->HasWeapons() && (!HitObj || O->HasWeaponFor(*HitObj))) || (HitObj && O->SpawnsCanAttack(*HitObj))) { Shooters.Add(Id); }
+				if ((O->HasWeapons() && (!HitObj || O->HasWeaponFor(*HitObj))) || (HitObj && O->SpawnsCanAttack(*HitObj))
+					|| (HitObj && Logic->CanRidersAttack(*O, *HitObj)))
+				{
+					Shooters.Add(Id);
+				}
 			}
 		}
 		// On an enemy: attack it. Anywhere else: go there.
-		if (Shooters.Num() > 0 && HitObj && HitObj->IsAttackable() && Logic->GetRelationship(Local, HitObj->GetOwner()) == EGenRelationship::Enemies)
+		// (WeaponSet::getAbleToAttackSpecificObject: or, from a player, what has the map's targetable flag and isn't allied.)
+		const EGenRelationship HitRelation = HitObj ? Logic->GetRelationship(Local, *HitObj) : EGenRelationship::Neutral;
+		if (Shooters.Num() > 0 && HitObj && HitObj->IsAttackable()
+			&& (HitRelation == EGenRelationship::Enemies || (HitObj->IsScriptTargetable() && HitRelation != EGenRelationship::Allies)))
 		{
 			Out.Action = EClickAction::Attack;
 			Out.Units = MoveTemp(Shooters);
+		}
+		// With a shot that is what the click does. Otherwise a building that may be captured is taken, before the
+		// walk-to-it fallback (CommandXlat: attack, then ACTIONTYPE_CAPTURE_BUILDING, then moveto).
+		else if (Capturers.Num() > 0)
+		{
+			Out.Action = EClickAction::CaptureBuilding;
+			Out.Units = MoveTemp(Capturers);
+			Out.Pos = HitObj->GetPosition();
 		}
 		else if (HitObj && HitObj->GetTemplate()->Crate.Type == EGenCrate::Salvage && bSalvager && !IsForceAttackMode() && Movers.Num() > 0)
 		{
@@ -2323,6 +2445,11 @@ void AGenPlayerController::EvaluateClick(FGenObjectID Hit, float MX, float MY, F
 		{
 			Out.Action = EClickAction::Move;
 			Out.Units = MoveTemp(Movers);
+		}
+		else if (bOnlyGarrisons)
+		{
+			// (A building can't go anywhere: anything that isn't a target for its soldiers is a click like any other.)
+			Out.Action = HitObj && HitObj->IsSelectable() ? EClickAction::SelectOther : EClickAction::Deselect;
 		}
 	}
 	else
@@ -2361,6 +2488,7 @@ FString AGenPlayerController::CursorForClick(FGenObjectID Hit, float MX, float M
 	case EClickAction::AddWaypoint: return TEXT("Waypoint");
 	case EClickAction::Move: return TEXT("Move");
 	case EClickAction::Salvage: return TEXT("Move"); // MSG_DO_SALVAGE_HINT
+	case EClickAction::CaptureBuilding: return TEXT("CaptureBuilding"); // MSG_CAPTUREBUILDING_HINT: the flag
 	case EClickAction::Nothing: return Eval.bCanCommand ? TEXT("GenericInvalid") : TEXT("Arrow");
 	default: return TEXT("Arrow"); // nothing of ours to command: somebody else's thing, or the ground
 	}
@@ -2380,6 +2508,26 @@ AGenPlayerController::EForceAttack AGenPlayerController::CanForceAttack(const FG
 {
 	// canObjectForceAttack: Object::isAbleToAttack, then WeaponSet::getAbleToAttackSpecificObject(ATTACK_NEW_TARGET_FORCED)
 	// on a thing, or getAbleToUseWeaponAgainstTarget on a spot.
+	if (!U.IsDead() && !U.HasWeapons() && !U.IsUnderConstruction())
+	{
+		// (An occupied container: "if just one of them can attack".)
+		if (const UGenGameLogic* Logic = UGenGameLogic::Get(this))
+		{
+			TArray<const FGenObject*> Riders;
+			Logic->GetRidersAbleToFire(U, Riders);
+			EForceAttack Best = EForceAttack::NotPossible;
+			for (const FGenObject* R : Riders)
+			{
+				const EForceAttack Result = CanForceAttack(*R, Victim, Pos);
+				if (Result == EForceAttack::Possible)
+				{
+					return Result;
+				}
+				Best = Result == EForceAttack::InvalidShot ? Result : Best;
+			}
+			return Best;
+		}
+	}
 	if (U.IsDead() || !U.HasWeapons() || U.IsDisabled() || U.IsUnderConstruction())
 	{
 		return EForceAttack::NotPossible;
@@ -2786,6 +2934,13 @@ FString AGenPlayerController::TestSelectionKey(const FString& What, int32 Group)
 	else if (What.Equals(TEXT("match"), ESearchCase::IgnoreCase)) { Result = SelectMatching(false); }
 	else if (What.Equals(TEXT("matchmap"), ESearchCase::IgnoreCase)) { Result = SelectMatching(true); }
 	else if (What.Equals(TEXT("all"), ESearchCase::IgnoreCase)) { Result = SelectAllUnits(false); }
+	else if (What.Equals(TEXT("scatter"), ESearchCase::IgnoreCase) && Logic) { Logic->IssueScatter(Selection); }
+	else if (What.Equals(TEXT("screenbox"), ESearchCase::IgnoreCase))
+	{
+		int32 ViewX = 0, ViewY = 0;
+		GetViewportSize(ViewX, ViewY);
+		BoxSelect(FVector2D(0.0, 0.0), FVector2D(ViewX, ViewY), false);
+	}
 	else if (What.Equals(TEXT("aircraft"), ESearchCase::IgnoreCase)) { Result = SelectAllUnits(true); }
 	else if (What.Equals(TEXT("double"), ESearchCase::IgnoreCase) && Selection.Num() > 0)
 	{

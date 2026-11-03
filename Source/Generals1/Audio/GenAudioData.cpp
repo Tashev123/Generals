@@ -350,7 +350,23 @@ const FGenAudioEventInfo* FGenAudioData::Find(const FString& Name) const
 	{
 		return nullptr;
 	}
-	return Events.Find(Name.ToLower());
+	const FString Key = Name.ToLower();
+	if (Key[0] == TEXT(' '))
+	{
+		const TUniquePtr<FGenAudioEventInfo>* Custom = CustomEvents.Find(Key);
+		return Custom ? Custom->Get() : nullptr;
+	}
+	return Events.Find(Key);
+}
+
+void FGenAudioData::AddCustomEvent(const FGenAudioEventInfo& Info)
+{
+	TUniquePtr<FGenAudioEventInfo>& Custom = CustomEvents.FindOrAdd(Info.Name.ToLower());
+	if (!Custom)
+	{
+		Custom = MakeUnique<FGenAudioEventInfo>();
+	}
+	*Custom = Info;
 }
 
 const FString& FGenAudioData::GetMisc(const TCHAR* Key) const

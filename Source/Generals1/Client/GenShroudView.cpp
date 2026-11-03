@@ -57,6 +57,7 @@ void UGenGameLogic::InitShroudView()
 	const uint8 Border = FGenGameData::Get().ShroudAlpha;
 	ShroudCurrent.Init(Border, W * H);   // the map fades in from black
 	ShroudFinal.Init(Border, W * H);
+	ShroudBorderLevel = ShroudBorderApplied = Border;
 	ShroudViewSerial = 0;
 
 	ShroudTexture = UTexture2D::CreateTransient(W, H, PF_B8G8R8A8, TEXT("GenShroud"));
@@ -98,11 +99,70 @@ void UGenGameLogic::InitShroudView()
 	const FLinearColor Offset(float((1.0 - Loc.X / CellCm) / W), float((1.0 + Loc.Y / CellCm) / H), 0.f, 0.f);
 	ShroudMaterial->SetVectorParameterValue(TEXT("ShroudScale"), Scale);
 	ShroudMaterial->SetVectorParameterValue(TEXT("ShroudOffset"), Offset);
+	ShroudMaterial->SetScalarParameterValue(TEXT("SkyDistance"), MapActor->GetSkyBoxDistance());
 	PostProcess->AddOrUpdateBlendable(ShroudMaterial, 1.f);
+}
+
+void UGenGameLogic::InitBehindBuildings()
+{
+	// RTS3DScene's occluded objects: what is of interest and stands behind a building shows there in its owner's colour.
+	bBehindBuildingsOn = false;
+	UPostProcessComponent* PostProcess = MapActor ? MapActor->GetPostProcess() : nullptr;
+	UMaterialInterface* Base = LoadObject<UMaterialInterface>(nullptr, TEXT("/Game/Generals/Materials/M_Occluded.M_Occluded"));
+	if (!Base || !PostProcess || !FGenGameData::Get().bUseBehindBuildingMarker)
+	{
+		UE_CLOG(!Base, LogGenerals, Warning, TEXT("Behind buildings: material M_Occluded not found (run Tools/ue_setup.py)"));
+		return;
+	}
+	UMaterialInstanceDynamic* MID = UMaterialInstanceDynamic::Create(Base, this);
+	const float Scale = FGenGameData::Get().OccludedColorLuminanceScale;
+	for (int32 p = 0; p < Players.Num() && p < 9; ++p)
+	{
+		MID->SetVectorParameterValue(*FString::Printf(TEXT("Player%d"), p + 1), Players[p].Color * Scale);
+	}
+	PostProcess->AddOrUpdateBlendable(MID, 1.f);
+	OccludedMaterial = MID;
+	bBehindBuildingsOn = true;
+}
+
+void UGenGameLogic::UpdateOccludedMark(const FGenObject& O, FDrawState& DS, bool bHidden, UGenModelComponent* Model)
+{
+	if (!bBehindBuildingsOn || !O.CanMove() || Model == nullptr)
+	{
+		return;
+	}
+	// (draw->isKindOf( KINDOF_SCORE ) and the like: what counts in the game; getSafeOcclusionFrame.)
+	const FGenThingTemplate* T = O.GetTemplate();
+	const bool bKind = T->IsKindOf(TEXT("SCORE")) || T->IsKindOf(TEXT("SCORE_CREATE")) || T->IsKindOf(TEXT("SCORE_DESTROY")) || T->IsKindOf(TEXT("MP_COUNT_FOR_VICTORY"));
+	const bool bScriptsAllow = !MapScripts || MapScripts->ShowsBehindBuildingMarkers(); // OPTIONS_SET_OCCLUSION_MODE
+	const int32 Mark = (bScriptsAllow && bKind && !bHidden && !O.IsDead() && !O.IsContained() && O.GetSafeOcclusionFrame() <= Frame && !O.IsStealthedAndUndetected()
+		&& Players.IsValidIndex(O.GetOwner()) && IsBehindStructure(O, BehindCameraPos)) ? FMath::Min(O.GetOwner() + 1, 9) : 0;
+	if (Mark != DS.OccludedMark)
+	{
+		DS.OccludedMark = Mark;
+		Model->SetOccludedMark(Mark);
+		for (const FExtraDraw& E : DS.Extras)
+		{
+			if (UGenModelComponent* Extra = E.Model.Get()) { Extra->SetOccludedMark(Mark); }
+		}
+	}
+}
+
+void UGenGameLogic::SetBorderShroud(bool bDark)
+{
+	const FGenGameData& GD = FGenGameData::Get();
+	ShroudBorderLevel = bDark ? GD.ShroudAlpha : GD.ClearAlpha;
 }
 
 void UGenGameLogic::UpdateShroudView(float DeltaSeconds)
 {
+	if (bBehindBuildingsOn)
+	{
+		if (const APlayerController* PC = GetWorld()->GetFirstPlayerController(); PC && PC->PlayerCameraManager)
+		{
+			BehindCameraPos = FVector3f(GenCoords::FromUE(PC->PlayerCameraManager->GetCameraLocation()));
+		}
+	}
 	GEN_PERF_SCOPE("R.ShroudView");
 	if (!ShroudTexture || ShroudFinal.Num() == 0)
 	{
@@ -123,6 +183,20 @@ void UGenGameLogic::UpdateShroudView(float DeltaSeconds)
 			{
 				Row[X] = ShroudLevel(Shroud.GetStatus(LocalPlayer, X, Y));
 			}
+		}
+	}
+
+	// W3DShroud::setBorderShroudLevel: the ring of texels round the cells is all there is beyond them.
+	if (ShroudBorderApplied != ShroudBorderLevel)
+	{
+		ShroudBorderApplied = ShroudBorderLevel;
+		for (int32 X = 0; X < W; ++X)
+		{
+			ShroudFinal[X] = ShroudFinal[(H - 1) * W + X] = ShroudBorderLevel;
+		}
+		for (int32 Y = 0; Y < H; ++Y)
+		{
+			ShroudFinal[Y * W] = ShroudFinal[Y * W + W - 1] = ShroudBorderLevel;
 		}
 	}
 

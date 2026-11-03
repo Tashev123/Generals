@@ -286,3 +286,34 @@ UTexture2D* GenTextureLoader::LoadGameTexture(const FString& TextureName, bool b
 	}
 	return nullptr;
 }
+
+const FGenImage* GenTextureLoader::LoadGameImage(const FString& TextureName)
+{
+	static TMap<FString, TUniquePtr<FGenImage>> Images;
+	const FString Base = FPaths::GetBaseFilename(TextureName);
+	const FString Key = Base.ToLower();
+	if (const TUniquePtr<FGenImage>* Found = Images.Find(Key))
+	{
+		return Found->Get();
+	}
+	TUniquePtr<FGenImage> Image;
+	FGenFileSystem& FS = FGenFileSystem::Get();
+	TArray<uint8> Bytes;
+	for (const TCHAR* Dir : { TEXT("Data\\English\\Art\\Textures\\"), TEXT("Art\\Textures\\"), TEXT("Art\\Terrain\\") })
+	{
+		if (FS.ReadFile(FString(Dir) + Base + TEXT(".dds"), Bytes))
+		{
+			break;
+		}
+		if (FS.ReadFile(FString(Dir) + Base + TEXT(".tga"), Bytes))
+		{
+			Image = MakeUnique<FGenImage>();
+			if (!DecodeTGA(Bytes, *Image))
+			{
+				Image.Reset();
+			}
+			break;
+		}
+	}
+	return Images.Add(Key, MoveTemp(Image)).Get();
+}

@@ -52,6 +52,10 @@ bool FGenObject::AllowedToStealth(uint32 Frame)
 	// StealthUpdate::allowedToStealth
 	const FGenStealthData& S = Template->Stealth;
 	const uint32 Flags = S.Forbidden;
+	if (bScriptUnstealthed)
+	{
+		return false;
+	}
 
 	// "With regards to slaves that stealth with us, we need to all be stealthed or not at all. If any of the
 	// slaves can't stealth, then reveal everyone!" A stinger site has no weapon of its own - the soldiers it
@@ -134,6 +138,17 @@ void FGenObject::UpdateStealth(uint32 Frame)
 	{
 		return;
 	}
+	if (Template->Stealth.RevealDistanceFromTarget > 0.f && TargetID != GenInvalidObjectID)
+	{
+		// "We're close enough to reveal ourselves"
+		const FGenObject* Target = Logic->FindObject(TargetID);
+		const float Reveal = Template->Stealth.RevealDistanceFromTarget;
+		if (Target && FVector2f::DistSquared(FVector2f(Position.X, Position.Y), FVector2f(Target->Position.X, Target->Position.Y)) <= Reveal * Reveal)
+		{
+			UE_CLOG(Logic->IsTracing() && (NextDisguise || (DisguiseTemplate && DisguiseFramesLeft <= 0)), LogGenerals, Log, TEXT("  [stealth f%u] #%u %s is close to #%u: shows itself"), Frame, ID, *Template->Name, TargetID);
+			MarkAsDetected(0);
+		}
+	}
 	if (AllowedToStealth(Frame))
 	{
 		if (StealthAllowedFrame > Frame)
@@ -185,7 +200,7 @@ void FGenObject::DisguiseAs(const FGenObject* Target)
 		UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [stealth f%u] #%u p%d %s disguises itself as p%d's %s"), Logic->GetFrame(), ID, Owner, *Template->Name,
 			NextDisguisePlayer, *NextDisguise->Name);
 	}
-	else if (DisguiseTemplate || NextDisguise)
+	else if (NextDisguise || (DisguiseTemplate && DisguiseFramesLeft <= 0)) // (not again while it is already fading back)
 	{
 		NextDisguise = nullptr;
 		NextDisguisePlayer = INDEX_NONE;
@@ -435,6 +450,16 @@ bool UGenGameLogic::DetectStealth(FGenObject& Detector, float Range, uint32 Rate
 				}
 			}
 			Them.MarkAsDetected(Rate + 1);
+			if (!Them.IsKindOf(TEXT("MINE")))
+			{
+				Them.HeatVisionFrame = Frame; // ("theirDraw->setSecondMaterialPassOpacity( 1.0f )")
+			}
+			// "gridPosition.x -= ((Int)gridPosition.x)%12": a lit square of the grid where it was found.
+			if (!Detector.GetTemplate()->Detector.IRGridParticleSys.IsEmpty())
+			{
+				const FVector3f Grid(Them.Position.X - float(int32(Them.Position.X) % 12), Them.Position.Y - float(int32(Them.Position.Y) % 12), Detector.Position.Z + 17.f);
+				PlayParticleSystemAt(Detector.GetTemplate()->Detector.IRGridParticleSys, Grid);
+			}
 		}
 		else if (Them.Contain && Them.Template->Contain.Type == EGenContainType::Garrison)
 		{

@@ -18,6 +18,7 @@ namespace
 		W3D_VERTEX_MATERIAL_NAME = 0x02C,
 		W3D_VERTEX_MATERIAL_INFO = 0x02D,
 		W3D_VERTEX_MAPPER_ARGS0 = 0x02E,
+		W3D_VERTEX_MAPPER_ARGS1 = 0x02F,
 		W3D_TEXTURES = 0x030,
 		W3D_TEXTURE = 0x031,
 		W3D_TEXTURE_NAME = 0x032,
@@ -130,6 +131,7 @@ namespace
 				Out.Translucency = R.F32(S.Start + 28);
 				break;
 			case W3D_VERTEX_MAPPER_ARGS0: Out.MapperArgs0 = R.Str(S.Start, S.End - S.Start); break;
+			case W3D_VERTEX_MAPPER_ARGS1: Out.MapperArgs1 = R.Str(S.Start, S.End - S.Start); break;
 			default: break;
 			}
 		}

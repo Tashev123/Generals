@@ -13,6 +13,7 @@
 #include "Logic/GenPathfinder.h"
 #include "Logic/GenShroud.h"
 #include "Logic/GenSkirmishAI.h"
+#include "Logic/GenTeams.h"
 #include "Client/GenDrawable.h"
 #include "GenGameLogic.generated.h"
 
@@ -94,6 +95,7 @@ struct GENERALS1_API FGenPlayer
 	FString ScriptName;
 	TMap<int32, EGenRelationship> Relations;
 	bool bScriptRelations = false;
+	TMap<int32, EGenRelationship> TeamRelations; // Player::m_teamRelations: what a script says of one team, by team id
 	const FGenPlayerTemplate* Template = nullptr;
 	FLinearColor Color = FLinearColor::White;
 	int32 Money = 0;
@@ -105,6 +107,10 @@ struct GENERALS1_API FGenPlayer
 	int32 Difficulty = -1;      // ... at this level (0 easy, 1 medium, 2 hard; -1: the default)
 	bool bDefeated = false;     // has lost every building that counts: out of the game
 	bool bDisconnected = false; // (a network game) its player has dropped out: its allies may command its things
+	// What a mission's scripts switch off for a side (Player::m_canBuildBase / m_canBuildUnits). A computer player
+	// builds by these, and so does the check that says whether a player may build at all.
+	bool CanBuildBase = true;
+	bool CanBuildUnits = true;
 	FGenScore Score;
 
 	// Upgrades (lower-case names)
@@ -115,6 +121,10 @@ struct GENERALS1_API FGenPlayer
 	int32 RankLevel = 1;
 	int32 SkillPoints = 0;
 	int32 SciencePurchasePoints = 0;
+	float SkillPointsModifier = 1.f;        // Player::m_skillPointsModifier: what future skill points are multiplied by
+	// Player::m_attackedBy: which players have hurt something of this one, from the damage that actually landed
+	// (ActiveBody::attemptDamage), not from what a script says.
+	uint32 AttackedByMask = 0;
 	float CashBounty = 0.f;                 // share of each kill's cost paid to this player
 	TMap<FString, uint32> PowerReadyFrame;  // timers of the powers all the player's buildings share (lower-case name)
 	int32 PowersFired = 0;
@@ -201,6 +211,8 @@ public:
 	// --- campaign missions (GenCampaignGame.cpp) ---
 	/** A campaign mission: the map's sides are the players, its scripts drive the game, and they decide it. */
 	bool IsCampaign() const { return !Match.Campaign.IsEmpty(); }
+	/** A mission of the Generals' Challenge: played by a player of its own, the map's sides against it. */
+	bool IsChallenge() const { return !Match.ChallengeFaction.IsEmpty(); }
 	/** The map's script engine (campaign missions; null in a skirmish). */
 	FGenMapScripts* GetMapScripts() const { return MapScripts.Get(); }
 	/** Player::setPlayerRelationship: how From sees To from now on (and who shares sight). */
@@ -209,19 +221,59 @@ public:
 	void ScriptGameOver(bool bLocalWins);
 	/** PLAYER_SET_RANKLEVELLIMIT: no general gets past this rank (0: no limit). */
 	void SetRankLevelLimit(int32 Limit) { RankLevelLimit = Limit; }
+	/** PLAYER_SET_RANKLEVEL (Player::setRankLevel): put that general at this rank, inside the ranks the data has
+	 *  and any limit the map set. Going down takes the rank's things away; the port has no record of which science
+	 *  came from which rank, so a demotion can only move the level. */
+	void SetRankLevel(int32 Player, int32 Level);
+	/** PLAYER_AFFECT_RECEIVING_EXPERIENCE (Player::setSkillPointsModifier): what future skill points are multiplied
+	 *  by. Nothing that was already earned changes. */
+	void SetSkillPointsModifier(int32 Player, float Modifier) { if (Players.IsValidIndex(Player)) { Players[Player].SkillPointsModifier = Modifier; } }
+	/** PLAYER_ENABLE_BASE_CONSTRUCTION / PLAYER_ENABLE_UNIT_CONSTRUCTION (Player::m_canBuildBase / m_canBuildUnits).
+	 *  These are the player's, not the computer player's own copies: a map's script sets them for any side, and a
+	 *  side that isn't human is played by the computer AI, which reads them from here. */
+	void SetCanBuildBase(int32 Player, bool bCan) { if (Players.IsValidIndex(Player)) { Players[Player].CanBuildBase = bCan; } }
+	void SetCanBuildUnits(int32 Player, bool bCan) { if (Players.IsValidIndex(Player)) { Players[Player].CanBuildUnits = bCan; } }
+	bool CanBuildBase(int32 Player) const { return Players.IsValidIndex(Player) && Players[Player].CanBuildBase; }
+	bool CanBuildUnits(int32 Player) const { return Players.IsValidIndex(Player) && Players[Player].CanBuildUnits; }
+	/** Player::setAttackedBy / getAttackedBy: which players have hurt something of this one, from the damage that
+	 *  actually landed (ActiveBody::attemptDamage) - not from what a script says. SKIRMISH_PLAYER_HAS_BEEN_ATTACKED_BY_PLAYER asks. */
+	void MarkAttackedBy(int32 Player, int32 Attacker)
+	{
+		if (Players.IsValidIndex(Player) && Players.IsValidIndex(Attacker)) { Players[Player].AttackedByMask |= 1u << Attacker; }
+	}
+	bool WasAttackedBy(int32 Player, int32 Attacker) const
+	{
+		return Players.IsValidIndex(Player) && Players.IsValidIndex(Attacker) && (Players[Player].AttackedByMask & (1u << Attacker)) != 0;
+	}
 	/** ENABLE_SCORING / DISABLE_SCORING: whether what is built, lost and destroyed counts towards the score. */
 	void SetScoringEnabled(bool bEnabled) { bScoringEnabled = bEnabled; }
 	bool IsScoringEnabled() const { return bScoringEnabled; }
 	/** MAP_REVEAL_ALL_PERM / MAP_REVEAL_ALL_UNDO_PERM / MAP_SHROUD_ALL / MAP_REVEAL_PERMANENTLY_AT_WAYPOINT. */
 	void ScriptRevealMapPermanently(int32 Player, bool bReveal);
 	void ScriptShroudMap(int32 Player);
-	void ScriptRevealPermanently(int32 Player, const FVector2f& Pos, float Radius);
+	/** doShroudMapAtWaypoint: a dollop of shroud that doesn't stay. */
+	void ScriptShroudOnce(int32 Player, const FVector2f& Pos, float Radius);
+	/** TerrainLogic::getWaterHeight / setWaterHeight, for a water area by name. The last step of a change opens up or
+	 *  closes the ground under it to units. */
+	bool GetScriptWaterHeight(const FString& Name, float& OutHeight) const;
+	void SetScriptWaterHeight(const FString& Name, float Height, bool bFinal);
+	void ScriptRevealPermanently(int32 Player, const FVector2f& Pos, float Radius, bool bUndo = false);
+	/** MAP_REVEAL_AT_WAYPOINT / MAP_REVEAL_ALL: a look, gone again at once: what was seen stays explored. */
+	void ScriptRevealOnce(int32 Player, const FVector2f& Pos, float Radius);
+	void ScriptRevealMapOnce(int32 Player);
 	/** MAP_SWITCH_BORDER: which of the map's boundaries is the playable area. */
 	void SetActiveBoundary(int32 Boundary);
 	/** TheGameLogic->destroyObject: gone at the end of the step, without dying (and what is inside goes with it). */
 	void RemoveObjectByScript(FGenObject& Obj);
 	/** What the scripts want seen and heard since the last time (game thread, inside the logic gate). */
 	void TakeScriptClientEvents(TArray<FGenScriptClientEvent>& Out) { if (MapScripts) { MapScripts->TakeClientEvents(Out); } }
+	/** Hold Space in a mission's intro: its steps run as fast as they go until the scripts give the input back. The
+	 *  game is the same one, only the wait is gone; nothing an order could tell apart. */
+	void StartCinematicSkip() { bCinematicSkip = true; }
+	/** The game is decided and the player may be told. A mission's scripts fade the screen out over its last explosion
+	 *  as they end it (the 100 frames of mission 1's CAMERA_FADE_MULTIPLY): the word and the score wait for that. */
+	bool IsGameOverAnnounced() const { return bGameOver && (!IsCampaign() || Frame >= GameOverFrame + 100); }
+	bool IsCinematicSkipping() const { return bCinematicSkip; }
 	/** ScriptEngine::transferObjectName (a terrorist's name goes to the car bomb he makes). */
 	void OnObjectNameTransfer(const FGenObject& From, FGenObject& To) { if (MapScripts) { MapScripts->TransferName(From, To); } }
 
@@ -248,6 +300,11 @@ public:
 	bool SaveRecording(const FString& Path = FString());
 	/** The orders come from this replay instead of from this computer (before StartSkirmish, with its settings). */
 	void SetPlayback(TUniquePtr<FGenReplay> Replay);
+	/** Loading a saved game: what SetPlayback was given is played again, flat out, up to that frame; from there on
+	 *  the game is the player's own, and the recording goes on from what was played. */
+	void BeginResume(uint32 UntilFrame);
+	bool IsResuming() const { return bResuming; }
+	float GetResumeProgress() const { return ResumeUntilFrame > 0 ? float(Frame) / float(ResumeUntilFrame) : 1.f; }
 	bool IsPlayingBack() const { return Playback.IsValid(); }
 	/** The first frame whose checksum differed from the replay's (0: none so far). */
 	uint32 GetPlaybackMismatchFrame() const { return PlaybackMismatchFrame; }
@@ -270,7 +327,22 @@ public:
 	// --- players ---
 	const TArray<FGenPlayer>& GetPlayers() const { return Players; }
 	int32 GetLocalPlayer() const { return LocalPlayer; }
+
+	// --- teams (TeamFactory) ---
+	/** The game's one team registry: the map's script engine and the computer players' AI share it. */
+	FGenTeamFactory& GetTeamFactory() { return TeamFactory; }
 	EGenRelationship GetRelationship(int32 A, int32 B) const;
+	/** Object::getRelationship (Team::getRelationship): a script's override between their teams, else their players'. */
+	EGenRelationship GetRelationship(const FGenObject& A, const FGenObject& B) const;
+	/** The same from a player's own (default) team: what its commands make of an object. */
+	EGenRelationship GetRelationship(int32 Player, const FGenObject& B) const;
+	/** TEAM_SET_OVERRIDE_RELATION_TO_TEAM: from now on the two above have to look. */
+	void NoteTeamRelationOverride() { bTeamRelationOverrides = true; }
+	/** PLAYER_SET_OVERRIDE_RELATION_TO_TEAM / _REMOVE_ (Player::setTeamRelationship). */
+	void SetPlayerTeamRelation(int32 Player, int32 TeamId, EGenRelationship Rel) { if (Players.IsValidIndex(Player)) { Players[Player].TeamRelations.Add(TeamId, Rel); bTeamRelationOverrides = true; } }
+	void RemovePlayerTeamRelation(int32 Player, int32 TeamId) { if (Players.IsValidIndex(Player)) { Players[Player].TeamRelations.Remove(TeamId); } }
+	/** ENABLE_BORDER_SHROUD / DISABLE_BORDER_SHROUD (W3DDisplay::setBorderShroudLevel): what lies beyond the map's cells, dark or clear. */
+	void SetBorderShroud(bool bDark);
 
 	// --- commands (queued, applied next logic frame) ---
 	void IssueMove(const TArray<FGenObjectID>& Units, const FVector3f& Goal);
@@ -286,6 +358,8 @@ public:
 	void IssueSwitchWeapon(const TArray<FGenObjectID>& Units, int32 Slot);
 	/** AIGroup::groupCreateFormation (Ctrl+F): the units keep their places relative to one another from now on - or, if they do already, no longer. */
 	void IssueCreateFormation(const TArray<FGenObjectID>& Units);
+	/** AIGroup::groupScatter (X): everybody away from the middle of the group, by four times his own size. */
+	void IssueScatter(const TArray<FGenObjectID>& Units);
 	/**
 	 * AIGroup::groupMoveToPosition (GenGroupMove.cpp): every unit to its place in the group at the goal;
 	 * three infantry or vehicles and more with some way to go as a column along one wide way; a formation
@@ -385,6 +459,12 @@ public:
 	TArray<FGenObjectID> SelectRequests;
 	/** A particle system of that name, by itself, at a spot. */
 	void PlayParticleSystemAt(const FString& TemplateName, const FVector3f& Pos);
+	/** ... and what it keeps to change its emission radius by (a firestorm's: 0 if nothing is drawn). */
+	uint32 CreateParticleSystemAt(const FString& TemplateName, const FVector3f& Pos);
+	void SetParticleSystemRadius(uint32 SystemID, float Radius);
+	/** ScriptEngine's attack priority sets, by name. */
+	FGenAttackPriority& FindOrAddAttackPriority(const FString& Name);
+	const FGenAttackPriority* FindAttackPriority(const FString& Name) const;
 	/** A mine has been laid in this game (movers look for mines under them only then). */
 	bool HasMines() const { return bAnyMines; }
 	bool bAnyMines = false;
@@ -437,6 +517,9 @@ public:
 	/** Frames a build takes for this player right now (ThingTemplate::calcTimeToBuild: slower when short on power). */
 	float CalcTimeToBuild(const FGenThingTemplate& Template, int32 Player) const;
 	/** Can the player build this now (prerequisites, money, the limit on its type)? If not, OutWhy says what is missing. */
+	/** ThingTemplate::getBuildable: Buildable, or what a script has made of it (TECHTREE_MODIFY_BUILDABILITY_OBJECT). */
+	uint8 GetBuildable(const FGenThingTemplate& Template) const;
+	void SetBuildableOverride(const FGenThingTemplate& Template, uint8 Buildable) { BuildableOverrides.Add(&Template, Buildable); }
 	bool CanMake(int32 Player, const FGenThingTemplate& Template, FString* OutWhy = nullptr, bool bCheckMoney = true) const;
 	/** Player::countExisting, for canBuildMoreOfType: how many of a type a player already has - what stands
 	 *  in the world (with what its allies on the same team have, as the original's team iteration does),
@@ -498,7 +581,7 @@ public:
 	/** The occupant of a garrison takes the fire point nearest its target (GarrisonContain::trackTargets). */
 	void PlaceAtGarrisonPoint(FGenObject& Container, FGenObject& Rider, const FGenObject* Victim);
 	void IssueEnter(const TArray<FGenObjectID>& Units, FGenObjectID Container);
-	void IssueExit(FGenObjectID Rider);
+	void IssueExit(FGenObjectID Rider, FGenObjectID Container = GenInvalidObjectID);
 	void IssueEvacuate(FGenObjectID Container);
 	/** A building about to be sold turns everybody out (the last tunnel too; otherwise they stay in the network). */
 	void OnContainerSold(FGenObject& Container);
@@ -580,7 +663,7 @@ public:
 	/** Object::defect: the object goes over to another player (a captured building). */
 	bool DefectObject(FGenObject& Obj, int32 NewOwner);
 	/** Object::setTeam and onCapture: everything that follows from a change of owner. */
-	void ChangeOwner(FGenObject& Obj, int32 NewOwner);
+	void ChangeOwner(FGenObject& Obj, int32 NewOwner, bool bCaptured = true);
 	bool IsFactionStructure(const FGenObject& Obj) const;
 	/** Everything queued at a building is taken off and paid back. */
 	void CancelAllProduction(FGenObject& Building);
@@ -668,6 +751,9 @@ public:
 	/** Radar::tryEvent: an event, unless there was one of the kind a moment ago. */
 	bool TryRadarEvent(EGenRadarEvent Type, const FVector3f& Pos);
 	void TryUnderAttackEvent(const FGenObject& Obj);
+	/** ControlBar::triggerRadarAttackGlow: whether the alarm has gone off yet, and when it last did (the HUD blinks the light above the radar from there). */
+	bool HasUnderAttackGlow() const { return bUnderAttackGlow; }
+	uint32 GetLastUnderAttackFrame() const { return LastUnderAttackFrame; }
 	bool GetLastRadarEventPos(FVector3f& OutPos) const;
 	const TArray<FGenRadarEvent>& GetRadarEvents() const { return RadarEvents; }
 	// --- sound (the audio manager does the playing; these are the game's occasions for it) ---
@@ -705,6 +791,11 @@ public:
 	/** The player has a finished building of that kind. */
 	bool HasFinishedKindOf(int32 Player, const TCHAR* Kind) const;
 	bool IsPassengerAllowedToFireFrom(const FGenObject& Container) const;
+	/** The ones inside that may fire out of it, and have a weapon to do it with. */
+	void GetRidersAbleToFire(const FGenObject& Container, TArray<const FGenObject*>& Out) const;
+	/** WeaponSet::getAbleToUseWeaponAgainstTarget, an occupied container: "if just one of them can attack the specific target,
+	 *  then we are good to go!" - from where they are, as they can't walk up to it. */
+	bool CanRidersAttack(const FGenObject& Container, const FGenObject& Victim) const;
 
 	/** RiderChangeContain::onContaining / onRemoving: whoever is selected getting onto a combat cycle (or off it) hands
 	 *  the selection over. Only the player controller reads these; they are kept for a second. */
@@ -782,6 +873,7 @@ public:
 	 * that less. Game thread.
 	 */
 	bool RaycastDrawable(FGenObjectID Id, const FVector& Origin, const FVector& Dir, double& InOutT) const;
+	FString DescribeDrawablePick(FGenObjectID Id) const;
 	/** Drawable::onSelected -> flashAsSelected: it lights up white for a moment. Game thread. */
 	void FlashSelected(FGenObjectID Id);
 	float GetRenderOrientation(const FGenObject& Obj) const;
@@ -872,10 +964,16 @@ private:
 	};
 	TArray<FGenObjectID> PendingVisuals;        // made, and no model yet
 	TArray<FGenObjectID> RemakeVisuals;         // its look has changed to another template's (a disguise): made anew
-	TMap<FGenObjectID, FString> SoundOnly;      // what has no model but a sound of its own (the map's Amb_ objects): the loop playing
+	struct FSoundOnlyObject
+	{
+		FString Playing;
+		uint32 ScriptCount = 0;
+	};
+	TMap<FGenObjectID, FSoundOnlyObject> SoundOnly; // what has no model but a sound of its own (the map's Amb_ objects, a cut scene's explosions)
 	/** The ambient sound an object makes, the map's word on it included (Object::updateObjValuesFromMapProperties:
 	 *  "Enable permanently looping sounds, disable one-shot sounds by default"). */
 	FString GetAmbientSound(const FGenObject& O, const FString& TemplateSound) const;
+	void ApplyMapAmbientCustomization(FGenObject& New, const struct FGenMapObject& O);
 	/** The player whose colours the local player sees it in (an enemy's disguise: the one it pretends to be). */
 	int32 GetColorPlayer(const FGenObject& O) const;
 	TArray<FPendingRemoval> PendingRemovals;    // gone, and the model still there
@@ -892,12 +990,16 @@ private:
 	void InitPlayerSciences(FGenPlayer& Player);
 	/** A campaign mission's players: the map's sides, in order (side 0 is the neutral player), with their relations. */
 	void SetupCampaignPlayers();
+	void SetupChallengePlayer();
 	/** Who sees through whose eyes (allies share what they see), after the relations have changed. */
 	void RefreshAllianceMasks();
 	TUniquePtr<FGenMapScripts> MapScripts;
+	FGenTeamFactory TeamFactory{this};
 	int32 RankLevelLimit = 0;
 	bool bScoringEnabled = true;
 	bool AddScience(int32 Player, const FString& Science);
+	/** Player::setRankLevel's rank walk: up to that rank, granting what each rank between gives. */
+	void PromoteToRank(FGenPlayer& Player, int32 TargetLevel);
 	void StartDelivery(const struct FGenDeliverPayload& Payload, const FGenObject& Source, const FVector3f& Primary, const FVector3f& Secondary);
 	void SpawnMapObjects();
 	FVector3f FindPositionAround(const FVector3f& Center, float MinRadius, float MaxRadius, uint32 Surfaces) const;
@@ -921,6 +1023,8 @@ private:
 	bool bLoadSoundsEnabled = true;
 	TArray<FSelectionHandoff> SelectionHandoffs;
 	TArray<FGenRadarEvent> RadarEvents;
+	bool bUnderAttackGlow = false;
+	uint32 LastUnderAttackFrame = 0;
 	bool bHasLastRadarEvent = false;
 	FVector3f LastRadarEventPos = FVector3f::ZeroVector;
 	// --- group moves (GenGroupMove.cpp) ---
@@ -981,6 +1085,8 @@ private:
 		int32 DrawIndex = INDEX_NONE;     // index into the template's Draws
 		TWeakObjectPtr<UGenModelComponent> Model;
 		FGenDrawInstance State;           // the condition state it shows, and the one waiting behind a transition
+		float AppliedTurret = 1e9f, AppliedTurretPitch = 1e9f, AppliedAltTurret = 1e9f, AppliedAltTurretPitch = 1e9f; // the pose its turrets were last given
+		FTransform AppliedAttach = FTransform::Identity; // where on the first model it sits (AttachToBoneInAnotherModule)
 		float AppliedRelZ = 0.f;          // how far below (or above) the object's first model it stands (ADJUST_HEIGHT_BY_CONSTRUCTION_PERCENT)
 		const FGenModelConditionState* StateSystemsFor = nullptr; // the state the ParticleSysBone systems below belong to
 		TArray<uint32> StateSystems;
@@ -1012,6 +1118,7 @@ private:
 		bool bPlaced = false;             // the drawable has been given the object's transform at least once
 		FVector AppliedPos = FVector::ZeroVector; // ... and where that last put it (relative to the map)
 		bool bHidden = false;             // inside a container, or out of the local player's sight
+		int32 OccludedMark = 0;           // what the model has been marked with for M_Occluded (0: nothing)
 		float StealthFade = 0.f;          // the stealth look applied so far
 		float StealthGlow = 0.f;
 		double FlashStart = 0.0;          // when it was selected (flashAsSelected), while the flash lasts
@@ -1024,8 +1131,10 @@ private:
 		bool bSoundTurret = false;      // TurretMoveLoop playing (the turret turned or tilted in the last step)
 		FString TurretLoopSound;
 		int32 SoundAmbient = -1;          // which ambient plays: -1 none, 0..3 damage state, 4 building site
+		uint32 SoundScriptCount = 0;      // the object's MapAmbientScriptCount, as far as it has been acted on
 		int32 SoundDamageState = 0;
 		int32 Owner = MIN_int32;          // whose colours it wears (a garrisoned building changes hands)
+		FLinearColor CustomColor = FLinearColor::Transparent; // NAMED_CUSTOM_COLOR, if it has been put on
 		const FGenModelConditionState* StateSystemsFor = nullptr; // condition state the ParticleSysBone systems below belong to
 		TArray<uint32> StateSystems;
 		TArray<FString> StateSystemBones; // ... and the bone each is on
@@ -1037,7 +1146,9 @@ private:
 		TArray<uint32> TransitionSystems;
 		int32 DebrisAnimState = -1;       // W3DDebrisDraw: -1 not begun, 0 its first animation, 1 flying, 2 landed
 		uint32 DebrisAnimFrame = 0;       // logic frame it began
-		float AppliedTurretPitch = 0.f;
+		float AppliedTurretPitch = 1e9f;
+		float AppliedAltTurret = 1e9f;
+		float AppliedAltTurretPitch = 1e9f;
 		int32 ClipSpent[3] = { 0, 0, 0 };  // shots of the clip whose launch bones' sub-objects are hidden
 		const FGenModelConditionState* ClipSpentState = nullptr; // ... in this look of the model
 		int32 BodySystemsKey = -1;        // damage state and "aflame" the fire and smoke below were made for
@@ -1082,6 +1193,9 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> ShroudMaterial;
 
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> OccludedMaterial;
+
 	TArray<uint8> ShroudCurrent;                    // m_currentFogData (border included)
 	TArray<uint8> ShroudFinal;                      // m_finalFogData
 	uint32 ShroudViewSerial = 0;
@@ -1096,6 +1210,14 @@ private:
 	};
 	TArray<FGhost> Ghosts;
 	bool bNight = false;
+	bool bSnowy = false;                            // the map's WorldInfo: "weather" is snowy
+	FVector3f BehindCameraPos = FVector3f::ZeroVector; // (where the camera is, in the game's units, this frame)
+	bool bBehindBuildingsOn = false;
+	bool bTeamRelationOverrides = false;
+	uint8 ShroudBorderLevel = 0, ShroudBorderApplied = 0;
+	bool IsBehindStructure(const FGenObject& O, const FVector3f& CameraPos) const;
+	void UpdateOccludedMark(const FGenObject& O, FDrawState& DS, bool bHidden, UGenModelComponent* Model);
+	void InitBehindBuildings();
 	double LastDrawFrameTime = 0.0;                 // logic frame + alpha at the previous drawable update
 
 	struct FDelayedDamage
@@ -1107,6 +1229,16 @@ private:
 		uint32 Frame = 0;
 	};
 	TArray<FDelayedDamage> DelayedDamage;
+	/** WeaponTemplate::m_historicDamage: where the weapons with a historic bonus have hit lately. */
+	struct FHistoricDamage
+	{
+		uint32 Frame = 0;
+		FVector3f Pos = FVector3f::ZeroVector;
+	};
+	TMap<const FGenWeaponTemplate*, TArray<FHistoricDamage>> HistoricDamage;
+	TMap<FString, TUniquePtr<FGenAttackPriority>> AttackPriorities;
+	TMap<const FGenThingTemplate*, uint8> BuildableOverrides;
+	void CheckHistoricBonus(const FGenWeaponTemplate& Weapon, const FGenObject& Source, const FVector3f& Pos);
 	TArray<FGenFloatingText> FloatingTexts;
 	FRandomStream Random;
 
@@ -1133,6 +1265,10 @@ private:
 	bool bPowersReady = false;                 // (tests) special powers don't wait for their timers
 	IGenOrderSource* OrderSource = nullptr;    // a network game's host
 	bool bCatchingUpNow = false;
+	bool bResuming = false;
+	uint32 ResumeUntilFrame = 0;
+	void FinishResume();
+	bool bCinematicSkip = false;
 	/** Far behind the host: steps run here, one after another, for a few milliseconds of this frame. */
 	void CatchUp();
 	/** The host's word on a player: "drop" (gone from the game: its allies may command its army), "return". */
@@ -1142,6 +1278,10 @@ private:
 	/** After a step: its checksum is noted (and, played back, compared). */
 	void CheckStep();
 	void ExecuteCommand(const FGenCommand& C);
+	/** FlightDeckBehavior::aiDoCommand: a ship's flight deck has no AI of its own ("a dumb stump that only
+	 *  propagates orders to its aircraft"), so an order given to the ship is kept by its deck and passed on
+	 *  to whatever stands on it. True when the deck took the order, so the caller does nothing else. */
+	bool OrderToDeck(FGenObject* O, EGenCommandType Type, const FVector3f& Pos, FGenObjectID Target, int32 Slot = 0);
 	void ExecMove(const FGenCommand& C);
 	void ExecAddWaypoint(const FGenCommand& C);
 	void ExecAttackMove(const FGenCommand& C);
@@ -1152,6 +1292,8 @@ private:
 	void ExecForceAttackGround(const FGenCommand& C);
 	void ExecSwitchWeapon(const FGenCommand& C);
 	void ExecCreateFormation(const FGenCommand& C);
+	void OrderStandingDecks(const FGenCommand& C);
+	void ExecScatter(const FGenCommand& C);
 	void ExecLand(const FGenCommand& C);
 	void ExecAttack(const FGenCommand& C);
 	void ExecSteerGunship(const FGenCommand& C);
@@ -1193,6 +1335,8 @@ private:
 	uint32 CompletedFrame = 0;       // ... has finished
 	uint32 PublishedFrame = 0;       // ... the screen is blending towards
 	double SimClock = 0.0;           // game time in logic frames: frame N is due when it reaches N
+	uint32 InitiateVoiceFrame = MAX_uint32; // (the last frame somebody answered a click: one voice for a selection)
+	double ModelClock = 0.0;         // how far the models have been animated, on the screen's clock (GetRenderFrameTime)
 	double RenderDelay = 0.0;        // how far behind that the screen runs (logic frames)
 	float TimeScale = 1.f;
 	/** Queues the models and animations of what the sides in this game can build (see UGenAssetSubsystem::QueuePreloadModel). */

@@ -233,6 +233,9 @@ public:
 
 	bool Initialize();
 
+	/** A map's map.ini: its particle systems, FX lists and object creation lists, instead of what the last map's changed. */
+	void ApplyMapIni(const TArray<TSharedPtr<FGenIniBlock>>& Blocks);
+
 	const FGenParticleSystemTemplate* FindParticleSystem(const FString& Name) const;
 	const FGenFXList* FindFXList(const FString& Name) const;
 	const FGenOCL* FindOCL(const FString& Name) const;
@@ -249,4 +252,8 @@ private:
 	TMap<FString, FGenParticleSystemTemplate> ParticleSystems; // key: lowercase name
 	TMap<FString, FGenFXList> FXLists;
 	TMap<FString, FGenOCL> OCLs;
+	// What the loaded map's map.ini replaced (unset: it wasn't there before).
+	TMap<FString, TOptional<FGenParticleSystemTemplate>> MapIniSavedSystems;
+	TMap<FString, TOptional<FGenFXList>> MapIniSavedLists;
+	TMap<FString, TOptional<FGenOCL>> MapIniSavedOCLs;
 };

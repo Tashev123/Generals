@@ -31,6 +31,7 @@ public:
 	/** Map folder name under Maps\ (e.g. "Tournament Desert"). */
 	UPROPERTY(EditAnywhere, Category = "Generals")
 	FString MapName = TEXT("Tournament Desert");
+	FString MapFolder;                  // where the loaded map's files are (its map.ini)
 
 	UPROPERTY(EditAnywhere, Category = "Generals")
 	bool bSpawnMapObjects = true;
@@ -46,6 +47,8 @@ public:
 	const FGenMapData* GetMapData() const { return Map.Get(); }
 	/** For the game logic, which levels building sites (TerrainLogic::flattenTerrain). */
 	FGenMapData* GetMapDataForLogic() { return Map.Get(); }
+	/** A script has changed a water level: drawn again from the map's water areas. */
+	void RebuildWater();
 	/** The heights of those cells (array indices, border included) have changed: the terrain's mesh there is made anew, a chunk a frame. */
 	void MarkTerrainDirty(const FIntRect& Cells);
 	/** One chunk's worth of that. True if there was something to do. */
@@ -83,6 +86,10 @@ public:
 	const UGenTerrainComponent* GetTerrain() const { return Terrain; }
 	/** W3DWater's sky box: centred on the camera every frame ("center skybox around camera"). */
 	void UpdateSkyBox(const FVector& CameraLocation);
+	/** DRAW_SKYBOX_BEGIN / _END (doSkyBoxSet: GlobalData's m_drawSkyBox). */
+	void SetSkyBoxVisible(bool bVisible);
+	/** How far from the camera the sky box's nearest face can be (cm): what is further than this is the sky. */
+	float GetSkyBoxDistance() const { return SkyBoxDistance; }
 	/** The map's bridges, for the game logic. */
 	const TArray<FGenBridgeInfo>& GetBridges() const;
 
@@ -130,4 +137,5 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<class UProceduralMeshComponent> SkyBox;
+	float SkyBoxDistance = 1.e9f;
 };

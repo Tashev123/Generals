@@ -22,7 +22,7 @@ import struct
 import sys
 from dataclasses import dataclass
 
-ZH_DIR = r"D:\Games\EA Games\Command & Conquer Generals Zero Hour"
+ZH_DIR = r"E:\SteamLibrary\steamapps\common\Command & Conquer Generals - Zero Hour"  # (the patched copy the game itself finds by the registry)
 GEN_DIR = r"D:\Games\EA Games\Command and Conquer Generals"
 
 _MOD_PREFIX = re.compile(r"^\d+_")

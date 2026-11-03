@@ -28,6 +28,18 @@ struct GENERALS1_API FGenCampaign
 	const FGenCampaignMission* FindMission(const FString& MissionName) const;
 };
 
+/** A general of the Generals' Challenge (ChallengeGenerals.cpp's GeneralPersona; ChallengeMode.ini). */
+struct GENERALS1_API FGenChallengeGeneral
+{
+	FString PlayerTemplate;     // "FactionAmericaAirForceGeneral"
+	bool bStartsEnabled = false;
+	FString BioName, BioRank, BioBranch, BioStrategy;   // labels
+	FString PortraitSmall, PortraitLarge, DefeatedImage, VictoriousImage;
+	FString DefeatedString, VictoriousString;           // labels
+	FString SelectionSound, WinSound, LossSound;
+	FString Campaign;           // "CHALLENGE_0": who it fights when the player plays it
+};
+
 /** Data\INI\Campaign.ini, read once. */
 class GENERALS1_API FGenCampaignData
 {
@@ -36,6 +48,11 @@ public:
 
 	const TArray<FGenCampaign>& GetCampaigns();
 	const FGenCampaign* FindCampaign(const FString& Name);
+	const TArray<FGenChallengeGeneral>& GetChallengeGenerals();
+	/** getGeneralByGeneralName: the general a mission's GeneralName says it is against. */
+	const FGenChallengeGeneral* FindGeneralByName(const FString& BioName);
+	/** getPlayerGeneralByCampaignName */
+	const FGenChallengeGeneral* FindGeneralByCampaign(const FString& CampaignName);
 	/** The missions of a campaign that this game can play so far (the rest are listed, but locked). */
 	static bool IsMissionPorted(const FString& Campaign, const FString& Mission);
 
@@ -43,5 +60,6 @@ private:
 	void Load();
 
 	bool bLoaded = false;
+	TArray<FGenChallengeGeneral> ChallengeGenerals;
 	TArray<FGenCampaign> Campaigns;
 };

@@ -177,6 +177,9 @@ bool FGenMapData::LoadFromMemory(TConstArrayView<uint8> InData)
 			{
 				FGenPolygonTrigger T;
 				T.Name = R.AStr();
+				// (Twilight Flame spells one of its areas "OuterPerimter5". The skirmish scripts ask for "OuterPerimeter5", find
+				// nothing, and the computer player who starts there never sends an attack wave: its army stays at home.)
+				T.Name.ReplaceInline(TEXT("Perimter"), TEXT("Perimeter"), ESearchCase::CaseSensitive);
 				if (C.Version >= 4) { R.AStr(); } // layer name
 				T.ID = R.I32();
 				if (C.Version >= 2) { T.bWater = R.U8() != 0; }
@@ -410,18 +413,18 @@ const FGenMapObject* FGenMapData::GetClosestWaypointOnPath(const FVector2f& Pos,
 	return Best;
 }
 
-void FGenMapData::GetWaypointPath(const FGenMapObject& Start, TArray<FVector2f>& OutPath) const
+int32 FGenMapData::GetWaypointPath(const FGenMapObject& Start, TArray<FVector2f>& OutPath) const
 {
 	const FGenMapObject* Cur = &Start;
-	TSet<int32> Seen;
+	TMap<int32, int32> Seen; // waypoint ID -> where it first appears in the path
 	while (Cur)
 	{
 		const int32 Id = Cur->GetInt(TEXT("waypointID"), -1);
-		if (Seen.Contains(Id))
+		if (const int32* First = Seen.Find(Id))
 		{
-			break; // a loop
+			return *First; // a closed circuit: the state goes back to this waypoint and on round it
 		}
-		Seen.Add(Id);
+		Seen.Add(Id, OutPath.Num());
 		OutPath.Add(FVector2f(Cur->Location.X, Cur->Location.Y));
 		const FGenMapObject* Next = nullptr;
 		for (const FIntPoint& L : WaypointLinks)
@@ -434,6 +437,7 @@ void FGenMapData::GetWaypointPath(const FGenMapObject& Start, TArray<FVector2f>&
 		}
 		Cur = Next;
 	}
+	return -1; // no link from the last one: that is where the path ends
 }
 
 const FGenMapLighting* FGenMapData::GetCurrentLighting() const

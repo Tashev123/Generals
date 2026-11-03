@@ -172,9 +172,15 @@ As in the original, units are not shoved apart by physics; they avoid ending up 
 - [x] Done since: the Stealth Fighter's stealth (M6b), the airfield's rally point for helicopters (M4d),
       Chinook / Helix transport duty (M5b); flares, the Aurora's "attackers miss", ejecting pilots and the
       combat drop are M5c below
-- [ ] Not done yet: aircraft carrier decks (FlightDeckBehavior: campaign only), the guard-airspace
-      command of jets; LockonTime (a delay before anti-air may fire at a jet) is in the code but no
-      object in the game's data uses it
+- [x] Aircraft carrier decks' spaces and the aircraft the ship is built with (FlightDeckBehavior, campaign
+      only): the bones the INI names, walked in the order the game walks them, one object per space; and for a
+      plane parked on a deck the deck is what its ground is (LandingDeckHeightOffset in PhysicsUpdate's ground
+      clamp - the only object in the game's data that sets it, so no airfield is affected). Tested: a carrier
+      alone at its own spot, 20 aircraft at the deck's bones in the game's order (R1S1, R2S1, R1S2...); an
+      airfield's planes still park as before.
+- [ ] Still not done in that module: the launch waves and the catapult, the deck's taxi and cleanup periods, the
+      dock and door animations, the deck's own production, the guard-airspace command of jets; LockonTime (a
+      delay before anti-air may fire at a jet) is in the code but no object in the game's data uses it
 ## Done (M4c: upgrades and general's powers)
 - [x] Upgrade.ini, Science.ini, Rank.ini, SpecialPower.ini; upgrade buttons research at the building
       (paid when queued, refunded on cancel, BuildTime regardless of power), player upgrades reach
@@ -1442,6 +1448,17 @@ more selecting something by clicking near it.)
 - [x] Tried on Tournament Desert: a war factory with three units queued, a Crusader selected
       (portrait and drone / training / armour cameos), the promotions panel at rank 5 (screenshots
       139-141). A hard three-computer game with the new bar ran 41000 frames without an error.
+- [x] The bar as it is now (the user's look test of 2026-11-01): three dark metal sections standing apart
+      over the world, side by side with a gap between them at the bottom of the screen - the radar, in the map's
+      shape so that no bars stand beside it, the commands in the middle of the screen, the right panel (the user's
+      choice over the radar and the right panel in the screen's corners, which `gen.HudSpread 1` still gives). The
+      power shortcuts in a rail on the screen's right edge, as high as they used to stand, growing upwards out of
+      the way of the view. A fifth smaller than the layouts' size
+      (`gen.ControlBarScale` 0.8); tooltips keep their size and stand above the section. All of it made from
+      code at the pixels it takes (Game/GenHudStyle.h, Game/GenHudMetal.cpp; seven finishes on the options' video
+      page). The cameos are the game's own pictures as they are, not their larger editions and not filtered;
+      what can't be used is the same picture in grey (W3DGadgetPushButtonImageDraw). The enlarged painted frame
+      is gone. Clicks between the sections and beside their tabs reach the world.
 - [ ] Not done yet: the tooltip is still the port's own box (ControlBarPopupDescription.wnd isn't
       used); the bar can't be minimised (ButtonLarge), beacons and the communicator are shown
       greyed; the veterancy chevrons over the portrait, UAttack and the rank-up arrow (GenArrow);
@@ -2142,6 +2159,293 @@ Begun 2026-10-28 (the first five), finished 2026-10-29.
   (RunUAT), which don't pass the flag
 - Tested together: a replay of 8-player Twilight Flame against hard computer players, 57,774 frames (32 game
   minutes) - every frame the same
+
+## In progress (C1: the campaigns - the map script engine, USA mission 1)
+The user's choice of 2026-10-29: a "Campaign" button on the main menu, the USA campaign first, its first
+mission (MD_USA01) only. The intro movie (Bink 1) isn't played.
+- [x] Campaign.ini (Game/GenCampaign): the campaigns and their missions; `IsMissionPorted` opens only USA
+      Mission01. The match settings carry Campaign / Mission (replay version 3); `-GenCampaign=USA
+      [-GenMission=Mission01] [-GenDifficulty=Hard]` starts one at once
+- [x] The map's script engine (Logic/GenMapScripts*.cpp, ScriptEngine / ScriptConditions / ScriptActions): every
+      side's scripts and subroutines, teams (TeamFactory, team instances), named objects, flags, counters,
+      timers, and every condition and action MD_USA01 uses. Players are the map's sides
+      (Logic/GenCampaignGame.cpp) with the map's relations. Sound-completion conditions work from the files'
+      lengths (deterministic). `[script f..]` trace lines; `Tools/map_scripts.py` dumps a map's scripts, teams,
+      objects, triggers and waypoint links
+- [x] Waypoint paths (AIFollowWaypointPathState): a script path is followed from the waypoint of it nearest the
+      unit (or the middle of the team), one leg after the other, and a path whose last waypoint links back into
+      it has no end - the unit goes round that circuit until it is ordered elsewhere. That is what keeps
+      MD_USA01's crop duster circling over the player's base (the path there is a closed circuit of eleven
+      waypoints, started by `NAMED_FOLLOW_WAYPOINTS` at the mission's first frame). The `_EXACT` variant keeps its
+      single pass through the points it was given, as `AIFollowWaypointPathExactState` does
+- [x] What the scripts show: W3DView's scripted camera (move / setup / reset / rotate / zoom / pitch / final zoom
+      and pitch / look toward, in logic time so CAMERA_MOVEMENT_FINISHED matches), fades, the letterbox (the
+      bar and health bars hidden), typed military captions, black-and-white, screen shakes, SET_FPS_LIMIT
+      (slows the logic clock), speech / music / sound effects / disabled sound types / volumes, DISABLE_INPUT,
+      removed command buttons, score-screen exclusions (Game/GenGameModeCampaign.cpp, Game/GenHUDCinematic.cpp)
+- [x] The campaign menu (Game/GenShellCampaign.cpp): side, missions (the rest listed as not ported),
+      difficulty, start; the score screen goes back to it; "restart" restarts the mission
+- [x] Tested: the whole intro (bikes, the naval base, the rocket launch, the spy-camera briefing) plays to
+      `ReturnToPlayerControl` at frame 3133 with the camera framing it as the original; a replay of 13,072 frames:
+      every frame the same
+- [ ] Not tested yet: the rest of the mission played by hand (securing the depot releases the held train;
+      loading TrainCar1/2; the train cinematic; the launch facility, radio station A-10s, the MOAB ending). The
+      user is playing it to report
+- [x] The user's report of 2026-11-01: units couldn't pass under the railway bridge - a footprint up in the air is
+      no obstacle (classifyObjectFootprint: more than a cell above the ground); a Humvee drove under it. The crop
+      duster braked at every waypoint - a flying unit's leg lost PathExtraDistance, and a closed circuit's last
+      point counted as the end; it now holds its speed all round
+- [x] map.ini as the original reads it: AddModule / ReplaceModule, Locomotor, ParticleSystem, FXList,
+      ObjectCreationList, and all of it undone when the next map loads (it used to last for the program's run)
+- [x] The script actions that were ignored: difficulty bonuses (OBJECT_ALLOW_BONUSES, SOLO_* weapon bonuses and
+      Human / AISoloPlayerHealthBonus_*: a Crusader on Easy has 720 health instead of 480), team relation
+      overrides in targeting, crushing, mines and the cursor, hulk lifetime, per-event volumes and the
+      disabled sounds as the original's one list (SOUND_REMOVE_ALL_DISABLED stops them and enables nothing), EVA
+      on/off, sky box, border shroud, behind-building markers. No-ops on purpose: OVERSIZE_TERRAIN,
+      RESIZE_VIEW_GUARDBAND, the particle cap option, the countdown display (nothing here is limited by them or
+      shows them). Tested: the health bonus, and a replay of 13,073 frames - every frame the same. Not checked one
+      by one: the volumes, EVA, sky, border and marker switches, the relation overrides, the hulk lifetime
+- [x] Set aside by the user 2026-11-01, solved 2026-11-02: the black sky in some intro scenes (the fog covered the sky: `SkyDistance`),
+      and the muzzle flashes stuck on tanks (see "the user's test notes of 2026-11-01/02").
+- [ ] Next: the other USA missions, then China and GLA (and the shell map, M8c, on the same engine)
+
+## In progress (C1: the campaigns - USA mission 2, MD_USA02)
+Begun 2026-10-29, following mission 1's steps. The user's word of 2026-10-29: a mission's computer side gets a
+brain - a side that is not human is played by the existing computer AI, fed from the map's own per-side build
+list instead of `AIData.ini` (which is what the original does: `AIPlayer` for every non-human side); and
+mission 2 is to be playable from the menu so the user can test the progress so far, startable without having
+finished mission 1.
+- [x] `IsMissionPorted` (Game/GenCampaign.cpp) is now the list of the missions that can be played, USA
+      Mission01 and Mission02. It is the menu's only gate: nothing asks whether the mission before it was
+      finished, so a playable mission is started straight from the mission list (`bOpen` is the flag at
+      `Source/Generals1/Game/GenShellCampaign.cpp:118`, and a disabled item is never clicked,
+      `Source/Generals1/Game/GenShell.cpp:1025`).
+- [x] The names MD_USA02 uses that were not there. Conditions: `NAMED_OWNED_BY_PLAYER`,
+      `SKIRMISH_PLAYER_HAS_UNITS_IN_AREA`, `SKIRMISH_PLAYER_HAS_BEEN_ATTACKED_BY_PLAYER`. Actions:
+      `TEAM_USE_COMMANDBUTTON_ABILITY_ON_NAMED` (team, ability, target), `NAMED_ATTACK_NAMED`,
+      `UNIT_EXECUTE_SEQUENTIAL_SCRIPT`, `WAREHOUSE_SET_VALUE` (the game's one `ValuePerSupplyBox`, through the
+      object's boxes), `PLAYER_SET_RANKLEVEL`, `PLAYER_AFFECT_RECEIVING_EXPERIENCE`, `PLAYER_GRANT_SCIENCE`,
+      `RADAR_CREATE_EVENT`, `RADAR_FORCE_ENABLE`. `CAMERA_MOD_LOOK_TOWARD` and `SOUND_REMOVE_TYPE` are the
+      client's: the waypoint is resolved in logic and the camera mod turns there, and a removed sound type
+      takes its event off the mixer (Audio/GenAudioManager.cpp `RemoveEvent`).
+- [x] Sequential scripts (`UNIT_EXECUTE_SEQUENTIAL_SCRIPT`): entries per team or named object, one script after
+      the other, each waiting for that team to be idle - the original's gate
+      `((idle && FramesToWait < 1) || FramesToWait == 0)`, `idle` being `AIGroup::isIdle` over the members that
+      can move, `FramesToWait` only set by WAIT actions; the loop count re-appends the script at the tail, and
+      the entry goes when the object dies or the group disbands. `'LCAC01 Deploy Sequence'` is what needs it:
+      follow the insert path, leave the transport, follow the extract path.
+- [x] Teams are one registry (Logic/GenTeams.h/.cpp) shared by the map's script engine and the computer AI, so
+      the teams the AI assembles are the teams the scripts name; the definitions, the players and each side's
+      build list all come from the map. A team definition with no production condition stays never-built, as in
+      the original (`evaluateProductionCondition` is false with no condition script), so only `BUILD_TEAM`
+      builds what the mission names. `privateEnter` in the original passes DONT_CHECK_CAPACITY - a script's
+      order to enter is not refused for having no slots - while the AI state and the player command path use
+      CHECK_CAPACITY; the port passes true in `CommandEnter` and should follow the original.
+- [x] Tested through the menu itself: a `-GenTestMenu` script clicks Campaign, USA, Mission02, Start; MD_USA02
+      loads, the match starts, 2,171 frames run, no name reports as unported, and the two client-only actions
+      fire (`CAMERA_MOD_LOOK_TOWARD` at frame 182, `SOUND_REMOVE_TYPE` at 643). `campaign02_menu.png` shows the
+      mission running with the map's own support list.
+- [x] The user's report of 2026-10-30, the carrier had no aircraft on its deck: the deck's model in the game has
+      no parked planes either, they are objects the module makes when the ship is built, which the port did not
+      do. It does now - the spaces in the game's order, the aircraft standing on the deck, and the deck counted
+      as the ground under them. A carrier alone at its own spot shows 20 of them in the order the INI lists the
+      bones (R1S1, R2S1, R1S2...), `deck_jets.png`; an airfield's plane still parks as before (`airfield_jet.png`),
+      and no airfield in the game's data sets that height, so nothing else is affected.
+- [ ] Not working yet: no supply truck boards its LCAC. In the test run each LCAC's waypoint path finished in 5
+      frames, at the first point of a chain that begins far from where it stood - the pathfinder does not route a
+      water-surface unit over the map's water (Logic/GenPathfinder.cpp walkable cells are only for Water and
+      Air surfaces). Capacity is not the blocker: `SupplyTruck` has 3 transport slots and the LCAC's transport
+      has 8.
+- [ ] `TEAM_ATTACK_AREA` keeps the port's guard-area reading (the team guards the named trigger as an area)
+      rather than the original's point-in-area test; it does not change what this mission asks for.
+- [ ] Mission 1's recorded replay (`Saved/Replays/camp1.genrep`) no longer matches at frame 866 (recorded
+      `6593035f`, this build `5dc793c7`); only `Saved/Logs/StateDump_replay_f866.txt` is left. The shared team
+      registry and the sequential gate move that further, so mission 1 needs re-recording or an explanation
+      before either mission can be called tested.
+- [ ] Not tested yet: mission 2 played by hand - the LCAC runs, the supply dumps, the carrier and battleship
+      support, the ending. The user is testing it.
+
+## In progress (C1: the campaigns - USA missions 3, 4 and 5, 2026-11-01)
+The user's word: finish the Dragon tank, then port the rest of the USA campaign (five missions in this game's Campaign.ini), few
+tests, the user plays them by hand. All five are on `IsMissionPorted`.
+- [x] Hold Space skips a mission's intro; after every cut scene the camera eases back to the skirmish zoom (`EndScript`).
+- [x] Dragon: flames in a blast are measured to the middle of the bounding sphere as in `distCalcProc_BoundaryAndBoundary_3D` (the
+      port measured to the object's foot, so a flame at height missed); cylinders' bounding spheres as in `calcBoundingStuff`. A
+      garrison is cleared (4 Rangers in 10 frames). A stinger site's flames go off on its rim, so its soldiers take the blast's
+      1 damage until near (that is the data: FLAME isn't passed to a hive's slaves). The fire wall's flames were never drawn:
+      `ParticleSysBone = None x` was dropped when the bone wasn't found, and a model-less object had no drawable. Fixed for
+      everything: 298 entries (infantry dust, flares, the microwave tank's) now show.
+- [x] Scripts: every condition and action of MD_USA01-05 (the list is in `GenScriptTypes.h`). Sequential scripts now run one at a time
+      per team or unit, with <This Team>, <This Object>, <This Player>, timers, loops and "wait until not contained". Relations: team
+      to player, player to team, and all of them looked at by blast damage. Script surface numbers (1 ground, 2 air) were read as
+      GenSurface bits, which stopped mission 3's helicopter scene.
+- [x] Mission 2's landing craft: in a mission, cells off the logical map are passable ("computer can move off logical map"); LCACs
+      carry their trucks to the docks. `TEAM_ATTACK_AREA` is the original's now.
+- Simplified: `TEAM_FACE_NAMED` turns at once; `CAMERA_MOTION_BLUR_JUMP` jumps with no blur; `TEAM_ENTERED_AREA_PARTIALLY` compares
+  with the last time it was asked; `SPEECH_SET_VOLUME` does nothing (the maps only set 100); booby traps sit at the target's middle.
+- Tested, unattended: mission 1 to f3943, mission 2 to f8900, mission 3 to f9636 (its input back at f1985), each on the last build with
+  no crash and nothing reported as unported; missions 4 and 5 to about f8500 on the build before the last, where mission 4 reported
+  `TEAM_OUTSIDE_AREA_ENTIRELY` (added since, not re-run). Not played to the end: no mission's objectives or ending past those frames, the named
+  timer's look, camera follow, `NAMED_SELECTED`, the VICTORY word after its 100-frame wait. The user is testing them.
+- [ ] Next: the China campaign, the shell map (M8c).
+
+## In progress (C1: the campaigns - the Generals' Challenge, 2026-11-01)
+The user's word: lastly, the Challenge; the user plays it by hand. Campaign menu -> Generals' Challenge: nine generals (ChallengeMode.ini), each with its campaign's seven or eight opponents, any of which can be started (as the campaigns' missions can).
+- [x] The game: `FGenMatchSettings::ChallengeFaction` (the general's template), `SetupChallengePlayer`: the map's sides stay, "player0" comes after them with a start position and starting objects; "ThePlayer" is an empty dummy whose enemies become the local player's; scripts' `ThePlayer` / `teamThePlayer` mean the local player's (`bThePlayerIsLocal`); skirmish victory rules off, the scripts decide.
+- [x] Scripts: PLAYER_EXCESS_POWER_COMPARE_VALUE, PLAYER_HAS_N_OR_FEWER_FACTION_BUILDINGS, SKIRMISH_PLAYER_FACTION, SKIRMISH_PLAYER_HAS_COMPARISON_GARRISONED, SUPPLY_SOURCE_SAFE, MULTIPLAYER_ALLIED_DEFEAT (false in single player, as the original), AI_PLAYER_BUILD_SUPPLY_CENTER, TEAM_GUARD_SUPPLY_CENTER, SKIRMISH_MOVE_TO / FOLLOW_APPROACH_PATH, PLAYER_PURCHASE_SCIENCE, CAMERA_MOD_FREEZE_ANGLE, LOCALDEFEAT.
+- [x] Shell: `DrawChallengeMenu`, `DrawChallengeLoading` (bio pictures stand in for the portrait movies, and only from the menu: a next mission loads with no versus screen), `DrawChallengeResult` (opponent's picture, line and sound), Score.Next to the next general, Score.Retry after a defeat.
+- Simplified: no taunt on hover, preview or name sounds; no map-of-the-world general picker; no medals or saved progress; TEAM_GUARD_SUPPLY_CENTER doesn't look for an attacked warehouse first.
+- Tested, unattended, general Fai (CHALLENGE_7, all eight maps): no crash, no unported item, input back at f1093, f601, f361, f991, f1413, f751, f751, f2281; past f16000, but the boss map's DEFEAT at f9908 with nobody defending. From the menu, Kwai: a forced win shows the panel and CONTINUE starts mission 2. Not seen: a real win or loss, the versus screen, the approach path and supply center actions firing.
+
+## In progress (C1: the campaigns - China missions 1 to 5, 2026-11-01)
+The user's word: China next; the user plays them by hand. All five are on `IsMissionPorted`, so the three campaigns are all in.
+- [x] Scripts: NAMED_BUILDING_IS_EMPTY, UNIT_EMPTIED, TEAM_ALL_HAS_OBJECT_STATUS, PLAYER_ACQUIRED_SCIENCE, PLAYER_COMPLETED_SPECIAL_POWER
+      (SpecialPowerCompletionDie: `FGenThingTemplate::SpecialPowerCompletion`, on any death of such an object, whoever made it), NAMED_SET_BOOBYTRAPPED,
+      SET_ATTACK_PRIORITY_KIND_OF, TEAM_GUARD_OBJECT, TEAM_ALL_USE_COMMANDBUTTON_ON_NEAREST_OBJECTTYPE (no check of the button's own target rules),
+      TECHTREE_MODIFY_BUILDABILITY_OBJECT (`GetBuildable`, used by `CanMake` and the control bar). Script buttons: DOZER_CONSTRUCT, and a battle plan by the button's option.
+- Tested, unattended, with nobody playing: no crash and no unported condition, action or button. Input comes back at f1774, f2017, f1261, f1084, f1654.
+  Missions 1, 2, 3, 5 run past f14000; mission 4 ends in DEFEAT at f7314 when the GLA reach the escape area past the undefended player.
+  Not seen: any objective or victory, nor these firing: TEAM_GUARD_OBJECT, the nearest-type button, a battle plan, a Scud Storm or carpet bomb finishing.
+
+## In progress (C1: the campaigns - GLA missions 1 to 5, 2026-11-01)
+The user's word: port the GLA missions; the user plays them by hand. All five are on `IsMissionPorted`.
+- [x] Scripts: every condition and action of MD_GLA01-05 (the rest of the list in `GenScriptTypes.h`). New behind them: paths finished
+      (`UpdateCompletedRoutes`), `AddToContain` remembers who came in, team/unit attitude (`ScriptAttitude`: passive doesn't look, alert and
+      aggressive go after what they see, and their MOVE_TEAM_TO is an attack move), named counters, custom colours, topple directions, camera
+      along a waypoint path and final look, script camera shakes, a water level over time with the pathfinder following (`RefreshWater`).
+- [x] Two engine fixes that all missions get: scripts with a delay start at a random offset (`checkConditionsForTeamNames`; without it GLA
+      mission 4 won itself on the first frames), and an empty OR block counts for nothing. Reinforcement teams now run their on-create script.
+- Simplified: a move doesn't become an attack move on a waypoint path; `TEAM_WANDER` follows the path, not wide of it; the particle cannon
+  at the end of mission 3 fires at the nearest waypoint and doesn't sweep along the path; `NAMED_SET_REPULSOR` does nothing; a script shake's
+  duration is ignored; the build facility test is "a command center or a structure that builds units"; `NAMED_FACE_WAYPOINT` turns at once.
+- Tested, unattended, with nobody playing, on the last build: all five run past f15000 with no crash and no unported condition, action or button.
+  Input comes back at f1345, f2795, f1751, f1113, f855. Missions 2 and 5 end in DEFEAT when the undefended player is wiped out (f14672, f6880).
+  Not seen: any objective or victory, mission 4's reservoir draining, any look (colours, camera path, counter), since nobody plays in these runs.
+
+## Done (the user's choice of 2026-10-31: the animations, play rules and looks still missing)
+Asked for after a survey of what wasn't ported (multiplayer, campaign and the menus left out). Several older "not done" lines
+above are stale: PRISTINE_BONE_POS_IN_FINAL_FRAME, hangar doors (`FGenParkingPlace::UpdateDoors`), the sonar ping and the options
+menu were all in the source already. Bridge repair is no gap: `no_BRIDGE_TOWERS`, bridges can't be destroyed in ZH skirmish.
+- [x] Animations: the flag raised while capturing takes the 20 s (`setAnimationCompletionTime`, also packing / unpacking for
+      abilities); a disguise fades out, swaps and fades in for everybody (`GetDisguiseOpacity`).
+- [x] Weapon rules: LeechRangeWeapon, AutoReloadWhenIdle, ProjectileCollidesWith (`FindProjectileCollision`: `[collide f..]`; a shot
+      runs into structures, walls, shrubbery and enemies as its mask says, for the shells and the missiles, and then its blast is
+      positional); shock waves (`ApplyShockWave`, `bStunned`: `[shock f..]`, what isn't stuck to the ground flies, tumbles and comes
+      down, upside down or on what it can't stand on it dies); HistoricBonus (`CheckHistoricBonus`: `[historic f..]`).
+- [x] Firestorms (Logic/GenFirestorm.cpp, FirestormDynamicGeometryInfoUpdate: `[firestorm f..]`), the bunker buster's upgrade
+      (occupants thrown out, shock wave), the Nuke Cannon's neutron shell (NeutronBlastBehavior: soldiers and drivers), the toxic
+      factories' FireWeaponWhenDamagedBehavior.
+- [x] Computer players' attack priority sets (SET_ATTACK_PRIORITY_THING, TEAM_APPLY_ATTACK_PRIORITY_SET, `FindEnemyByPriority`,
+      the capture and ability hunts too): they were no-ops, every computer team went for the nearest thing.
+- [x] Looks: a model's second texture (stage 1, 317 meshes: `DetailMode`) and an additive second pass (3,213 meshes: lights at
+      night) on a second set of coordinates; the GRID mapper (ScrollMode 5); falling snow (Weather.ini + map.ini, `gen.Snow`,
+      `gen.SnowMax`, five skirmish maps) and the SNOW model states of maps whose weather is snowy; heat haze (M_Smudge: SMUD*
+      particles); units behind a building in their owner's colour (M_Occluded + custom depth: `UpdateOccludedMark` marks only what a
+      line to the camera finds a structure in, `r.CustomDepth=3`); heat vision after the original's pass (fades 0.8 a frame after
+      each look of a detector); the detector's IRGrid particles.
+- Different from the original on purpose: a detected enemy's model isn't dropped altogether between the flashes of heat vision (at
+  25% it stays in sight; the original's additive-only pass all but vanishes). The haze is a time-driven shimmer, not the original's
+  random pushed middle. Terrain heave of the bunker buster (`DO_SEISMIC_SIMULATIONS`) not ported.
+- Tested: four Inferno Cannons at a power plant light a firestorm (f203-f227); a Crusader's and a Battlemaster's shells at each other
+  burst on a pub between them; a MOAB throws the wrecks, a sneak attack's thumps throw a tank and a truck alive (down again 40 frames
+  later); a neutron shell takes an Overlord's driver; a bunker buster's shock wave goes off; a Pathfinder lights a Sentry Drone
+  orange; Bitter Winter snows; a Crusader behind a pub shows blue through its roof. A replay of 8-player Twilight Flame against hard
+  computer players, 41,152 frames: every frame the same. Not seen working: a bunker buster on a real garrison (the test's soldiers
+  never got in), the second texture and the night lights up close, the haze's shimmer (a still shows nothing), a computer team's
+  choice of target by its set, the flag and the disguise's fade in motion.
+- Game data note: the game finds its install by the registry (or `GamePaths.txt`): the Steam copy on E:, patched to 1.04. The tools
+  (`gen_vfs.py`) now read that too; the old copy on D: differs in 37 INI files (InfernoCannonGun's HistoricBonusCount is 3 on Steam, 6
+  there). Base Generals still comes from D:, the same as Steam's ZH_Generals but for one copy-protection file.
+- Stats checked against that data (2026-10-31): run with `-Extra "-GenDumpStats=<file>"`, then `Tools\compare_stats.py <file>` reads
+  the INI again by itself: 363 weapons, 53 armors, 182 locomotors, 2,114 objects (health, armor and weapon sets, cost, build time,
+  vision, power, crushing, experience; weapons' damage, radii, range, delays, clips, types, bonuses): 41,326 values, no difference.
+  `Tools\compare_modules.py <file>` takes the rest: upgrades, sciences, ranks, powers (1,109 values; only the carpet bomb's house rule
+  differs: `ReloadMsOverride`, 2:30 where the data says 4:00, kept), every line read of every INI file including the merged objects'
+  modules (375,612 lines, none differ), the unit conversions against the original's field tables, and the keys no code names.
+  What that turned up, fixed: subdual damage (SUBDUAL_*: the microwave tank knocks out instead of killing, `IsSubdued`, `[subdue f..]`,
+  SubdualDamageCap / HealRate / HealAmount); RefundValue on selling; shells no longer home in (only FlightPathAdjustDistPerSecond
+  follows a victim; a shell that ends its flight where the victim was is a blast there); ScaleWeaponSpeed / MinWeaponSpeed;
+  FireWeaponUpdate's ExclusiveWeaponDelay; MoodAttackCheckRate (idle units looked round every half second, the original's default
+  is two). Tested: a microwave tank has a 1500-health power plant out at f139 with no damage done; a supply center sells for its 400;
+  an 8-player replay of 41,473 frames: every frame the same. Not seen: a shell actually missing a moving target (the test's Humvee was hit).
+  Generals' Challenge or campaign only, still unread: GrantTemporaryStealth, dam waves, ferry, flight deck.
+- [x] Settings that affect play: ECM missile jamming (`ProjectileNowJammed`, `[jam f..]`: 12 of 12 buggy rockets off, no hits; 8 of 8
+      hit without the tank); nobody leaves a subdued transport (`CommandExit`); spy power's bonus per captured (no shipped owner
+      holds anybody, so its time stays 30 s, as in the original).
+- [x] Settings that affect the looks: death flings (`[fling f..]`, EXPLODED_FLAILING then BOUNCING, the death's clocks wait for the
+      landing); turrets' idle scan (`[scan f..]`, the ECM tank's); rods out over RodsExtendTime (`[rods f..]`, `ExtendRods`); parachute
+      sway on the locomotor's spring (`[chute f..]`); overkill in the death's weight (`SlowDeathWeight`: only the 3 Demo_ vehicles
+      have deaths that compete, and 20% of the overkill rounds to 0 below 500%, so it is hardly ever felt, as in the original).
+- [x] More settings: a second AutoHealBehavior (`MoreAutoHeals`: the ambulance healed vehicles only, now infantry too, not itself:
+      SkipSelfForHealing); RemovesUpgrades (the worker's real / fake buttons go back and forth; `RemoveObjectUpgrade` resets modules
+      even when the upgrade is gone already); WeaponBonusPassedToPassengers; TurretFireAngleSweep and its speed (`[sweep f..]`, Dragon,
+      toxin truck, ambulance); FiresWhileTurning (turret sound only); RevealDistanceFromTarget (bomb truck; also a reveal no longer
+      restarts its own fade); MissileCallsOnDie (`Kill(DETONATED)` in `DetonateMissile`); ShareWeaponReloadTime;
+      WeaponLockSharedAcrossSets (other sets now release a lock); PlayFXWhenStealthed, and mines always show theirs.
+      DestroyRidersWhoAreNotFreeToExit: read, but its 7 users are delivery planes, whose cargo is a count here, not objects.
+      Not ported: the amphibious terrain half of `isSpecificRiderFreeToExit`. Not yet looked at: the rest of the scan's list, such
+      as EnterGuard / HijackGuard, SupplyWarehouseCrippling, EMPUpdate.DoesNotAffect, tank recoil, track marks (may be false alarms).
+
+## Done (the user's test notes of 2026-11-01/02: missions 1 to 4, then the second list)
+Two rounds of `notes.txt` from the user's own play. What was wrong and where it is now:
+
+- **Units stuck on parked units.** `FindPath` ignored parked units, so paths ran through a row of tanks; units only
+  looked for a way round after bumping into something, and soldiers often never did: a soldier capped to speed 0 by the
+  soldier ahead (who had stopped too) skipped steering that frame, then swerved the next, and rocked on the spot.
+  Now: `StartPath` looks along the plain path (`WorstParkedOnPath`); if somebody is parked in the way it searches round
+  them (`FindPathAroundUnits`, which only closes the cells of those `IsObstacleKind` says are in this unit's way). Idle
+  allies that can make way only get a detour up to 3x / +40 cells, then they are asked to move; what can't move (a vehicle
+  for a soldier, a unit fighting, an enemy) gets any detour; with none at all the path goes through and even a soldier may
+  ask a tank to move (`bPathThroughParked`, the original's `getBlockedByAlly`). Steering keeps to a way round for
+  `SteerHold` frames. Soldiers don't queue behind a stopped soldier; "soft" obstacles aren't soft for soldiers (the push
+  would throw them back); a group's members stop counting as parked when the order goes out. Getting nowhere for a second
+  means a new path, three seconds means going through (soldiers always; vehicles not through an enemy), and getting
+  nowhere within 4 cells of the goal counts as arrived. Tested: six movement scenes in `move_scenes.sh` style (a row, a
+  goal among tanks, a parking lot, vehicles and soldiers), no give-ups; AI skirmish replay of 26,647 frames, every frame the same.
+- **Sliding soldiers.** The move animation stopped a quarter second after "blocked" even for a soldier walking at the
+  pace of the one ahead. It now goes with really moving, and a soldier the collision pass pushes walks.
+- **Muzzle flash frozen on tanks:** `USceneComponent::IsVisible()` is false when hidden in game, so the check that hid
+  flashes again never fired; `GetVisibleFlag()`. `-GenFlashTrace` is a true detector now.
+- **Battleships, carrier:** two turrets (`TurretArtAngle`, linked turrets), runways as FlightDeckBehavior has them (both
+  runways launch and land at once, replacements, no 360 on take-off), all jets parked when input returns. A deck can't
+  move, so group orders skipped it: Guard and attack-move now reach it (`OrderStandingDecks`).
+- **Script / map fixes:** map object properties (selectable, enabled, powered, targetable, aggressiveness, vision...) in
+  `OnMapObjectCreated`; on-create scripts of AI teams; capture sells a base only for skirmish AI; a power's InitiateSound
+  only on the human's own click; `ENABLE_OBJECT_SOUND` re-triggers, customized sounds are events of their own (`" name id"`);
+  fog (`M_Shroud`) leaves the sky alone (`SkyDistance`). Sound events in 10 of the 15 missions depend on this.
+- **Veterans heal when idle** (`VeterancyAutoHeal`, from Default\Object.ini), garrison attack cursor and focus fire,
+  dozers remove booby traps from derricks, detected demo traps draw solid, charge icons.
+- **Status icons and pips** (Drawable::drawIconUI): wrench, cross, lightning, rank, ammo and container pips. The wrench and
+  cross are sized by the screen (about 40 and 27 pixels on 1440 lines - the original's sizes were too big, the user's word),
+  and each image fades into the next for smooth motion. Mouse cursors: x1.5 at 1200-2000 lines, x2 above, resampled and faded
+  between frames (`gen.CursorScale` is a float).
+- **Selection and orders:** a cast gunship stays selected (own things are never dropped for being in the fog); a drag box
+  leaves out DOZER, HARVESTER and IGNORES_SELECT_ALL when it holds fighters; X scatters (AIGroup::groupScatter, a new order
+  `Scatter`); an object upgrade goes to everybody selected that can have it; no selecting, no mouse in a letterboxed scene.
+- **Comanche rockets:** FIRE_WEAPON buttons show the clip reload. **Repair:** mended vehicles go on to the rally point (AIDockMoveToRallyState).
+  **Promotions:** the menu hides a mission's "Hidden" sciences and greys its "Disabled" ones. **Tunnels:** one rider's exit
+  comes out of the tunnel the button was pressed at.
+- **Restart did nothing:** `UEngine::LoadMap` draws the old world once more while it loads, the same click counted again and
+  queued a second reload, which found the restart's details used up and ended on the menu. `bReloading` guards it (also next mission, exit).
+- **Technical and every second model:** `AttachToBoneInAnotherModule` wasn't there (the gunner stood in the middle of the
+  truck), and turrets, flashes, recoil, fire bones and launch bones were only looked for in the first draw module. All modules
+  now (also Combat Cycle, Strategy Center gun, Paladin laser, PT boat). `TURRET_ROTATE` is set.
+- **Stinger Site:** its soldiers were `bImmobile`, so they never turned to aim and missiles left backwards and looped round.
+  **Overlord gatling (add-ons):** fire FX start from the bone the add-on stands on. **Microwave Tank's black voids:** a
+  `UGenQuadBatchComponent` proxy keeps the material relevance of when it was made; a material reading SceneColor added later
+  got `SystemTextures.Black`. It remakes the proxy when the relevance changes. Heat patches boil each on its own phase.
+- **Toxin Tractor:** not reproduced; it attacks buildings (cursor, spray, 0.1 damage a hit: POISON 1%). Walls and Fire Bases are 0%.
+- **Engine messages and keys:** `GAreScreenMessagesEnabled` off, `bEnableOnScreenDebugMessages=False`,
+  `r.RayTracing.ShowOnScreenWarnings=0`, the Sun has `ForwardShadingPriority` 1, `!DebugExecBindings=ClearArray` removes F1-F5, F9 etc.
+- **Save and load (new).** `FGenSavedGame` (`Saved/SaveGames/Generals/*.gensave`): the recording so far, the frame, camera,
+  selection, groups. Loading starts the match and plays it back flat out (`BeginResume`, in `CatchUp`) behind a loading screen, then
+  the game is the player's again and the recording goes on. Menus: in-game Save / Load, main menu Load Game (`GenShellSave.cpp`).
+  Exact by construction: saved at f3501, loaded in a new run, 4,200 frames compared, 0 different. 3,500 frames load in 4.6 s
+  (about 760 frames a second early on; a long game takes minutes). A save belongs to its build: another build warns and may diverge.
+
+Open: the user's HUD note ("the experience bar with the star above it in the right part of the HUD,") and the note "After repair, the
+unit should return to the building's" were cut off (the second is taken as the rally point, as the original has it).
+Not done (the user dropped it 2026-11-02): looking through every mission's intro sheets. Not re-run on the final build: all missions, USA03 / USA04 / GLA05 cargo planes, whether USA04's AI teams leave the base.
 
 ## Next
 (Performance: no profiling between milestones - one review at the very end, the user's word of

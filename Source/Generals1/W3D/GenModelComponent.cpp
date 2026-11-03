@@ -352,6 +352,14 @@ void UGenModelComponent::BuildParts()
 		// (A model put on while the object is stealthed starts out with the look the old one had.)
 		Sub.Component->SetCustomPrimitiveDataFloat(0, StealthFade);
 		Sub.Component->SetCustomPrimitiveDataFloat(1, StealthGlow);
+		if (Sub.Component->bRenderCustomDepth != (OccludedMark != 0))
+		{
+			Sub.Component->SetRenderCustomDepth(OccludedMark != 0);
+		}
+		if (OccludedMark != 0)
+		{
+			Sub.Component->SetCustomDepthStencilValue(OccludedMark);
+		}
 		Sub.Component->SetCustomPrimitiveDataVector4(2, FVector4(ObjectTint.R, ObjectTint.G, ObjectTint.B, 0.f));
 		if (SwayType != 0)
 		{
@@ -568,6 +576,23 @@ void UGenModelComponent::SetStealthLook(float FadeOut, float Glow)
 		{
 			C->SetCustomPrimitiveDataFloat(0, StealthFade);
 			C->SetCustomPrimitiveDataFloat(1, StealthGlow);
+		}
+	}
+}
+
+void UGenModelComponent::SetOccludedMark(int32 Mark)
+{
+	if (Mark == OccludedMark)
+	{
+		return;
+	}
+	OccludedMark = Mark;
+	for (UMeshComponent* C : MeshComponents)
+	{
+		if (C)
+		{
+			C->SetCustomDepthStencilValue(Mark);
+			C->SetRenderCustomDepth(Mark != 0);
 		}
 	}
 }
@@ -875,6 +900,24 @@ void UGenModelComponent::SetAnimDuration(float Seconds)
 	{
 		// (a multiplier of the animation's own rate, as the original sets one)
 		AnimSpeed = float(Animation->NumFrames) / Animation->FrameRate / Seconds;
+	}
+}
+
+void UGenModelComponent::GetShownSubObjectsLike(const TCHAR* Part, TArray<FString>& Out) const
+{
+	for (const FSubObject& Sub : SubObjects)
+	{
+		if (Sub.Component && Sub.Component->GetVisibleFlag() && Sub.Name.Contains(Part))
+		{
+			Out.Add(Sub.Name);
+		}
+	}
+	for (const FGenModelPlan::FPart& Part2 : MergedMembers)
+	{
+		if (Part2.Name.Contains(Part))
+		{
+			Out.Add(Part2.Name + TEXT(" (merged)"));
+		}
 	}
 }
 
@@ -1261,7 +1304,9 @@ void UGenModelComponent::ApplyPose()
 			Sub.Component->SetRelativeTransform(ToUETransform(PoseW3D[Sub.Bone]));
 		}
 		const bool bShouldShow = !Sub.bHiddenByDefault && !Sub.bForcedHidden && (Sub.bModelSpace || !PivotVisible.IsValidIndex(Sub.Bone) || PivotVisible[Sub.Bone]);
-		if (Sub.Component->IsVisible() != bShouldShow)
+		// (The flag itself: IsVisible says no for anything hidden in game. A model set up in the fog, or in a transport,
+		// kept what it had to hide - a muzzle flash - showing for when it came out, until its turret next moved.)
+		if (Sub.Component->GetVisibleFlag() != bShouldShow)
 		{
 			Sub.Component->SetVisibility(bShouldShow);
 		}

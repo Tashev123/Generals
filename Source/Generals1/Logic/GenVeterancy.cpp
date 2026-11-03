@@ -145,7 +145,7 @@ bool UGenGameLogic::HasPlayerBeenDefeated(int32 Player) const
 void UGenGameLogic::UpdateVictory()
 {
 	GEN_PERF_SCOPE("Victory");
-	if (Frame < 2 || Frame % 15 != 0)
+	if (Frame < 2 || Frame % 15 != 0 || IsChallenge()) // (VictoryConditions::update: "single player isn't multiplayer", the map's scripts decide)
 	{
 		return;
 	}

@@ -5,6 +5,7 @@
 #include "Logic/GenGameLogic.h"
 #include "Logic/GenGameData.h"
 #include "Logic/GenObject.h"
+#include "Core/GenCoords.h"
 #include "Audio/GenAudioManager.h"
 #include "Audio/GenAudioData.h"
 #include "W3D/GenAssets.h"
@@ -97,6 +98,11 @@ bool FGenParkingPlace::IsGone(FGenObjectID Id) const
 	return !O || O->IsDead() || O->IsDestroyed();
 }
 
+float FGenParkingPlace::GetLandingDeckHeightOffset() const
+{
+	return Airfield.GetTemplate()->ParkingDeckHeightOffset;
+}
+
 void FGenParkingPlace::BuildInfo()
 {
 	// The spaces and runways are bones of the airfield's model; found once the building stands.
@@ -133,24 +139,79 @@ void FGenParkingPlace::BuildInfo()
 	};
 
 	Spaces.Reset(T->ParkingRows * T->ParkingCols);
-	for (int32 Row = 0; Row < T->ParkingRows; ++Row)
+	if (T->bFlightDeck)
 	{
-		for (int32 Col = 0; Col < T->ParkingCols; ++Col)
+		// A flight deck takes its spaces from the bones the INI names, walked in the order it lists them
+		// (runway 1 space 1, runway 2 space 1, runway 1 space 2...). The game puts an aircraft on every
+		// space as the deck is built: those are objects, not part of the ship's model, which is why a
+		// carrier in the game has fighters standing on it. Parking here means standing on the deck, so the
+		// deck's height is what counts as the ground under them.
+		const FGenThingTemplate* Payload = T->FlightPayloadTemplate.IsEmpty() ? nullptr
+			: FGenGameData::Get().FindTemplate(T->FlightPayloadTemplate);
+		for (int32 Row = 0; Row < T->ParkingRows; ++Row)
 		{
-			FSpace& S = Spaces.AddDefaulted_GetRef();
-			Bone(FString::Printf(TEXT("Runway%dPark%dHan"), Col + 1, Row + 1), S.HangarStart, &S.HangarOrient);
-			Bone(FString::Printf(TEXT("Runway%dParking%d"), Col + 1, Row + 1), S.Location, &S.Orient);
-			Bone(FString::Printf(TEXT("Runway%dPrep%d"), Col + 1, Row + 1), S.Prep, nullptr);
-			S.Runway = Col;
+			for (int32 Col = 0; Col < T->ParkingCols; ++Col)
+			{
+				FSpace& S = Spaces.AddDefaulted_GetRef();
+				S.Runway = Col;
+				S.Row = Row;
+				if (T->FlightRunways.IsValidIndex(Col) && T->FlightRunways[Col].SpaceBones.IsValidIndex(Row))
+				{
+					Bone(T->FlightRunways[Col].SpaceBones[Row], S.Location, &S.Orient);
+				}
+				// On a deck the space is the prep: the game puts the aircraft at the bone and measures
+				// whether it stands at the front of its runway from that same point.
+				S.Prep = S.Location;
+				if (!Payload)
+				{
+					continue;
+				}
+				FGenObject* Jet = Logic->CreateObject(Payload, Airfield.GetOwner(), S.Location, S.Orient);
+				if (!Jet)
+				{
+					continue;
+				}
+				Jet->Producer = Airfield.GetID();             // FlightDeckBehavior::buildInfo: setProducer(the ship)
+				Jet->bStatusDeckHeightOffset = true;          // ... and the deck height offset
+				S.Occupant = Jet->GetID();                   // ... and the plane is assigned to its space
+			}
 		}
 	}
-	if (T->bParkingHasRunways)
+	else
+	{
+		for (int32 Row = 0; Row < T->ParkingRows; ++Row)
+		{
+			for (int32 Col = 0; Col < T->ParkingCols; ++Col)
+			{
+				FSpace& S = Spaces.AddDefaulted_GetRef();
+				Bone(FString::Printf(TEXT("Runway%dPark%dHan"), Col + 1, Row + 1), S.HangarStart, &S.HangarOrient);
+				Bone(FString::Printf(TEXT("Runway%dParking%d"), Col + 1, Row + 1), S.Location, &S.Orient);
+				Bone(FString::Printf(TEXT("Runway%dPrep%d"), Col + 1, Row + 1), S.Prep, nullptr);
+				S.Runway = Col;
+			}
+		}
+	}
+	if (T->bFlightDeck || T->bParkingHasRunways)
 	{
 		for (int32 Col = 0; Col < T->ParkingCols; ++Col)
 		{
+			const FGenThingTemplate::FFlightDeckRunway* RW = T->bFlightDeck ? &T->FlightRunways[Col] : nullptr;
 			FRunway& R = Runways.AddDefaulted_GetRef();
-			Bone(FString::Printf(TEXT("RunwayStart%d"), Col + 1), R.Start, nullptr);
-			Bone(FString::Printf(TEXT("RunwayEnd%d"), Col + 1), R.End, nullptr);
+			Bone(RW && !RW->TakeoffStart.IsEmpty() ? RW->TakeoffStart : FString::Printf(TEXT("RunwayStart%d"), Col + 1), R.Start, nullptr);
+			Bone(RW && !RW->TakeoffEnd.IsEmpty() ? RW->TakeoffEnd : FString::Printf(TEXT("RunwayEnd%d"), Col + 1), R.End, nullptr);
+			if (RW)
+			{
+				Bone(RW->LandingStart, R.LandingStart, nullptr);
+				Bone(RW->LandingEnd, R.LandingEnd, nullptr);
+				for (const FString& Name : RW->TaxiBones)
+				{
+					Bone(Name, R.Taxi.AddDefaulted_GetRef(), nullptr);
+				}
+				for (int32 i = 0; i < RW->CreationBones.Num(); ++i)
+				{
+					Bone(RW->CreationBones[i], R.Creation.AddDefaulted_GetRef(), i == 0 ? &R.StartOrient : nullptr);
+				}
+			}
 		}
 	}
 	bHasHeliPark = Bone(TEXT("HeliPark01"), HeliPark, &HeliParkOrient);
@@ -175,6 +236,10 @@ void FGenParkingPlace::PurgeDead()
 			R.InUseBy = GenInvalidObjectID;
 			R.bWasInLine = false;
 		}
+		if (R.InUseForLanding != GenInvalidObjectID && IsGone(R.InUseForLanding))
+		{
+			R.InUseForLanding = GenInvalidObjectID;
+		}
 		if (R.NextInLineForTakeoff != GenInvalidObjectID && IsGone(R.NextInLineForTakeoff))
 		{
 			R.NextInLineForTakeoff = GenInvalidObjectID;
@@ -185,6 +250,13 @@ void FGenParkingPlace::PurgeDead()
 
 void FGenParkingPlace::UpdateDoors(uint32 Frame)
 {
+	// A ship's deck has one door: the one its production goes through (the game's DOOR_1, the dock
+	// animation). DOOR_2 and DOOR_3 are its ramps, and an airfield's per-space hangar doors do not exist
+	// on a ship, so nothing here is a hangar door.
+	if (IsFlightDeck())
+	{
+		return;
+	}
 	// ProductionUpdate::setHoldDoorOpen: the hangar door of a space stays open for as long as an aircraft
 	// holds that space (parked there or out flying), and closes when the space is given up.
 	const FGenThingTemplate* T = Airfield.GetTemplate();
@@ -211,10 +283,487 @@ void FGenParkingPlace::UpdateDoors(uint32 Frame)
 	}
 }
 
+// ---- a ship's flight deck: the order it keeps, and the aircraft it sends -------------------------
+
+bool FGenParkingPlace::IsFlightDeck() const
+{
+	return Airfield.GetTemplate()->bFlightDeck;
+}
+
+FGenObjectID FGenParkingPlace::GetAirfieldID() const
+{
+	return Airfield.GetID();
+}
+
+bool FGenParkingPlace::OrderDeck(EGenCommandType Type, const FVector3f& Pos, FGenObjectID Target, int32 Slot)
+{
+	if (!IsFlightDeck())
+	{
+		return false;
+	}
+	// FlightDeckBehavior::aiDoCommand keeps only the orders its aircraft can act on: hold a spot, attack a
+	// thing, attack a place, attack-move to a place, or do nothing. Anything else takes the order off the
+	// deck. The player's own way of pointing the ship at something is its bar button
+	// Command_AircraftCarrierFire, whose weapon (AircraftCarrierOrderLaunch) has no projectile and 0.00001
+	// damage - it is there to pick a target - so what it picks is taken as the deck's attack order, which is
+	// what that button is for. The port has no separate order to do nothing, so the player's stop stands for
+	// the game's AICMD_IDLE: the aircraft that were out are sent back.
+	switch (Type)
+	{
+	case EGenCommandType::Guard:
+	case EGenCommandType::AttackMove:
+	case EGenCommandType::Attack:
+	case EGenCommandType::ForceAttack:
+	case EGenCommandType::FireWeapon:
+	case EGenCommandType::FireWeaponAt:
+	case EGenCommandType::Stop:
+		DeckOrder = Type;
+		DeckPos = Pos;
+		DeckTarget = Target;
+		DeckSlot = Slot;
+		DeckOrderIsPosition = Target == GenInvalidObjectID;
+		break;
+	default:
+		DeckOrder = EGenCommandType::None;
+		DeckPos = FVector3f::ZeroVector;
+		DeckTarget = GenInvalidObjectID;
+		DeckOrderIsPosition = false;
+		break;
+	}
+	PropagateOrdersToPlanes();
+	return true;
+}
+
+bool FGenParkingPlace::HasTakeoffOrders()
+{
+	switch (DeckOrder)
+	{
+	case EGenCommandType::Guard:
+	case EGenCommandType::AttackMove:
+		return true;
+	case EGenCommandType::Attack:
+	case EGenCommandType::ForceAttack:
+	case EGenCommandType::FireWeapon:
+	case EGenCommandType::FireWeaponAt:
+		// A place is always there; a thing may not be, and then the order is dropped.
+		if (DeckOrderIsPosition || Logic->FindObject(DeckTarget))
+		{
+			return true;
+		}
+		DeckOrder = EGenCommandType::None;
+		DeckTarget = GenInvalidObjectID;
+		return false;
+	default:
+		return false; // ordered to do nothing: the deck keeps its aircraft where they are
+	}
+}
+
+// Whether an aircraft is standing in its own space, or on the way into it - that is the aircraft the deck
+// launches or moves up. One that is out flying something is not. (JetAIUpdate's isIdle and
+// isTaxiingToParking; the game's isIdle is false while an order is held for after takeoff.)
+bool FGenParkingPlace::IsPlaneStandingInItsSpace(const FGenObject& Jet) const
+{
+	switch (Jet.GetJetState())
+	{
+	case EGenJetState::TaxiFromHangar:
+	case EGenJetState::TaxiFromLanding:
+	case EGenJetState::OrientForParking:
+	case EGenJetState::ReloadAmmo:
+	case EGenJetState::TakeoffAwaitClearance:
+	case EGenJetState::TaxiToTakeoff:
+	case EGenJetState::PauseBeforeTakeoff:
+	case EGenJetState::TakingOff:
+		return true;
+	default:
+		break;
+	}
+	return !Jet.bJetPendingCommand && Jet.GetJetState() == EGenJetState::None && Jet.IsAIIdle();
+}
+
+// isAbleToGiveUpParkingSpace: an aircraft that is out, or gone, can hand its space to another one.
+bool FGenParkingPlace::CanPlaneGiveUpSpace(FGenObject* Jet)
+{
+	if (!Jet || Jet->IsAirborneTarget())
+	{
+		return true;
+	}
+	if (IsPlaneStandingInItsSpace(*Jet))
+	{
+		return false; // this is the aircraft the deck works with
+	}
+	// It is here for something else. If the order it is holding is to come back to the ship, or the deck's
+	// order is to do nothing, that order is dropped and the plane stays where it stands.
+	if ((Jet->bJetPendingCommand && Jet->JetLastCommand.Type == FGenObject::FJetCommand::Land) || DeckOrder == EGenCommandType::Stop)
+	{
+		Jet->bJetPendingCommand = false; // friend_purgePendingCommand
+		return false;
+	}
+	// It must not be waiting for its runway either.
+	for (const FRunway& R : Runways)
+	{
+		if (R.InUseBy == Jet->GetID())
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+// isAbleToMoveForward: an aircraft that stands still, or rearms where it stands, can be moved up.
+bool FGenParkingPlace::CanPlaneMoveForward(const FGenObject& Jet) const
+{
+	if (Jet.IsAirborneTarget())
+	{
+		return false;
+	}
+	return Jet.GetJetState() == EGenJetState::ReloadAmmo
+		|| (Jet.GetJetState() == EGenJetState::None && !Jet.bJetPendingCommand && Jet.IsAIIdle());
+}
+
+// isInPositionToTakeoff: only the aircraft at the start of a runway can be sent, and only when it is
+// standing there ("distanceSqr < 10.0f", on the ground plane).
+bool FGenParkingPlace::IsPlaneAtTakeoffPosition(const FGenObject& Jet) const
+{
+	const FSpace* S = Spaces.FindByPredicate([&Jet](const FSpace& Other) { return Other.Occupant == Jet.GetID(); });
+	if (!S || S->Row != 0)
+	{
+		return false;
+	}
+	const FVector2f A(Jet.GetPosition().X, Jet.GetPosition().Y);
+	const FVector2f B(S->Prep.X, S->Prep.Y);
+	return (A - B).SizeSquared() < 10.f;
+}
+
+// propagateOrderToSpecificPlane: the deck's order, given to one aircraft as an AI order.
+void FGenParkingPlace::PropagateOrderToPlane(FGenObject* Jet)
+{
+	if (!Jet)
+	{
+		return;
+	}
+	switch (DeckOrder)
+	{
+	case EGenCommandType::Guard:
+		Jet->CommandGuardPosition(FVector2f(DeckPos.X, DeckPos.Y), EGenGuardMode::Normal);
+		break;
+	case EGenCommandType::AttackMove:
+		Jet->CommandAttackMove(DeckPos);
+		break;
+	case EGenCommandType::Attack:
+	case EGenCommandType::ForceAttack:
+	case EGenCommandType::FireWeapon:
+	case EGenCommandType::FireWeaponAt:
+		if (DeckOrderIsPosition)
+		{
+			Jet->CommandAttackPosition(DeckPos, -1, DeckSlot); // NO_MAX_SHOTS_LIMIT
+		}
+		else if (Logic->FindObject(DeckTarget))
+		{
+			Jet->CommandAttack(DeckTarget, true); // aiForceAttackObject
+		}
+		break;
+	case EGenCommandType::Stop:
+		Jet->CommandLandAt(Airfield.GetID()); // aiEnter(the ship): back on the deck
+		break;
+	default:
+		break;
+	}
+}
+
+// The order goes to the aircraft that are already out; the ones standing on the deck are sent one at a time,
+// when that deck's ramp is up (LaunchPlanes).
+void FGenParkingPlace::PropagateOrdersToPlanes()
+{
+	for (const FSpace& S : Spaces)
+	{
+		if (S.Occupant == GenInvalidObjectID)
+		{
+			continue;
+		}
+		if (FGenObject* Jet = Logic->FindObject(S.Occupant))
+		{
+			if (CanPlaneGiveUpSpace(Jet))
+			{
+				PropagateOrderToPlane(Jet);
+			}
+		}
+	}
+}
+
+// The first space of a runway is the ramp end of it: the only one the deck launches from.
+FGenParkingPlace::FSpace* FGenParkingPlace::FrontSpace(int32 Runway)
+{
+	if (!bGotInfo)
+	{
+		return nullptr;
+	}
+	return Spaces.FindByPredicate([Runway](const FSpace& S) { return S.Runway == Runway && S.Row == 0; });
+}
+
+void FGenParkingPlace::SetRampState(int32 Runway, bool bUp)
+{
+	// The deck's ramps are the game's DOOR_2 / DOOR_3 model states, one pair per runway (the game's
+	// clearAndSetModelConditionState: the one it sets is the opening or the closing state).
+	const int32 Opening = GenConditions::Index(FString::Printf(TEXT("DOOR_%d_OPENING"), Runway + 2));
+	const int32 Closing = GenConditions::Index(FString::Printf(TEXT("DOOR_%d_CLOSING"), Runway + 2));
+	if (Opening < 0 || Closing < 0)
+	{
+		return;
+	}
+	Airfield.SetModelCondition(Opening, bUp);
+	Airfield.SetModelCondition(Closing, !bUp);
+}
+
+void FGenParkingPlace::LaunchPlanes(uint32 Frame)
+{
+	const FGenThingTemplate* T = Airfield.GetTemplate();
+	for (int32 R = 0; R < Runways.Num(); ++R)
+	{
+		FRunway& RW = Runways[R];
+		const FSpace* Front = FrontSpace(R);
+		FGenObject* Jet = Front ? Logic->FindObject(Front->Occupant) : nullptr;
+		if (Jet && !CanPlaneGiveUpSpace(Jet) && IsPlaneAtTakeoffPosition(*Jet) && HasTakeoffOrders())
+		{
+			// One aircraft per runway per wave: the ramp goes up first, and the plane at the front of the
+			// runway goes once it is up; the next one has to wait for the wave delay.
+			if (RW.NextWaveFrame <= Frame)
+			{
+				if (!RW.bRampUp)
+				{
+					RW.bRampUp = true;
+					RW.RampUpFrame = Frame + uint32(T->DeckLaunchRampFrames);
+					RW.LowerRampFrame = MAX_uint32;
+					SetRampState(R, true);
+				}
+				if (RW.bRampUp && RW.RampUpFrame <= Frame)
+				{
+					PropagateOrderToPlane(Jet);
+					RW.NextWaveFrame = Frame + uint32(T->DeckLaunchWaveFrames);
+					RW.CatapultFrame = Frame + uint32(T->DeckCatapultFireFrames);
+					RW.LowerRampFrame = Frame + uint32(T->DeckLowerRampFrames);
+				}
+			}
+		}
+		// "Handle firing of the catapult steam effect upon launching planes."
+		if (RW.CatapultFrame != 0 && RW.CatapultFrame <= Frame)
+		{
+			RW.CatapultFrame = 0;
+			if (T->FlightRunways.IsValidIndex(R) && !T->FlightRunways[R].CatapultSystem.IsEmpty())
+			{
+				Logic->PlayParticleSystemAt(T->FlightRunways[R].CatapultSystem, RW.Start);
+			}
+		}
+		if (RW.bRampUp && RW.LowerRampFrame <= Frame)
+		{
+			RW.bRampUp = false;
+			SetRampState(R, false);
+		}
+	}
+}
+
+// ParkingCleanupPeriod: keep the aircraft near the front of the deck. A space whose aircraft is out gets the
+// nearest one behind it that is standing still; one plane per runway per pass, and the ones behind that wait
+// for the follow period instead of all moving at once.
+void FGenParkingPlace::MovePlanesForward(uint32 Frame)
+{
+	if (Frame < NextCleanupFrame)
+	{
+		return;
+	}
+	const int32 Cols = Airfield.GetTemplate()->ParkingCols;
+	NextCleanupFrame = Frame + uint32(Airfield.GetTemplate()->DeckCleanupFrames);
+	if (!bGotInfo || Cols <= 0 || Spaces.Num() == 0)
+	{
+		return;
+	}
+	TArray<bool> Done;
+	Done.Init(false, Cols);
+	for (int32 i = 0; i < Spaces.Num(); ++i)
+	{
+		FSpace& S = Spaces[i];
+		FGenObject* Out = Logic->FindObject(S.Occupant);
+		if (Out && !CanPlaneGiveUpSpace(Out))
+		{
+			continue; // an aircraft stands in this space: nothing to fill
+		}
+		// The spaces are ordered runway by runway, so only look along this one.
+		for (int32 J = i + Cols; J < Spaces.Num(); J += Cols)
+		{
+			if (Done[S.Runway])
+			{
+				continue;
+			}
+			FSpace& Back = Spaces[J];
+			FGenObject* Standing = Logic->FindObject(Back.Occupant);
+			if (Standing && CanPlaneMoveForward(*Standing))
+			{
+				// "Now handle assignment swap": the one that is out comes home to the space behind. The taxi state
+				// works the path out from the assignment (and the status: it isn't coming from the hangar).
+				Back.Occupant = Out ? Out->GetID() : GenInvalidObjectID;
+				S.Occupant = Standing->GetID();
+				Standing->bStatusReassignParking = true;
+				Standing->SetJetState(EGenJetState::TaxiFromHangar, Frame);
+				Done[S.Runway] = true;
+				NextCleanupFrame = Frame + uint32(Airfield.GetTemplate()->DeckHumanFollowFrames);
+			}
+			break; // one look per space, then on to the next
+		}
+	}
+}
+
+void FGenParkingPlace::ReplaceLostPlanes(uint32 Frame)
+{
+	// A space with nobody assigned to it: its plane is lost. One at a time, from the hangar, whatever it costs (nothing).
+	const FGenThingTemplate* T = Airfield.GetTemplate();
+	const FGenThingTemplate* Payload = T->FlightPayloadTemplate.IsEmpty() ? nullptr : FGenGameData::Get().FindTemplate(T->FlightPayloadTemplate);
+	if (!Payload || Airfield.Production.Num() > 0 || Frame < NextReplacementFrame || !FindEmptySpace())
+	{
+		return;
+	}
+	FGenObject::FProduction& P = Airfield.Production.AddDefaulted_GetRef();
+	P.Unit = Payload;
+	P.ExitDoor = 0; // ("Uses the same door for all production.")
+	NextReplacementFrame = Frame + uint32(T->DeckReplacementFrames + T->DeckDockAnimationFrames);
+	UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [jet f%u] #%u %s builds a replacement %s"), Frame, Airfield.GetID(), *T->Name, *Payload->Name);
+}
+
+bool FGenParkingPlace::CalcBestParkingAssignment(FGenObjectID Id, FVector3f& OutPos)
+{
+	// "Search for the front-most available space that doesn't have any planes blocking it. So start from the back and
+	// keep looking at empty spaces until we find one with a plane blocking."
+	const int32 Mine = Spaces.IndexOfByPredicate([Id](const FSpace& S) { return S.Occupant == Id; });
+	if (Mine == INDEX_NONE)
+	{
+		return false;
+	}
+	OutPos = Spaces[Mine].Prep;
+	bool bCheckForPlaneInWay = false;
+	int32 Best = INDEX_NONE;
+	FGenObject* BestJet = nullptr;
+	for (int32 i = 0; i < Mine; ++i)
+	{
+		if (Spaces[i].Runway != Spaces[Mine].Runway)
+		{
+			continue;
+		}
+		FGenObject* Other = Logic->FindObject(Spaces[i].Occupant);
+		if (!Other || CanPlaneGiveUpSpace(Other))
+		{
+			if (!bCheckForPlaneInWay)
+			{
+				Best = i;
+				BestJet = Other;
+				bCheckForPlaneInWay = true;
+				OutPos = Spaces[i].Prep;
+			}
+		}
+		else if (bCheckForPlaneInWay)
+		{
+			// "Ugh, there's a plane parked between us and the best spot!"
+			bCheckForPlaneInWay = false;
+			OutPos = Spaces[Mine].Prep;
+			Best = INDEX_NONE;
+		}
+	}
+	if (Best == INDEX_NONE)
+	{
+		return false;
+	}
+	Spaces[Mine].Occupant = BestJet ? BestJet->GetID() : GenInvalidObjectID;
+	Spaces[Best].Occupant = Id;
+	return true;
+}
+
+const TArray<FVector3f>* FGenParkingPlace::GetTaxiLocations(FGenObjectID Id) const
+{
+	const FSpace* S = Spaces.FindByPredicate([Id](const FSpace& Other) { return Other.Occupant == Id; });
+	return S && Runways.IsValidIndex(S->Runway) ? &Runways[S->Runway].Taxi : nullptr;
+}
+
+const TArray<FVector3f>* FGenParkingPlace::GetCreationLocations(FGenObjectID Id) const
+{
+	const FSpace* S = Spaces.FindByPredicate([Id](const FSpace& Other) { return Other.Occupant == Id; });
+	return S && Runways.IsValidIndex(S->Runway) ? &Runways[S->Runway].Creation : nullptr;
+}
+
+void FGenParkingPlace::ParkAllPlanes()
+{
+	if (!IsFlightDeck() || !bGotInfo)
+	{
+		return;
+	}
+	DeckOrder = EGenCommandType::None;
+	DeckTarget = GenInvalidObjectID;
+	for (FRunway& R : Runways)
+	{
+		R.InUseBy = R.InUseForLanding = GenInvalidObjectID;
+	}
+	// The aircraft are put forward first: the spaces in their order, the empty ones behind.
+	TArray<FGenObjectID> Planes;
+	for (FSpace& S : Spaces)
+	{
+		if (S.Occupant != GenInvalidObjectID && !IsGone(S.Occupant))
+		{
+			Planes.Add(S.Occupant);
+		}
+		S.Occupant = GenInvalidObjectID;
+	}
+	const uint32 Frame = Logic->GetFrame();
+	for (int32 i = 0; i < Planes.Num(); ++i)
+	{
+		FSpace& S = Spaces[i];
+		FGenObject* Jet = Logic->FindObject(Planes[i]);
+		S.Occupant = Planes[i];
+		Jet->SetJetState(EGenJetState::None, Frame);
+		Jet->ClearAIMode();
+		Jet->ClearAttack();
+		Jet->CommandStop();
+		Jet->bJetPendingCommand = false;
+		Jet->bJetUseReturnLoco = false;
+		Jet->bJetInterruptForReload = false;
+		Jet->JetReturnToBaseFrame = 0;
+		Jet->bJetAllowAirLoco = false;
+		Jet->bStatusDeckHeightOffset = true;
+		Jet->ChooseLocomotorSet(TEXT("SET_TAXIING"));
+		Jet->Velocity = FVector3f::ZeroVector;
+		Jet->SetPosition(S.Prep);
+		Jet->SetOrientation(S.Orient);
+		Jet->SnapshotPrevious();
+		for (FGenWeaponInstance& WI : Jet->Weapons)
+		{
+			if (WI.Template)
+			{
+				WI.AmmoInClip = WI.Template->ClipSize;
+				WI.bReloading = false;
+			}
+		}
+	}
+}
+
+bool FGenParkingPlace::TakeFirstFreeSpace(FGenObjectID Id, FVector3f& OutPos, float& OutAngle)
+{
+	PurgeDead();
+	FSpace* S = FindEmptySpace();
+	if (!S || !Runways.IsValidIndex(S->Runway) || Runways[S->Runway].Creation.Num() == 0)
+	{
+		return false;
+	}
+	S->Occupant = Id;
+	OutPos = Runways[S->Runway].Creation[0];
+	OutAngle = Runways[S->Runway].StartOrient;
+	return true;
+}
+
 void FGenParkingPlace::Update(uint32 Frame)
 {
 	PurgeDead();
 	UpdateDoors(Frame);
+	if (IsFlightDeck())
+	{
+		MovePlanesForward(Frame);
+		ReplaceLostPlanes(Frame);
+		LaunchPlanes(Frame);
+	}
 	// Aircraft on the ground here are repaired (five times a second is plenty).
 	const int32 HealRateFrames = FMath::Max(1, GenLogic::GetLogicFPS() / 5);
 	if (Healing.Num() == 0)
@@ -294,6 +843,14 @@ bool FGenParkingPlace::ReserveSpace(FGenObjectID Id, float ParkingOffset, FGenPa
 	}
 	S->Occupant = Id;
 	S->bReservedForExit = false;
+	if (Airfield.GetTemplate()->ParkingDeckHeightOffset)
+	{
+		// ParkingPlaceBehavior: parked on a deck, the deck is what the ground under it is.
+		if (FGenObject* O = Logic->FindObject(Id))
+		{
+			O->bStatusDeckHeightOffset = true;
+		}
+	}
 	if (OutInfo)
 	{
 		CalcInfo(Id, *OutInfo);
@@ -315,6 +872,29 @@ bool FGenParkingPlace::CalcInfo(FGenObjectID Id, FGenParkingInfo& Info)
 	}
 	const FGenThingTemplate* T = Airfield.GetTemplate();
 	const FRunway& R = Runways[S->Runway];
+	if (T->bFlightDeck)
+	{
+		// FlightDeckBehavior::calcPPInfo: the space is all there is to it; beyond the strips' ends, 3/4 of their length on
+		// and the approach height over the deck, is where a plane is up, or starts down.
+		const float Above = T->ParkingApproachHeight + T->ParkingDeckHeightOffset;
+		Info.ParkingSpace = Info.RunwayPrep = S->Prep;
+		Info.ParkingOrientation = S->Orient;
+		Info.RunwayStart = R.Start;
+		Info.RunwayEnd = R.End;
+		Info.RunwayExit = R.End + (R.End - R.Start) * ApproachDist;
+		Info.RunwayExit.Z = R.End.Z + Above;
+		Info.RunwayLandingStart = R.LandingStart;
+		Info.RunwayLandingEnd = R.LandingEnd;
+		Info.RunwayApproach = R.LandingStart + (R.LandingStart - R.LandingEnd) * ApproachDist;
+		Info.RunwayApproach.Z = R.LandingStart.Z + Above;
+		Info.RunwayTakeoffDist = (R.Start - R.End).Size();
+		// (The one with the clearance goes from where it stands: there is no walking back to the bone.)
+		if (R.InUseBy == Id)
+		{
+			Info.RunwayStart = Info.RunwayPrep;
+		}
+		return true;
+	}
 	Info.ParkingSpace = T->bParkInHangars ? S->HangarStart : S->Location;
 	Info.ParkingOrientation = T->bParkInHangars ? S->HangarOrient : S->Orient;
 	Info.RunwayPrep = S->Prep;
@@ -345,6 +925,13 @@ void FGenParkingPlace::ReleaseSpace(FGenObjectID Id)
 		{
 			S.Occupant = GenInvalidObjectID;
 			S.bReservedForExit = false;
+			if (Airfield.GetTemplate()->ParkingDeckHeightOffset)
+			{
+				if (FGenObject* O = Logic->FindObject(Id))
+				{
+					O->bStatusDeckHeightOffset = false;
+				}
+			}
 		}
 	}
 }
@@ -357,6 +944,10 @@ FGenObjectID FGenParkingPlace::GetRunwayReservation(int32 Runway)
 
 void FGenParkingPlace::TransferRunwayReservationToNextInLineForTakeoff(FGenObjectID Id)
 {
+	if (IsFlightDeck())
+	{
+		return; // "Aircraft carrier controls this functionality with an iron fist."
+	}
 	PurgeDead();
 	for (FRunway& R : Runways)
 	{
@@ -378,6 +969,21 @@ bool FGenParkingPlace::ReserveRunway(FGenObjectID Id, bool bForLanding)
 		return false; // only aircraft with a space get a runway
 	}
 	FRunway& R = Runways[S->Runway];
+	if (IsFlightDeck())
+	{
+		// FlightDeckBehavior::reserveRunway: a runway's taking off and its landing are two things, one plane each; and
+		// "Only look at the front spaces for takeoff. You can't take off from the back!"
+		if (!bForLanding && S->Row != 0)
+		{
+			return false;
+		}
+		FGenObjectID& Holder = bForLanding ? R.InUseForLanding : R.InUseBy;
+		if (Holder == GenInvalidObjectID)
+		{
+			Holder = Id;
+		}
+		return Holder == Id;
+	}
 	if (R.InUseBy == Id)
 	{
 		return true;
@@ -408,6 +1014,10 @@ void FGenParkingPlace::ReleaseRunway(FGenObjectID Id)
 		{
 			R.InUseBy = GenInvalidObjectID;
 			R.bWasInLine = false;
+		}
+		if (R.InUseForLanding == Id)
+		{
+			R.InUseForLanding = GenInvalidObjectID;
 		}
 		if (R.NextInLineForTakeoff == Id)
 		{
@@ -660,8 +1270,10 @@ float FGenObject::GetDrawLift(const FVector3f& RenderPos) const
 	{
 		return 0.f;
 	}
+	// ("minHeight += pp->getLandingDeckHeightOffset()": on a deck they stand that much over the bones, which are in it.)
+	const float MinHeight = Template->JetMinHeight + GetCarrierDeckHeight();
 	const float Height = FMath::Max(0.f, RenderPos.Z - Logic->GetGroundHeight(RenderPos.X, RenderPos.Y));
-	return Height < Template->JetMinHeight ? Template->JetMinHeight - Height : 0.f;
+	return Height < MinHeight ? MinHeight - Height : 0.f;
 }
 
 void FGenObject::JetEnableAfterburners(bool bOn)
@@ -905,7 +1517,7 @@ void FGenObject::UpdateJet(uint32 Frame)
 
 	if (JetState != EGenJetState::None)
 	{
-		UE_CLOG(Logic->IsTracing() && Frame % 6 == 0 && (JetState == EGenJetState::Landing || JetState == EGenJetState::TakingOff), LogGenerals, Log,
+		UE_CLOG(Logic->IsTracing() && Frame % 6 == 0 && JetState != EGenJetState::ReloadAmmo, LogGenerals, Log,
 			TEXT("  [jetpos f%u] #%u %s leg %d pos=(%.1f, %.1f) alt=%.1f heading=%.0f speed=%.2f vz=%.2f lift=%.3f"), Frame, ID, JetStateName(JetState),
 			JetPathIndex, Position.X, Position.Y, Position.Z - Logic->GetGroundHeight(Position.X, Position.Y), FMath::RadiansToDegrees(Orientation),
 			FVector2f(Velocity.X, Velocity.Y).Size(), Velocity.Z, FMath::Min(LocoMaxLift, Locomotor->Lift));
@@ -1162,7 +1774,48 @@ FGenObject::EJetResult FGenObject::JetEnterState(uint32 Frame)
 			bIntermed = IntersectLines(Info.ParkingSpace, Info.ParkingOrientation, Info.RunwayPrep, Info.ParkingOrientation + PI / 2.f, Intermed);
 		}
 		JetPath.Reset();
-		if (JetState == S::TaxiFromLanding)
+		if (bStatusDeckHeightOffset)
+		{
+			// JetOrHeliTaxiState on a carrier: the bones the deck lists, and the space the deck says.
+			if (JetState == S::TaxiFromLanding)
+			{
+				if (const TArray<FVector3f>* Taxi = PP->GetTaxiLocations(ID))
+				{
+					JetPath.Append(*Taxi);
+				}
+				// "We just landed... see if we can get a better space forward so we don't stop and pause at our initially
+				// assigned spot."
+				FVector3f Best;
+				PP->CalcBestParkingAssignment(ID, Best);
+				JetPath.Add(Best);
+			}
+			else if (JetState == S::TaxiToTakeoff)
+			{
+				if (Info.RunwayStart != Info.RunwayPrep)
+				{
+					JetPath.Add(Info.RunwayStart);
+				}
+			}
+			else if (bStatusReassignParking)
+			{
+				// "This status means we are being reassigned a parking space. We're not actually moving from the hangar."
+				bStatusReassignParking = false;
+				JetPath.Add(Info.RunwayPrep);
+			}
+			else
+			{
+				if (const TArray<FVector3f>* Creation = PP->GetCreationLocations(ID))
+				{
+					// ("Skip the first node because it's the creation location.")
+					for (int32 i = 1; i < Creation->Num(); ++i)
+					{
+						JetPath.Add((*Creation)[i]);
+					}
+				}
+				JetPath.Add(Info.RunwayPrep);
+			}
+		}
+		else if (JetState == S::TaxiFromLanding)
 		{
 			JetPath.Add(Info.RunwayPrep);
 			if (bIntermed) { JetPath.Add(Intermed); }
@@ -1261,10 +1914,19 @@ FGenObject::EJetResult FGenObject::JetEnterState(uint32 Frame)
 		JetPath.Reset();
 		if (bLanding)
 		{
-			// Down the same runway we took off from, the other way.
 			JetPath.Add(Info.RunwayApproach);
-			JetPath.Add(Info.RunwayEnd);
-			JetPath.Add(Info.RunwayStart);
+			if (bStatusDeckHeightOffset)
+			{
+				// "Assigned to an aircraft carrier which has separate landing strips."
+				JetPath.Add(Info.RunwayLandingStart);
+				JetPath.Add(Info.RunwayLandingEnd);
+			}
+			else
+			{
+				// Down the same runway we took off from, the other way.
+				JetPath.Add(Info.RunwayEnd);
+				JetPath.Add(Info.RunwayStart);
+			}
 		}
 		else
 		{
@@ -1362,8 +2024,19 @@ FGenObject::EJetResult FGenObject::JetUpdateState(uint32 Frame)
 		return PP->ReserveRunway(ID, JetState == S::LandingAwaitClearance) ? EJetResult::Success : EJetResult::Continue;
 
 	case S::TaxiFromHangar:
-	case S::TaxiToTakeoff:
 	case S::TaxiFromLanding:
+		// "Keep checking to see if there is a better spot as it moves forward. If we find a better spot, then append the
+		// position to our move."
+		if (PP && bStatusDeckHeightOffset)
+		{
+			FVector3f Best;
+			if (PP->CalcBestParkingAssignment(ID, Best))
+			{
+				JetPath.Add(Best);
+			}
+		}
+		// fall through
+	case S::TaxiToTakeoff:
 		return JetFollowPath(Frame, Locomotor->Speed) ? EJetResult::Success : EJetResult::Continue;
 
 	case S::PauseBeforeTakeoff:
@@ -1424,7 +2097,7 @@ FGenObject::EJetResult FGenObject::JetUpdateState(uint32 Frame)
 		if (JetState == S::Landing)
 		{
 			LocoMaxLift = BigLift;
-			if (!bJetLandingSoundPlayed && Position.Z - 0.25f <= Logic->GetGroundHeight(Position.X, Position.Y))
+			if (!bJetLandingSoundPlayed && Position.Z - 0.25f <= Logic->GetGroundHeight(Position.X, Position.Y) + (PP ? PP->GetLandingDeckHeightOffset() : 0.f))
 			{
 				// "zPos - zSlop <= groundZ": the wheels touch the runway (MiscAudio's AircraftWheelScreech).
 				bJetLandingSoundPlayed = true;
@@ -1461,8 +2134,8 @@ FGenObject::EJetResult FGenObject::JetUpdateState(uint32 Frame)
 		}
 		// Exactly on the spot, turning to face the way the space does.
 		Velocity.X = Velocity.Y = 0.f;
-		Position.X = Info.ParkingSpace.X;
-		Position.Y = Info.ParkingSpace.Y;
+		Position.X = bStatusDeckHeightOffset ? Info.RunwayPrep.X : Info.ParkingSpace.X;
+		Position.Y = bStatusDeckHeightOffset ? Info.RunwayPrep.Y : Info.ParkingSpace.Y;
 		JetFaceAngle(Info.ParkingOrientation, 0.f);
 		return EJetResult::Continue;
 

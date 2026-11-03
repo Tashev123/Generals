@@ -76,6 +76,8 @@ struct FGenVideoExtras
 
 	UPROPERTY(config) bool bRayTracing = false;
 	UPROPERTY(config) bool bShowFPS = false;
+	/** The look of the in-game bar: a style's id (GenHudStyles). */
+	UPROPERTY(config) FString HudStyle = TEXT("Faction");
 	/** The game's video defaults (SetVideoDefaults) have been put over the engine's (GenOptionsVideo.cpp): a
 	 *  first start, or a settings file from before they existed, gets them once. */
 	UPROPERTY(config) int32 DefaultsVersion = 0;

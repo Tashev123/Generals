@@ -107,6 +107,7 @@ bool FGenCommandData::Initialize()
 			: Cmd.Equals(TEXT("HIJACK_VEHICLE"), ESearchCase::IgnoreCase) ? EGenCommand::HijackVehicle
 			: Cmd.Equals(TEXT("CONVERT_TO_CARBOMB"), ESearchCase::IgnoreCase) ? EGenCommand::ConvertToCarBomb
 			: Cmd.Equals(TEXT("SABOTAGE_BUILDING"), ESearchCase::IgnoreCase) ? EGenCommand::SabotageBuilding
+			: Cmd.Equals(TEXT("SELECT_ALL_UNITS_OF_TYPE"), ESearchCase::IgnoreCase) ? EGenCommand::SelectAllUnitsOfType
 			: (Cmd.Equals(TEXT("SPECIAL_POWER"), ESearchCase::IgnoreCase) || Cmd.Equals(TEXT("SPECIAL_POWER_FROM_SHORTCUT"), ESearchCase::IgnoreCase)
 				|| Cmd.Equals(TEXT("SPECIAL_POWER_CONSTRUCT"), ESearchCase::IgnoreCase) || Cmd.Equals(TEXT("SPECIAL_POWER_CONSTRUCT_FROM_SHORTCUT"), ESearchCase::IgnoreCase))
 				? EGenCommand::SpecialPower : EGenCommand::Other;
@@ -234,6 +235,40 @@ bool FGenCommandData::Initialize()
 	UE_LOG(LogGenerals, Log, TEXT("Command data: %d buttons, %d command sets, %d mapped images, %d strings (%.2fs)"),
 		Buttons.Num(), Sets.Num(), Images.Num(), Strings.Num(), FPlatformTime::Seconds() - Start);
 	return true;
+}
+
+void FGenCommandData::ApplyMapIni(const TArray<TSharedPtr<FGenIniBlock>>& Blocks)
+{
+	Initialize();
+	for (const TPair<FString, TOptional<FGenCommandSet>>& It : MapIniSavedSets)
+	{
+		if (It.Value.IsSet()) { Sets.Add(It.Key, It.Value.GetValue()); }
+		else { Sets.Remove(It.Key); }
+	}
+	MapIniSavedSets.Reset();
+	for (const TSharedPtr<FGenIniBlock>& B : Blocks)
+	{
+		if (!B->Keyword.Equals(TEXT("CommandSet"), ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+		const FString Key = B->Name().ToLower();
+		if (!MapIniSavedSets.Contains(Key))
+		{
+			const FGenCommandSet* Old = Sets.Find(Key);
+			MapIniSavedSets.Add(Key, Old ? TOptional<FGenCommandSet>(*Old) : TOptional<FGenCommandSet>());
+		}
+		FGenCommandSet& Set = Sets.FindOrAdd(Key);
+		Set.Name = B->Name();
+		for (const FGenIniEntry& E : B->Entries)
+		{
+			const int32 Slot = FCString::Atoi(*E.Key);
+			if (Slot >= 1 && Slot <= FGenCommandSet::NumSlots)
+			{
+				Set.Slots[Slot - 1] = E.Value();
+			}
+		}
+	}
 }
 
 void FGenCommandData::LoadStrings()

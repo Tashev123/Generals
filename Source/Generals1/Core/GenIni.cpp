@@ -55,6 +55,11 @@ namespace
 		{
 			return true;
 		}
+		// ChallengeMode.ini
+		if (ParentKeyword.Equals(TEXT("ChallengeGenerals"), ESearchCase::IgnoreCase) && K.StartsWith(TEXT("generalpersona")))
+		{
+			return true;
+		}
 		// AIUpdate's "Turret" block vs. W3DModelDraw's "Turret = Bone" field.
 		if (!bHasValues && (K == TEXT("turret") || K == TEXT("altturret") || K.EndsWith(TEXT("radiuscursor"))))
 		{

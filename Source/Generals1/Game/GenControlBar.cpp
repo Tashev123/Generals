@@ -1,6 +1,7 @@
 #include "Game/GenControlBar.h"
 #include "Core/GenWnd.h"
 #include "Game/GenControlBarScheme.h"
+#include "Game/GenHudStyle.h"
 #include "Logic/GenCommandData.h"
 #include "Logic/GenGameData.h"
 #include "Logic/GenGameLogic.h"
@@ -9,22 +10,74 @@
 #include "Generals1.h"
 
 static TAutoConsoleVariable<float> CVarGenControlBarScale(
-	TEXT("gen.ControlBarScale"), 1.f,
-	TEXT("Size of the control bar, the power tray and the promotions panel: 1 = the original's share of the screen's height (its 800 x 600 layouts scaled to the screen's height)."));
+	TEXT("gen.ControlBarScale"), 0.8f,
+	TEXT("Size of the control bar, the power rail and the promotions panel: 1 = the original's share of the screen's height (its 800 x 600 layouts scaled to the screen's height)."));
+
+static TAutoConsoleVariable<float> CVarGenHudSpread(
+	TEXT("gen.HudSpread"), 0.f,
+	TEXT("Where the bar's sections stand: 0 = right beside the commands in the middle, 1 = the radar and the right panel in the screen's corners."));
 
 namespace
 {
-	/** A rectangle of a window of a layout, on the screen. */
-	FBox2D MapRect(const FBox2D& R, const FVector2D& Origin, float Scale)
+	/** The side (FGenBarShape::ESide) a scheme belongs to (the generals' schemes wear their side's look). */
+	int32 FindSide(const FGenControlBarScheme* Scheme)
 	{
-		return R.bIsValid ? FBox2D(Origin + R.Min * double(Scale), Origin + R.Max * double(Scale)) : FBox2D(ForceInit);
+		if (Scheme)
+		{
+			for (const FGenControlBarImagePart& Part : Scheme->ImageParts)
+			{
+				if (Part.Image.Contains(TEXT("China")))
+				{
+					return FGenBarShape::China;
+				}
+				if (Part.Image.Contains(TEXT("GLA")))
+				{
+					return FGenBarShape::GLA;
+				}
+			}
+		}
+		return FGenBarShape::America;
+	}
+
+	/** The middle of a rectangle in a cameo's own shape (5:4): the layouts' cells were made for a 4:3 screen's pixels. */
+	FBox2D FitCameo(const FBox2D& R)
+	{
+		if (!R.bIsValid)
+		{
+			return R;
+		}
+		const FVector2D Size = R.GetSize(), Center = R.GetCenter();
+		const FVector2D Half = (Size.X > Size.Y * 1.25 ? FVector2D(Size.Y * 1.25, Size.Y) : FVector2D(Size.X, Size.X / 1.25)) * 0.5;
+		return FBox2D(Center - Half, Center + Half);
 	}
 }
 
 FBox2D FGenControlBar::WindowRect(const TCHAR* ShortName) const
 {
+	// (The layout's command window is laid onto the section's.)
 	const FGenWndWindow* W = Wnd ? Wnd->Find(ShortName) : nullptr;
-	return W ? ToScreen(W->Rect) : FBox2D(ForceInit);
+	const FGenWndWindow* From = Wnd ? Wnd->Find(TEXT("CommandWindow")) : nullptr;
+	if (!W || !From || !Shape)
+	{
+		return FBox2D(ForceInit);
+	}
+	const FVector2D K = Shape->CommandWindow.GetSize() / From->Rect.GetSize();
+	const FVector2D Min = Shape->CommandWindow.Min + (W->Rect.Min - From->Rect.Min) * K, Max = Shape->CommandWindow.Min + (W->Rect.Max - From->Rect.Min) * K;
+	return ToPod(BarPodCommands, FBox2D(Min, Max));
+}
+
+FBox2D FGenControlBar::CommandCell(int32 Row, int32 Col) const
+{
+	using namespace GenBarLayout;
+	const FVector2D Min = Shape->Grid + FVector2D(Col * (CellW + CellGapX), Row * (CellH + CellGapY));
+	return ToPod(BarPodCommands, FBox2D(Min, Min + FVector2D(CellW, CellH)));
+}
+
+FBox2D FGenControlBar::QueueCell(int32 Row, int32 Col) const
+{
+	using namespace GenBarLayout;
+	const FVector2D Min = Shape->Queue + FVector2D(Col * (QueueW + QueueGap), Row * (QueueH + QueueGap));
+	return ToPod(BarPodRight, FBox2D(Min, Min + FVector2D(QueueW, QueueH)));
 }
 
 void FGenControlBar::Layout(UGenGameLogic* Logic, const TArray<FGenObjectID>& Selection, const FVector2D& ViewSize)
@@ -51,6 +104,11 @@ void FGenControlBar::Layout(UGenGameLogic* Logic, const TArray<FGenObjectID>& Se
 		{
 			LastFlashedAtPoints = Points;
 		}
+		// CAMEO_FLASH: the one button the missions flash.
+		if (const FGenMapScripts* Scripts = Logic->GetMapScripts(); Scripts && Scripts->IsCameoFlashing(TEXT("NonCommand_GeneralsExperience")))
+		{
+			bGenStarFlash = true;
+		}
 	}
 	bVisible = false;
 	bHasGenerals = false;
@@ -68,10 +126,11 @@ void FGenControlBar::Layout(UGenGameLogic* Logic, const TArray<FGenObjectID>& Se
 	Sciences.Reset();
 	GeneralsTexts.Reset();
 	Shortcuts.Reset();
-	ShortcutTrays.Reset();
+	ShortcutRail = FBox2D(ForceInit);
 	SystemButtons.Reset();
-	InputRects.Reset();
 	Radar = FBox2D(ForceInit);
+	LampRect = FBox2D(ForceInit);
+	Shape = nullptr;
 	MenuButton = FBox2D(ForceInit);
 	Panel = FBox2D(ForceInit);
 	if (!Logic || !Logic->IsRunning() || ViewSize.X <= 0.0 || ViewSize.Y <= 0.0)
@@ -83,27 +142,42 @@ void FGenControlBar::Layout(UGenGameLogic* Logic, const TArray<FGenObjectID>& Se
 	const FGenPlayerTemplate* Faction = Players.IsValidIndex(Local) ? Players[Local].Template : nullptr;
 	Wnd = GenWnd::Load(TEXT("ControlBar.wnd"));
 	Scheme = GenControlBarSchemes::FindBySide(Faction ? Faction->Side : FString());
-	// ControlBarSchemeManager's m_multiplyer is the screen's size over 800 x 600 each way; here the layouts keep
-	// their shape - scaled to the screen's height, the bar centred at the bottom - whatever the screen's shape.
-	const FIntPoint Res = Scheme ? Scheme->CreationRes : FIntPoint(800, 600);
-	Scale = float(ViewSize.Y / double(Res.Y)) * FMath::Clamp(CVarGenControlBarScale.GetValueOnGameThread(), 0.3f, 2.f);
-	BarOrigin = FVector2D((ViewSize.X - double(Res.X) * Scale) * 0.5, ViewSize.Y - double(Res.Y) * Scale);
 	if (!Wnd)
 	{
 		return;
 	}
-	Wnd->GetInputRects(InputRects);
-	for (FBox2D& R : InputRects)
-	{
-		R = ToScreen(R);
-	}
-	Radar = WindowRect(TEXT("LeftHUD"));
+	Style = &GenHudStyles::Current();
 	RadarMapSize = Logic->GetMap() ? Logic->GetMap()->GetPlayableBounds().Max : FVector2f::ZeroVector;
-	RightHUDRect = WindowRect(TEXT("RightHUD"));
-	ExpRect = WindowRect(TEXT("GeneralsExp"));
-	ExpForegroundRect = WindowRect(TEXT("ExpBarForeground"));
-	MoneyRect = Scheme && Scheme->MoneyRect.bIsValid ? ToScreen(Scheme->MoneyRect) : WindowRect(TEXT("MoneyDisplay"));
-	PowerRect = Scheme && Scheme->PowerBarRect.bIsValid ? ToScreen(Scheme->PowerBarRect) : WindowRect(TEXT("PowerWindow"));
+	Shape = &Style->GetShape(FindSide(Scheme), RadarMapSize.Y > 0.f ? RadarMapSize.X / RadarMapSize.Y : 1.f);
+	// ControlBarSchemeManager's m_multiplyer is the screen's size over 800 x 600 each way; here the layouts keep
+	// their shape - scaled to the screen's height - whatever the screen's shape (and in a window too narrow for it,
+	// to what lets the sections stand side by side).
+	using namespace GenBarLayout;
+	const FIntPoint Res = Scheme ? Scheme->CreationRes : FIntPoint(800, 600);
+	Scale = float(ViewSize.Y / double(Res.Y)) * FMath::Clamp(CVarGenControlBarScale.GetValueOnGameThread(), 0.3f, 2.f);
+	Scale = FMath::Min(Scale, float(ViewSize.X / (Shape->PodSize[BarPodRadar].X + Shape->PodSize[BarPodCommands].X + Shape->PodSize[BarPodRight].X + 2.0 * (ScreenMargin + SectionGap))));
+	BarOrigin = FVector2D((ViewSize.X - double(Res.X) * Scale) * 0.5, ViewSize.Y - double(Res.Y) * Scale);
+	{
+		const double Margin = double(ScreenMargin) * Scale, Gap = double(SectionGap) * Scale;
+		const double Spread = FMath::Clamp(double(CVarGenHudSpread.GetValueOnGameThread()), 0.0, 1.0);
+		const FVector2D Left = Shape->PodSize[BarPodRadar] * double(Scale), Middle = Shape->PodSize[BarPodCommands] * double(Scale), Right = Shape->PodSize[BarPodRight] * double(Scale);
+		const double MiddleX = (ViewSize.X - Middle.X) * 0.5;
+		const double Bottom = ViewSize.Y - Margin;
+		PodOrigin[BarPodRadar] = FVector2D(FMath::RoundToDouble(FMath::Lerp(MiddleX - Gap - Left.X, Margin, Spread)), FMath::RoundToDouble(Bottom - Left.Y));
+		PodOrigin[BarPodCommands] = FVector2D(FMath::RoundToDouble(MiddleX), FMath::RoundToDouble(Bottom - Middle.Y));
+		PodOrigin[BarPodRight] = FVector2D(FMath::RoundToDouble(FMath::Lerp(MiddleX + Middle.X + Gap, ViewSize.X - Margin - Right.X, Spread)), FMath::RoundToDouble(Bottom - Right.Y));
+	}
+	Radar = ToPod(BarPodRadar, Shape->Radar);
+	{
+		// The side's picture (5:4 and a bit) in the middle of the right panel's cells.
+		const FBox2D Cells(QueueCell(0, 0).Min, QueueCell(2, 2).Max);
+		const FVector2D Center = Cells.GetCenter(), Half(Cells.GetSize().X * 0.5, Cells.GetSize().X * 0.5 * 109.0 / 139.0);
+		RightHUDRect = FBox2D(Center - Half, Center + Half);
+	}
+	ExpRect = ToPod(BarPodRight, Shape->ExpFill);
+	MoneyRect = ToPod(BarPodCommands, Shape->Money);
+	PowerRect = ToPod(BarPodCommands, Shape->Power);
+	LampRect = ToPod(BarPodRadar, Shape->Lamp);
 	LayoutSystemButtons(Logic);
 	LayoutGenerals(Logic);
 	LayoutShortcuts(Logic, ViewSize);
@@ -222,18 +296,13 @@ void FGenControlBar::LayoutSystemButtons(UGenGameLogic* Logic)
 	{
 		return;
 	}
-	auto Add = [this](EGenBarSystem System, const FBox2D& R, bool bEnabled, const FString& Image)
+	auto Add = [this](EGenBarSystem System, int32 Row, bool bEnabled) -> FBox2D
 	{
-		if (!R.bIsValid)
-		{
-			return;
-		}
 		FGenBarButton& B = SystemButtons.AddDefaulted_GetRef();
-		B.Rect = ToScreen(R);
+		B.Rect = ToPod(BarPodCommands, Shape->Keys[Row]);
 		B.System = System;
 		B.bEnabled = bEnabled;
-		B.Image = Image;
-		InputRects.Add(B.Rect);
+		return B.Rect;
 	};
 	// InGameUI::m_idleWorkers: dozers and workers of ours with nothing to do (looked for a few times a second).
 	if (Logic->GetFrame() >= IdleWorkerCheckFrame || Logic->GetFrame() + 60 < IdleWorkerCheckFrame)
@@ -250,12 +319,8 @@ void FGenControlBar::LayoutSystemButtons(UGenGameLogic* Logic)
 			}
 		}
 	}
-	Add(EGenBarSystem::Options, Scheme->OptionsRect, true, Scheme->Options.Enable);
-	Add(EGenBarSystem::IdleWorker, Scheme->WorkerRect, IdleWorkers > 0, IdleWorkers > 0 ? Scheme->IdleWorker.Enable : Scheme->IdleWorker.Disabled);
-	Add(EGenBarSystem::Beacon, Scheme->BeaconRect, false, Scheme->Beacon.Disabled);
-	Add(EGenBarSystem::Chat, Scheme->ChatRect, false, Scheme->Buddy.Disabled);
-	Add(EGenBarSystem::MinMax, Scheme->MinMaxRect, false, Scheme->ToggleDown.Enable);
-	MenuButton = Scheme->OptionsRect.bIsValid ? ToScreen(Scheme->OptionsRect) : FBox2D(ForceInit);
+	MenuButton = Add(EGenBarSystem::Options, 0, true);
+	Add(EGenBarSystem::IdleWorker, 1, IdleWorkers > 0);
 }
 
 bool FGenControlBar::FillPower(UGenGameLogic* Logic, const FGenObject* Source, FGenBarButton& B) const
@@ -338,6 +403,27 @@ bool FGenControlBar::FillPower(UGenGameLogic* Logic, const FGenObject* Source, F
 	return true;
 }
 
+bool FGenControlBar::CanBuyForItself(const UGenGameLogic* Logic, const FGenObject& Unit, const FGenCommandButton& Button, const FGenUpgradeTemplate& Upgrade)
+{
+	if (!Logic->CanPlayerCommand(Logic->GetLocalPlayer(), Unit) || Unit.IsDead() || Unit.HasObjectUpgrade(Upgrade.Name) || !Unit.HasPortedUpgradeEffect(Upgrade)
+		|| !Logic->CanQueueUpgrade(Unit, Upgrade, nullptr))
+	{
+		return false;
+	}
+	const FGenCommandSet* Set = FGenCommandData::Get().FindSet(Unit.GetCommandSet());
+	if (Set)
+	{
+		for (int32 i = 0; i < FGenCommandSet::NumSlots; ++i)
+		{
+			if (Set->Slots[i].Equals(Button.Name, ESearchCase::IgnoreCase))
+			{
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 void FGenControlBar::LayoutSelection(UGenGameLogic* Logic, const TArray<FGenObjectID>& Selection)
 {
 	const FGenCommandData& CD = FGenCommandData::Get();
@@ -371,6 +457,27 @@ void FGenControlBar::LayoutSelection(UGenGameLogic* Logic, const TArray<FGenObje
 		if (!S && O && Logic->CanPlayerCommand(Local, *O) && !O->IsDead() && O->GetTemplate()->OCLUpdate.bValid)
 		{
 			S = &NoCommands;
+		}
+		if (S && O && Logic->GetMapScripts())
+		{
+			bool bRemoved = false;
+			for (int32 i = 0; i < FGenCommandSet::NumSlots; ++i)
+			{
+				const FString* Added = Logic->GetMapScripts()->GetButtonAdded(O->GetCommandSet(), i);
+				if (Added || Logic->GetMapScripts()->IsButtonRemoved(O->GetCommandSet(), i))
+				{
+					if (!bRemoved)
+					{
+						ScriptFilteredSet = *S;
+						bRemoved = true;
+					}
+					ScriptFilteredSet.Slots[i] = Added ? *Added : FString();
+				}
+			}
+			if (bRemoved)
+			{
+				S = &ScriptFilteredSet;
+			}
 		}
 		if (S)
 		{
@@ -424,7 +531,7 @@ void FGenControlBar::LayoutSelection(UGenGameLogic* Logic, const TArray<FGenObje
 		if (Logic->CanPlayerCommand(Local, *Obj))
 		{
 			FGenBarButton B;
-			B.Rect = WindowRect(TEXT("ButtonCancelConstruction"));
+			B.Rect = FitCameo(WindowRect(TEXT("ButtonCancelConstruction")));
 			B.Button = CD.FindButton(TEXT("Command_CancelConstruction"));
 			B.Source = Subject;
 			B.bEnabled = B.Button != nullptr;
@@ -478,7 +585,7 @@ void FGenControlBar::LayoutSelection(UGenGameLogic* Logic, const TArray<FGenObje
 			if (!Obj->IsKindOf(TEXT("TECH_BUILDING")) || bRally)
 			{
 				FGenBarButton B;
-				B.Rect = WindowRect(TEXT("OCLTimerSellButton"));
+				B.Rect = CommandCell(1, 6); // (where the sell button of every other building is)
 				B.Button = CD.FindButton(bRally ? TEXT("Command_SetRallyPoint") : TEXT("Command_Sell"));
 				B.Source = Subject;
 				B.bEnabled = B.Button != nullptr && (!bRally || Logic->CanSetRallyPoint(*Obj));
@@ -504,24 +611,25 @@ void FGenControlBar::LayoutSelection(UGenGameLogic* Logic, const TArray<FGenObje
 	for (int32 Slot = 0; Slot < NumCommandButtons; ++Slot)
 	{
 		const FGenCommandButton* Btn = CD.FindButton(Set->Slots[Slot]);
-		if (!Btn)
+		// (ControlBar::setControlCommand: "commandButton == NULL || BitIsSet( commandButton->getOptions(), SCRIPT_ONLY )": no button.)
+		if (!Btn || Btn->bScriptOnly)
 		{
 			continue;
 		}
 		FGenBarButton B;
-		// ControlBar.wnd's ButtonCommandNN for slot NN (1 and 2 share the first column, 13 and 14 the last).
-		B.Rect = WindowRect(*FString::Printf(TEXT("ButtonCommand%02d"), Slot + 1));
-		if (!B.Rect.bIsValid)
+		// ControlBar.wnd's ButtonCommandNN for slot NN (1 and 2 share the first column, 13 and 14 the last), in its
+		// row and column of the command window's cells.
+		if (!GetGridCell(Slot, B.GridRow, B.GridCol))
 		{
 			continue;
 		}
+		B.Rect = CommandCell(B.GridRow, B.GridCol);
 		B.Button = Btn;
 		B.Source = Subject;
-		GetGridCell(Slot, B.GridRow, B.GridCol);
 		B.Thing = FGenGameData::Get().FindTemplate(Btn->Object);
 		// getCommandAvailability: "BSTATUS_NO" (and Only_By_AI for a person) - COMMAND_HIDDEN.
 		if ((Btn->Command == EGenCommand::UnitBuild || Btn->Command == EGenCommand::DozerConstruct) && B.Thing
-			&& (B.Thing->Buildable == 1 || (B.Thing->Buildable == 2 && !Logic->GetPlayers()[Local].bSkirmishAI)))
+			&& (Logic->GetBuildable(*B.Thing) == 1 || (Logic->GetBuildable(*B.Thing) == 2 && !Logic->GetPlayers()[Local].bSkirmishAI)))
 		{
 			continue;
 		}
@@ -544,6 +652,12 @@ void FGenControlBar::LayoutSelection(UGenGameLogic* Logic, const TArray<FGenObje
 			B.bEnabled = B.Thing && Logic->CanMake(Local, *B.Thing, &B.Disabled);
 			break;
 		case EGenCommand::Sell:
+			if (Obj->IsScriptUnsellable())
+			{
+				B.Disabled = TEXT("Not available"); // (ControlBar::getCommandAvailability: "OBJECT_STATUS_SCRIPT_UNSELLABLE")
+				break;
+			}
+			// fall through
 		case EGenCommand::Stop:
 			// ("OPTION_ONE ... designates special case handling to hide stop button when not applicable": the
 			// strategy center's, there only to stop the bombardment gun.)
@@ -551,13 +665,14 @@ void FGenControlBar::LayoutSelection(UGenGameLogic* Logic, const TArray<FGenObje
 			B.Disabled = TEXT("Only with the bombardment plan in force");
 			break;
 		case EGenCommand::AttackMove:
-			B.bEnabled = Obj->CanMove() && Obj->HasWeapons();
+			// (A ship's deck moves nothing itself: FlightDeckBehavior::aiDoCommand passes these on to its aircraft.)
+			B.bEnabled = (Obj->CanMove() && Obj->HasWeapons()) || (Obj->GetParking() && Obj->GetParking()->IsFlightDeck());
 			B.Disabled = TEXT("Not available");
 			break;
 		case EGenCommand::Guard:
 		case EGenCommand::GuardWithoutPursuit:
 		case EGenCommand::GuardFlyingOnly:
-			B.bEnabled = Obj->CanMove();
+			B.bEnabled = Obj->CanMove() || (Obj->GetParking() && Obj->GetParking()->IsFlightDeck());
 			B.Disabled = TEXT("Not available");
 			break;
 		case EGenCommand::PlayerUpgrade:
@@ -574,21 +689,37 @@ void FGenControlBar::LayoutSelection(UGenGameLogic* Logic, const TArray<FGenObje
 			if (B.bOwned)
 			{
 				B.Disabled = B.Upgrade->bObjectUpgrade ? TEXT("Already installed") : TEXT("Already researched");
-				break;
 			}
-			if (B.Upgrade->bObjectUpgrade && !Obj->HasPortedUpgradeEffect(*B.Upgrade))
+			else if (B.Upgrade->bObjectUpgrade && !Obj->HasPortedUpgradeEffect(*B.Upgrade))
 			{
 				B.Disabled = TEXT("Not available yet"); // drones, add-ons: what they create isn't in the game so far
-				break;
 			}
-			B.bEnabled = Logic->CanQueueUpgrade(*Obj, *B.Upgrade, &B.Disabled);
-			// The button may name promotions that are needed first.
-			for (const FString& Needed : Btn->Sciences)
+			else
 			{
-				if (B.bEnabled && !Logic->HasScience(Local, Needed))
+				B.bEnabled = Logic->CanQueueUpgrade(*Obj, *B.Upgrade, &B.Disabled);
+				// The button may name promotions that are needed first.
+				for (const FString& Needed : Btn->Sciences)
 				{
-					B.bEnabled = false;
-					B.Disabled = TEXT("Requires a general's promotion");
+					if (B.bEnabled && !Logic->HasScience(Local, Needed))
+					{
+						B.bEnabled = false;
+						B.Disabled = TEXT("Requires a general's promotion");
+					}
+				}
+			}
+			// (What each unit buys for itself is bought for everybody selected: the button works if any of them can.)
+			if (!B.bEnabled && B.Upgrade->bObjectUpgrade)
+			{
+				for (FGenObjectID Id : Selection)
+				{
+					const FGenObject* Other = Logic->FindObject(Id);
+					if (Other && Other != Obj && CanBuyForItself(Logic, *Other, *Btn, *B.Upgrade))
+					{
+						B.bEnabled = true;
+						B.bOwned = false;
+						B.Disabled.Reset();
+						break;
+					}
 				}
 			}
 			break;
@@ -680,6 +811,22 @@ void FGenControlBar::LayoutSelection(UGenGameLogic* Logic, const TArray<FGenObje
 			B.bEnabled = Btn->WeaponSlot != INDEX_NONE
 				&& (Obj->GetWeapon(Btn->WeaponSlot).Template != nullptr || (Btn->bUsesMineClearingWeaponSet && Obj->GetTemplate()->bHasMineClearingSet));
 			B.Disabled = Btn->bNeedTargetObject ? TEXT("Not available") : TEXT("Not available yet");
+			// ControlBar::getCommandAvailability: "only draw the clock when reloading a clip, not when merely between
+			// shots" - and "We need to show the button as always available for anything with a 0 clip reload time."
+			if (B.bEnabled && Btn->WeaponSlot != INDEX_NONE)
+			{
+				const FGenWeaponInstance& Weapon = Obj->GetWeapon(Btn->WeaponSlot);
+				const uint32 Now = Logic->GetFrame();
+				if (Weapon.Template && Weapon.Template->ClipReloadTime != 0 && (Weapon.ReadyFrame > Now || (Weapon.Template->ClipSize > 0 && Weapon.AmmoInClip <= 0)))
+				{
+					B.bEnabled = false;
+					B.Disabled = TEXT("Reloading");
+					if (Weapon.bReloading && Weapon.ReadyFrame > Now)
+					{
+						B.Recharge = FMath::Clamp(float(Weapon.ReadyFrame - Now) / float(Weapon.Template->ClipReloadTime), 0.f, 1.f);
+					}
+				}
+			}
 			break;
 		default:
 			B.Disabled = TEXT("Not available yet");
@@ -721,15 +868,13 @@ void FGenControlBar::LayoutRightPanel(UGenGameLogic* Logic, const FGenObject* Ob
 {
 	// The right panel: a factory's production queue (ProductionQueueWindow), or the selected unit's portrait
 	// and upgrade cameos (WinUnitSelected), or - nothing selected - the side's picture (RightHUDImage).
-	for (int32 i = 1; i <= 9; ++i)
+	// (ButtonQueue01..09 run row by row. The portrait takes four of the same cells, the upgrades as many as are left,
+	// in the order of UnitUpgrade1..5: down the right, then back along the bottom.)
+	for (int32 i = 0; i < 9; ++i)
 	{
-		const FBox2D R = WindowRect(*FString::Printf(TEXT("ButtonQueue%02d"), i));
-		if (R.bIsValid)
-		{
-			QueueSlots.Add(R);
-		}
+		QueueSlots.Add(QueueCell(i / 3, i % 3));
 	}
-	PortraitRect = WindowRect(TEXT("CameoWindow"));
+	PortraitRect = FBox2D(QueueCell(0, 0).Min, QueueCell(1, 1).Max);
 	if (!Obj)
 	{
 		return;
@@ -744,17 +889,17 @@ void FGenControlBar::LayoutRightPanel(UGenGameLogic* Logic, const FGenObject* Ob
 	}
 	Portrait = Obj->GetTemplate()->SelectPortrait;
 	const FGenUpgradeData& UD = FGenUpgradeData::Get();
+	static const FIntPoint UpgradeCells[5] = { { 0, 2 }, { 1, 2 }, { 2, 2 }, { 2, 1 }, { 2, 0 } }; // (row, column)
 	for (int32 i = 0; i < 5; ++i)
 	{
 		// ControlBar::populateUpgradeCameos (?): the upgrade's button image, lit once the unit (or its player) has it.
 		const FGenUpgradeTemplate* U = UD.FindUpgrade(Obj->GetTemplate()->UpgradeCameos[i]);
-		const FBox2D R = WindowRect(*FString::Printf(TEXT("UnitUpgrade%d"), i + 1));
-		if (!U || !R.bIsValid)
+		if (!U)
 		{
 			continue;
 		}
 		FGenBarButton& B = UnitUpgrades.AddDefaulted_GetRef();
-		B.Rect = R;
+		B.Rect = QueueCell(UpgradeCells[i].X, UpgradeCells[i].Y);
 		B.Upgrade = U;
 		B.Image = U->ButtonImage;
 		B.bOwned = U->bObjectUpgrade ? Obj->HasObjectUpgrade(U->Name) : Logic->HasUpgradeComplete(Obj->GetOwner(), U->Name);
@@ -779,11 +924,10 @@ void FGenControlBar::LayoutGenerals(UGenGameLogic* Logic)
 
 	// The general's button (ButtonGeneral, where the scheme puts it).
 	GeneralsButton = FGenBarButton();
-	GeneralsButton.Rect = Scheme && Scheme->GeneralRect.bIsValid ? ToScreen(Scheme->GeneralRect) : WindowRect(TEXT("ButtonGeneral"));
+	GeneralsButton.Rect = ToPod(BarPodRight, Shape->General);
 	GeneralsButton.bGeneralsToggle = true;
 	GeneralsButton.bEnabled = true;
 	GeneralsButton.Cost = P.SciencePurchasePoints;
-	InputRects.Add(GeneralsButton.Rect);
 	if (!bGeneralsOpen)
 	{
 		return;
@@ -860,8 +1004,13 @@ void FGenControlBar::LayoutGenerals(UGenGameLogic* Logic)
 			{
 				continue;
 			}
+			// (ControlBar::populatePurchaseScience: a mission's "Hidden" promotions aren't there; its "Disabled" ones are, greyed.)
+			if (Logic->GetMapScripts() && Logic->GetMapScripts()->IsScienceHidden(Local, Btn->Sciences[0]))
+			{
+				continue;
+			}
 			FGenBarButton& B = Sciences.AddDefaulted_GetRef();
-			B.Rect = ToScreen(W->Rect);
+			B.Rect = FitCameo(ToScreen(W->Rect));
 			B.Button = Btn;
 			B.Science = Btn->Sciences[0];
 			const FGenScience* Sc = UD.FindScience(B.Science);
@@ -887,52 +1036,61 @@ void FGenControlBar::LayoutGenerals(UGenGameLogic* Logic)
 
 void FGenControlBar::LayoutShortcuts(UGenGameLogic* Logic, const FVector2D& ViewSize)
 {
-	// The special power shortcut tray (the faction's SpecialPowerShortcutWinName): the powers the player has,
-	// in ButtonCommand1.. from the bottom up, each in its ButtonParent. Anchored to the screen's right edge.
+	// The special power shortcuts (the faction's SpecialPowerShortcutSet): the powers the player has, from the bottom up,
+	// in a rail on the screen's right edge, which grows upwards, out of the way of the view.
 	const TArray<FGenPlayer>& Players = Logic->GetPlayers();
 	const int32 Local = Logic->GetLocalPlayer();
 	const FGenCommandData& CD = FGenCommandData::Get();
 	const FGenPlayerTemplate* Faction = Players.IsValidIndex(Local) ? Players[Local].Template : nullptr;
 	const FGenCommandSet* Set = Faction ? CD.FindSet(Faction->SpecialPowerShortcutSet) : nullptr;
-	const FGenWndLayout* Tray = Faction && !Faction->SpecialPowerShortcutWinName.IsEmpty() ? GenWnd::Load(Faction->SpecialPowerShortcutWinName) : nullptr;
-	ShortcutArea = FBox2D(ForceInit);
-	if (!Set || !Tray)
+	if (!Set)
 	{
 		return;
 	}
-	const FIntPoint Res = Scheme ? Scheme->CreationRes : FIntPoint(800, 600);
-	const FVector2D TrayOrigin(ViewSize.X - double(Res.X) * Scale, ViewSize.Y - double(Res.Y) * Scale);
+	using namespace GenBarLayout;
 	const int32 MaxButtons = Faction->SpecialPowerShortcutButtonCount > 0 ? Faction->SpecialPowerShortcutButtonCount : 11;
+	const double RailX = FMath::RoundToDouble(ViewSize.X - double(RailW) * Scale);
+	const double RailBottom = FMath::RoundToDouble(ViewSize.Y - double(RailLift) * Scale);
 	int32 Next = 1;
 	for (int32 i = 0; i < FGenCommandSet::NumSlots && Next <= MaxButtons; ++i)
 	{
 		const FGenCommandButton* Btn = CD.FindButton(Set->Slots[i]);
-		if (!Btn || Btn->Command != EGenCommand::SpecialPower)
+		if (!Btn || Btn->bScriptOnly || (Btn->Command != EGenCommand::SpecialPower && Btn->Command != EGenCommand::SelectAllUnitsOfType))
 		{
 			continue;
 		}
 		FGenBarButton B;
 		B.Button = Btn;
-		if (!FillPower(Logic, nullptr, B))
+		if (Btn->Command == EGenCommand::SelectAllUnitsOfType)
+		{
+			// ControlBar::populateSpecialPowerShortcut: "Make sure we actually have an object of type that we want to be able to select."
+			const FGenThingTemplate* Thing = FGenGameData::Get().FindTemplate(Btn->Object);
+			bool bHave = false;
+			for (const FGenObject* O : Logic->GetObjectsOf(Local))
+			{
+				bHave |= Thing && !O->IsDestroyed() && !O->IsDead() && O->GetTemplate()->Canonical() == Thing->Canonical();
+			}
+			if (!bHave)
+			{
+				continue;
+			}
+			B.bEnabled = true;
+			B.Label = CD.GetText(Btn->TextLabel);
+			B.Image = Btn->ButtonImage;
+		}
+		else if (!FillPower(Logic, nullptr, B))
 		{
 			continue;
 		}
-		const FGenWndWindow* W = Tray->Find(FString::Printf(TEXT("ButtonCommand%d"), Next));
-		const FGenWndWindow* Back = Tray->Find(FString::Printf(TEXT("ButtonParent%d"), Next));
-		++Next;
-		if (!W)
-		{
-			continue;
-		}
-		B.Rect = MapRect(W->Rect, TrayOrigin, Scale);
+		const FVector2D Min(RailX + double(RailCellX) * Scale, RailBottom - double(Next * RailPitch) * Scale);
+		B.Rect = FBox2D(Min, Min + FVector2D(RailCellW, RailCellH) * double(Scale));
 		Shortcuts.Add(MoveTemp(B));
-		if (Back)
-		{
-			const FBox2D BackRect = MapRect(Back->Rect, TrayOrigin, Scale);
-			ShortcutTrays.Add(BackRect);
-			ShortcutArea += BackRect;
-			ShortcutTrayImage = Back->GetImage();
-		}
+		++Next;
+	}
+	if (Shortcuts.Num() > 0)
+	{
+		const double Top = FMath::RoundToDouble(RailBottom - double(RailTop + Shortcuts.Num() * RailPitch) * Scale);
+		ShortcutRail = FBox2D(FVector2D(RailX, Top), FVector2D(ViewSize.X, RailBottom));
 	}
 }
 
@@ -942,16 +1100,22 @@ bool FGenControlBar::IsOverPanel(const FVector2D& P) const
 	{
 		return true;
 	}
-	if (ShortcutArea.bIsValid && ShortcutArea.IsInside(P))
+	if (ShortcutRail.bIsValid && ShortcutRail.IsInside(P))
 	{
 		return true;
 	}
-	if (Shortcuts.ContainsByPredicate([&P](const FGenBarButton& B) { return B.Rect.IsInside(P); }))
+	// The bar's sections, exactly where they are: the world shows and takes clicks between them and beside their tabs.
+	if (Shape && Style && Scale > 0.f)
 	{
-		return true;
+		for (int32 Pod = 0; Pod < BarPodCount; ++Pod)
+		{
+			if (Style->IsPodSolid(*Shape, Pod, (P - PodOrigin[Pod]) / double(Scale)))
+			{
+				return true;
+			}
+		}
 	}
-	// The bar: its windows that take the mouse (the frame's blocking parts, the buttons, the radar...).
-	return InputRects.ContainsByPredicate([&P](const FBox2D& R) { return R.IsInside(P); });
+	return false;
 }
 
 const FGenBarButton* FGenControlBar::HitTest(const FVector2D& P) const

@@ -25,10 +25,13 @@ namespace GenW3D
 	{
 		VertMatStage0MappingMask = 0x00FF0000,
 		VertMatStage0MappingShift = 16,
+		VertMatStage1MappingMask = 0x0000FF00,
+		VertMatStage1MappingShift = 8,
 		MappingUV = 0x00,
 		MappingEnvironment = 0x01,          // camera-space reflection vector
 		MappingCheapEnvironment = 0x02,     // camera-space normal
 		MappingLinearOffset = 0x04,         // LinearOffsetTextureMapperClass: the texture slides along
+		MappingGrid = 0x07,                 // GridTextureMapperClass: the frames of a texture laid out in a grid
 		MappingWSClassicEnv = 0x0C,
 		MappingWSEnvironment = 0x0D,
 		MappingGridClassicEnv = 0x0E,
@@ -75,8 +78,10 @@ struct FGenW3DVertexMaterial
 	float Opacity = 1.f;
 	float Translucency = 0.f;
 	FString MapperArgs0;
+	FString MapperArgs1;
 
 	uint32 Stage0Mapping() const { return (Attributes & GenW3D::VertMatStage0MappingMask) >> GenW3D::VertMatStage0MappingShift; }
+	uint32 Stage1Mapping() const { return (Attributes & GenW3D::VertMatStage1MappingMask) >> GenW3D::VertMatStage1MappingShift; }
 	/** Stage 0 is an environment map: its coordinates come from the view, not from the mesh's UVs. */
 	bool IsEnvironmentMapped() const;
 };

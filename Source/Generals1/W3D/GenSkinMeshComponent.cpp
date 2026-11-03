@@ -168,7 +168,7 @@ public:
 
 	virtual bool CanBeOccluded() const override
 	{
-		return !MaterialRelevance.bDisableDepthTest;
+		return !MaterialRelevance.bDisableDepthTest && !ShouldRenderCustomDepth();
 	}
 
 	virtual uint32 GetMemoryFootprint() const override { return sizeof(*this) + FPrimitiveSceneProxy::GetAllocatedSize(); }

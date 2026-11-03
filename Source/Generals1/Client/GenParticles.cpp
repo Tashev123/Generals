@@ -558,13 +558,11 @@ FGenParticleSystem* FGenParticleManager::Create(const FString& TemplateName)
 
 FGenParticleSystem* FGenParticleManager::Create(const FGenParticleSystemTemplate* Template, bool bCreateSlaves)
 {
-	// Drawable particles (one template in the whole game) and smudges are not supported. (W3DParticleSystemManager:
+	// Drawable particles (one template in the whole game) are not supported. (Smudges are - W3DParticleSystemManager:
 	// "if texture name starts with "SMUD" ... we can assume it's a smudge type" - the heat haze over a
-	// microwave tank's dish, drawn by distorting the picture behind it, and not at all without the
-	// hardware for it or with heat effects off; drawn as particles it is a cloud of white squares.)
+	// microwave tank's dish, drawn by distorting the picture behind it: UGenFXManager::GetBatch gives them M_Smudge.)
 	if (!Template || Template->Shader == EGenParticleShader::None
-		|| (Template->Type != EGenParticleType::Particle && Template->Type != EGenParticleType::Streak && Template->Type != EGenParticleType::VolumeParticle)
-		|| Template->ParticleName.StartsWith(TEXT("SMUD"), ESearchCase::IgnoreCase))
+		|| (Template->Type != EGenParticleType::Particle && Template->Type != EGenParticleType::Streak && Template->Type != EGenParticleType::VolumeParticle))
 	{
 		return nullptr;
 	}

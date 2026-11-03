@@ -112,73 +112,159 @@ bool FGenUpgradeData::Initialize()
 
 	Blocks.Reset();
 	LoadIni(TEXT("SpecialPower.ini"), Blocks);
-	// House rule: the Air Force General's carpet bomb recharges in 2:30, not the 4:00 its
-	// ReloadTime in SpecialPower.ini gives it.
-	static const TMap<FString, int32> ReloadMsOverride = { { TEXT("airf_superweaponcarpetbomb"), 150000 } };
 	for (const TSharedPtr<FGenIniBlock>& B : Blocks)
 	{
-		if (!B->Keyword.Equals(TEXT("SpecialPower"), ESearchCase::IgnoreCase))
+		if (B->Keyword.Equals(TEXT("SpecialPower"), ESearchCase::IgnoreCase))
 		{
-			continue;
-		}
-		FGenSpecialPowerTemplate& P = Powers.FindOrAdd(B->Name().ToLower());
-		P = FGenSpecialPowerTemplate();
-		P.Name = B->Name();
-		P.Enum = B->GetString(TEXT("Enum"));
-		P.ReloadTime = FMath::CeilToInt32(B->GetFloat(TEXT("ReloadTime"), 0.f) * float(FPS) / 1000.f);
-		if (const int32* Override = ReloadMsOverride.Find(B->Name().ToLower()))
-		{
-			P.ReloadTime = FMath::CeilToInt32(float(*Override) * float(FPS) / 1000.f);
-		}
-		P.ViewObjectFrames = FMath::CeilToInt32(B->GetFloat(TEXT("ViewObjectDuration"), 0.f) * float(FPS) / 1000.f);
-		P.ViewObjectRange = B->GetFloat(TEXT("ViewObjectRange"), 0.f);
-		P.RequiredScience = B->GetString(TEXT("RequiredScience"));
-		if (P.RequiredScience.Equals(TEXT("None"), ESearchCase::IgnoreCase)) { P.RequiredScience.Reset(); }
-		P.bPublicTimer = B->GetBool(TEXT("PublicTimer"));
-		P.bSharedSyncedTimer = B->GetBool(TEXT("SharedSyncedTimer"));
-		P.RadiusCursorRadius = B->GetFloat(TEXT("RadiusCursorRadius"), 0.f);
-		P.InitiateSound = B->GetString(TEXT("InitiateSound"));
-		P.InitiateAtLocationSound = B->GetString(TEXT("InitiateAtLocationSound"));
-		// The powers whose effect exists so far. (Not yet: mines, tunnels, weapon bonuses for an area,
-		// leaflets, the superweapon buildings, and the units' own abilities.)
-		static const TCHAR* PortedEnums[] = { TEXT("SPECIAL_DAISY_CUTTER"), TEXT("SPECIAL_PARADROP_AMERICA"), TEXT("SPECIAL_CARPET_BOMB"),
-			TEXT("SPECIAL_CHINA_CARPET_BOMB"), TEXT("SPECIAL_EMP_PULSE"), TEXT("SPECIAL_A10_THUNDERBOLT_STRIKE"), TEXT("SPECIAL_ARTILLERY_BARRAGE"),
-			TEXT("SPECIAL_CASH_HACK"), TEXT("SPECIAL_AMBUSH"), TEXT("SPECIAL_ANTHRAX_BOMB"), TEXT("SPECIAL_REPAIR_VEHICLES"), TEXT("SPECIAL_CASH_BOUNTY"),
-			TEXT("SPECIAL_SPY_SATELLITE"), TEXT("SPECIAL_RADAR_VAN_SCAN"), TEXT("SPECIAL_SPY_DRONE"), TEXT("SPECIAL_CIA_INTELLIGENCE"),
-			TEXT("SPECIAL_GPS_SCRAMBLER"), TEXT("SPECIAL_INFANTRY_CAPTURE_BUILDING"), TEXT("SPECIAL_BLACKLOTUS_CAPTURE_BUILDING"),
-			TEXT("SPECIAL_BLACKLOTUS_DISABLE_VEHICLE_HACK"), TEXT("SPECIAL_BLACKLOTUS_STEAL_CASH_HACK"), TEXT("SPECIAL_HACKER_DISABLE_BUILDING"),
-			TEXT("SPECIAL_REMOTE_CHARGES"), TEXT("SPECIAL_TIMED_CHARGES"), TEXT("SPECIAL_TANKHUNTER_TNT_ATTACK"), TEXT("SPECIAL_BOOBY_TRAP"),
-			TEXT("SPECIAL_MISSILE_DEFENDER_LASER_GUIDED_MISSILES"), TEXT("SPECIAL_SCUD_STORM"), TEXT("SPECIAL_NEUTRON_MISSILE"), TEXT("SPECIAL_PARTICLE_UPLINK_CANNON"), TEXT("SPECIAL_FRENZY"), TEXT("SPECIAL_LEAFLET_DROP"), TEXT("SPECIAL_CLUSTER_MINES"), TEXT("SPECIAL_SPECTRE_GUNSHIP"), TEXT("SPECIAL_SNEAK_ATTACK"), TEXT("SPECIAL_DISGUISE_AS_VEHICLE"), TEXT("SPECIAL_CHANGE_BATTLE_PLANS"), TEXT("SPECIAL_HELIX_NAPALM_BOMB"),
-			TEXT("SPECIAL_CLEANUP_AREA"), TEXT("SPECIAL_TANK_PARADROP") };
-		// (The generals' own variants carry a prefix: EARLY_SPECIAL_..., AIRF_SPECIAL_...)
-		const int32 EnumAt = P.Enum.Find(TEXT("SPECIAL_"), ESearchCase::IgnoreCase);
-		const FString BaseEnum = EnumAt != INDEX_NONE ? P.Enum.Mid(EnumAt) : P.Enum;
-		for (const TCHAR* Ported : PortedEnums)
-		{
-			P.bPorted |= BaseEnum.Equals(Ported, ESearchCase::IgnoreCase);
-		}
-		static const TPair<const TCHAR*, EGenAbilityKind> Kinds[] = {
-			{ TEXT("SPECIAL_INFANTRY_CAPTURE_BUILDING"), EGenAbilityKind::CaptureBuilding },
-			{ TEXT("SPECIAL_BLACKLOTUS_CAPTURE_BUILDING"), EGenAbilityKind::LotusCapture },
-			{ TEXT("SPECIAL_BLACKLOTUS_DISABLE_VEHICLE_HACK"), EGenAbilityKind::LotusVehicleHack },
-			{ TEXT("SPECIAL_BLACKLOTUS_STEAL_CASH_HACK"), EGenAbilityKind::LotusCashHack },
-			{ TEXT("SPECIAL_HACKER_DISABLE_BUILDING"), EGenAbilityKind::HackerDisableBuilding },
-			{ TEXT("SPECIAL_REMOTE_CHARGES"), EGenAbilityKind::RemoteCharges },
-			{ TEXT("SPECIAL_TIMED_CHARGES"), EGenAbilityKind::TimedCharges },
-			{ TEXT("SPECIAL_TANKHUNTER_TNT_ATTACK"), EGenAbilityKind::TankHunterTNT },
-			{ TEXT("SPECIAL_BOOBY_TRAP"), EGenAbilityKind::BoobyTrap },
-			{ TEXT("SPECIAL_MISSILE_DEFENDER_LASER_GUIDED_MISSILES"), EGenAbilityKind::LaserGuidedMissiles },
-			{ TEXT("SPECIAL_HELIX_NAPALM_BOMB"), EGenAbilityKind::HelixNapalmBomb },
-			{ TEXT("SPECIAL_DISGUISE_AS_VEHICLE"), EGenAbilityKind::Disguise } };
-		for (const TPair<const TCHAR*, EGenAbilityKind>& K : Kinds)
-		{
-			if (BaseEnum.Equals(K.Key, ESearchCase::IgnoreCase)) { P.AbilityKind = K.Value; }
+			ParsePower(*B);
 		}
 	}
 
 	UE_LOG(LogGenerals, Log, TEXT("Upgrade data: %d upgrades, %d sciences, %d ranks, %d special powers (%.2fs)"), Upgrades.Num(), Sciences.Num(),
 		Ranks.Num(), Powers.Num(), FPlatformTime::Seconds() - Start);
 	return true;
+}
+
+void FGenUpgradeData::ParsePower(const FGenIniBlock& B)
+{
+	const int32 FPS = GenLogic::GetLogicFPS();
+	// House rule: the Air Force General's carpet bomb recharges in 2:30, not the 4:00 its
+	// ReloadTime in SpecialPower.ini gives it.
+	static const TMap<FString, int32> ReloadMsOverride = { { TEXT("airf_superweaponcarpetbomb"), 150000 } };
+	FGenSpecialPowerTemplate& P = Powers.FindOrAdd(B.Name().ToLower());
+	P = FGenSpecialPowerTemplate();
+	P.Name = B.Name();
+	P.Enum = B.GetString(TEXT("Enum"));
+	P.ReloadTime = FMath::CeilToInt32(B.GetFloat(TEXT("ReloadTime"), 0.f) * float(FPS) / 1000.f);
+	if (const int32* Override = ReloadMsOverride.Find(B.Name().ToLower()))
+	{
+		P.ReloadTime = FMath::CeilToInt32(float(*Override) * float(FPS) / 1000.f);
+	}
+	P.ViewObjectFrames = FMath::CeilToInt32(B.GetFloat(TEXT("ViewObjectDuration"), 0.f) * float(FPS) / 1000.f);
+	P.ViewObjectRange = B.GetFloat(TEXT("ViewObjectRange"), 0.f);
+	P.RequiredScience = B.GetString(TEXT("RequiredScience"));
+	if (P.RequiredScience.Equals(TEXT("None"), ESearchCase::IgnoreCase)) { P.RequiredScience.Reset(); }
+	P.bPublicTimer = B.GetBool(TEXT("PublicTimer"));
+	P.bSharedSyncedTimer = B.GetBool(TEXT("SharedSyncedTimer"));
+	P.RadiusCursorRadius = B.GetFloat(TEXT("RadiusCursorRadius"), 0.f);
+	P.InitiateSound = B.GetString(TEXT("InitiateSound"));
+	P.InitiateAtLocationSound = B.GetString(TEXT("InitiateAtLocationSound"));
+	// The powers whose effect exists so far. (Not yet: mines, tunnels, weapon bonuses for an area,
+	// leaflets, the superweapon buildings, and the units' own abilities.)
+	static const TCHAR* PortedEnums[] = { TEXT("SPECIAL_DAISY_CUTTER"), TEXT("SPECIAL_PARADROP_AMERICA"), TEXT("SPECIAL_CARPET_BOMB"),
+		TEXT("SPECIAL_CHINA_CARPET_BOMB"), TEXT("SPECIAL_EMP_PULSE"), TEXT("SPECIAL_A10_THUNDERBOLT_STRIKE"), TEXT("SPECIAL_ARTILLERY_BARRAGE"),
+		TEXT("SPECIAL_CASH_HACK"), TEXT("SPECIAL_AMBUSH"), TEXT("SPECIAL_ANTHRAX_BOMB"), TEXT("SPECIAL_REPAIR_VEHICLES"), TEXT("SPECIAL_CASH_BOUNTY"),
+		TEXT("SPECIAL_SPY_SATELLITE"), TEXT("SPECIAL_RADAR_VAN_SCAN"), TEXT("SPECIAL_SPY_DRONE"), TEXT("SPECIAL_CIA_INTELLIGENCE"),
+		TEXT("SPECIAL_GPS_SCRAMBLER"), TEXT("SPECIAL_INFANTRY_CAPTURE_BUILDING"), TEXT("SPECIAL_BLACKLOTUS_CAPTURE_BUILDING"),
+		TEXT("SPECIAL_BLACKLOTUS_DISABLE_VEHICLE_HACK"), TEXT("SPECIAL_BLACKLOTUS_STEAL_CASH_HACK"), TEXT("SPECIAL_HACKER_DISABLE_BUILDING"),
+		TEXT("SPECIAL_REMOTE_CHARGES"), TEXT("SPECIAL_TIMED_CHARGES"), TEXT("SPECIAL_TANKHUNTER_TNT_ATTACK"), TEXT("SPECIAL_BOOBY_TRAP"),
+		TEXT("SPECIAL_MISSILE_DEFENDER_LASER_GUIDED_MISSILES"), TEXT("SPECIAL_SCUD_STORM"), TEXT("SPECIAL_NEUTRON_MISSILE"), TEXT("SPECIAL_PARTICLE_UPLINK_CANNON"), TEXT("SPECIAL_FRENZY"), TEXT("SPECIAL_LEAFLET_DROP"), TEXT("SPECIAL_CLUSTER_MINES"), TEXT("SPECIAL_SPECTRE_GUNSHIP"), TEXT("SPECIAL_SNEAK_ATTACK"), TEXT("SPECIAL_DISGUISE_AS_VEHICLE"), TEXT("SPECIAL_CHANGE_BATTLE_PLANS"), TEXT("SPECIAL_HELIX_NAPALM_BOMB"),
+		TEXT("SPECIAL_CLEANUP_AREA"), TEXT("SPECIAL_TANK_PARADROP"), TEXT("SPECIAL_BATTLESHIP_BOMBARDMENT") };
+	// (The generals' own variants carry a prefix: EARLY_SPECIAL_..., AIRF_SPECIAL_...)
+	const int32 EnumAt = P.Enum.Find(TEXT("SPECIAL_"), ESearchCase::IgnoreCase);
+	const FString BaseEnum = EnumAt != INDEX_NONE ? P.Enum.Mid(EnumAt) : P.Enum;
+	for (const TCHAR* Ported : PortedEnums)
+	{
+		P.bPorted |= BaseEnum.Equals(Ported, ESearchCase::IgnoreCase);
+	}
+	static const TPair<const TCHAR*, EGenAbilityKind> Kinds[] = {
+		{ TEXT("SPECIAL_INFANTRY_CAPTURE_BUILDING"), EGenAbilityKind::CaptureBuilding },
+		{ TEXT("SPECIAL_BLACKLOTUS_CAPTURE_BUILDING"), EGenAbilityKind::LotusCapture },
+		{ TEXT("SPECIAL_BLACKLOTUS_DISABLE_VEHICLE_HACK"), EGenAbilityKind::LotusVehicleHack },
+		{ TEXT("SPECIAL_BLACKLOTUS_STEAL_CASH_HACK"), EGenAbilityKind::LotusCashHack },
+		{ TEXT("SPECIAL_HACKER_DISABLE_BUILDING"), EGenAbilityKind::HackerDisableBuilding },
+		{ TEXT("SPECIAL_REMOTE_CHARGES"), EGenAbilityKind::RemoteCharges },
+		{ TEXT("SPECIAL_TIMED_CHARGES"), EGenAbilityKind::TimedCharges },
+		{ TEXT("SPECIAL_TANKHUNTER_TNT_ATTACK"), EGenAbilityKind::TankHunterTNT },
+		{ TEXT("SPECIAL_BOOBY_TRAP"), EGenAbilityKind::BoobyTrap },
+		{ TEXT("SPECIAL_MISSILE_DEFENDER_LASER_GUIDED_MISSILES"), EGenAbilityKind::LaserGuidedMissiles },
+		{ TEXT("SPECIAL_HELIX_NAPALM_BOMB"), EGenAbilityKind::HelixNapalmBomb },
+		{ TEXT("SPECIAL_DISGUISE_AS_VEHICLE"), EGenAbilityKind::Disguise } };
+	for (const TPair<const TCHAR*, EGenAbilityKind>& K : Kinds)
+	{
+		if (BaseEnum.Equals(K.Key, ESearchCase::IgnoreCase)) { P.AbilityKind = K.Value; }
+	}
+}
+
+void FGenUpgradeData::ApplyMapIni(const TArray<TSharedPtr<FGenIniBlock>>& Blocks)
+{
+	// UpgradeCenter::newUpgrade, SpecialPowerStore: a map's own numbers, gone again with the map.
+	Initialize();
+	for (const TPair<FString, FGenUpgradeTemplate>& It : MapIniSavedUpgrades)
+	{
+		Upgrades.Add(It.Key, It.Value);
+	}
+	for (const TPair<FString, FGenSpecialPowerTemplate>& It : MapIniSavedPowers)
+	{
+		Powers.Add(It.Key, It.Value);
+	}
+	MapIniSavedUpgrades.Reset();
+	MapIniSavedPowers.Reset();
+	for (const TSharedPtr<FGenIniBlock>& B : Blocks)
+	{
+		const FString Key = B->Name().ToLower();
+		if (B->Keyword.Equals(TEXT("Upgrade"), ESearchCase::IgnoreCase))
+		{
+			if (FGenUpgradeTemplate* U = Upgrades.Find(Key))
+			{
+				if (!MapIniSavedUpgrades.Contains(Key)) { MapIniSavedUpgrades.Add(Key, *U); }
+				U->DisplayName = B->GetString(TEXT("DisplayName"), U->DisplayName);
+				U->BuildCost = B->GetInt(TEXT("BuildCost"), U->BuildCost);
+				U->BuildTime = B->GetFloat(TEXT("BuildTime"), U->BuildTime);
+				U->ButtonImage = B->GetString(TEXT("ButtonImage"), U->ButtonImage);
+				U->ResearchSound = B->GetString(TEXT("ResearchSound"), U->ResearchSound);
+			}
+		}
+		else if (B->Keyword.Equals(TEXT("SpecialPower"), ESearchCase::IgnoreCase))
+		{
+			if (const FGenSpecialPowerTemplate* Old = Powers.Find(Key))
+			{
+				if (!MapIniSavedPowers.Contains(Key)) { MapIniSavedPowers.Add(Key, *Old); }
+				ParsePower(*B);
+			}
+		}
+	}
+}
+
+void FGenUpgradeData::DumpStats(TArray<FString>& Out) const
+{
+	auto Add = [&Out](const TCHAR* Kind, const FString& Name, const TCHAR* Field, const FString& Value)
+	{
+		Out.Add(FString::Printf(TEXT("%s|%s|%s|%s"), Kind, *Name.ToLower(), Field, *Value));
+	};
+	auto Names = [](TArray<FString> V) { for (FString& S : V) { S.ToLowerInline(); } V.Sort(); return FString::Join(V, TEXT(" ")); };
+	for (const TPair<FString, FGenUpgradeTemplate>& It : Upgrades)
+	{
+		const FGenUpgradeTemplate& U = It.Value;
+		Add(TEXT("U"), U.Name, TEXT("BuildCost"), FString::FromInt(U.BuildCost));
+		Add(TEXT("U"), U.Name, TEXT("BuildTime"), FString::Printf(TEXT("%.6f"), U.BuildTime));
+		Add(TEXT("U"), U.Name, TEXT("Object"), FString::FromInt(U.bObjectUpgrade ? 1 : 0));
+	}
+	for (const TPair<FString, FGenScience>& It : Sciences)
+	{
+		const FGenScience& S = It.Value;
+		Add(TEXT("S"), S.Name, TEXT("Cost"), FString::FromInt(S.PurchaseCost));
+		Add(TEXT("S"), S.Name, TEXT("Prerequisites"), Names(S.Prerequisites));
+		Add(TEXT("S"), S.Name, TEXT("Grantable"), FString::FromInt(S.bGrantable ? 1 : 0));
+	}
+	for (int32 i = 0; i < Ranks.Num(); ++i)
+	{
+		const FString Rank = FString::FromInt(i + 1);
+		Add(TEXT("R"), Rank, TEXT("Skill"), FString::FromInt(Ranks[i].SkillPointsNeeded));
+		Add(TEXT("R"), Rank, TEXT("Points"), FString::FromInt(Ranks[i].PurchasePointsGranted));
+		Add(TEXT("R"), Rank, TEXT("Sciences"), Names(Ranks[i].SciencesGranted));
+	}
+	for (const TPair<FString, FGenSpecialPowerTemplate>& It : Powers)
+	{
+		const FGenSpecialPowerTemplate& P = It.Value;
+		Add(TEXT("P"), P.Name, TEXT("Reload"), FString::FromInt(P.ReloadTime));
+		Add(TEXT("P"), P.Name, TEXT("RequiredScience"), P.RequiredScience.ToLower());
+		Add(TEXT("P"), P.Name, TEXT("Public"), FString::FromInt(P.bPublicTimer ? 1 : 0));
+		Add(TEXT("P"), P.Name, TEXT("Shared"), FString::FromInt(P.bSharedSyncedTimer ? 1 : 0));
+		Add(TEXT("P"), P.Name, TEXT("Radius"), FString::Printf(TEXT("%.6f"), P.RadiusCursorRadius));
+		Add(TEXT("P"), P.Name, TEXT("ViewFrames"), FString::FromInt(P.ViewObjectFrames));
+		Add(TEXT("P"), P.Name, TEXT("ViewRange"), FString::Printf(TEXT("%.6f"), P.ViewObjectRange));
+	}
 }
 
 const FGenUpgradeTemplate* FGenUpgradeData::FindUpgrade(const FString& Name) const
@@ -209,6 +295,7 @@ bool FGenUpgradeData::ParseUpgradeModule(const FString& Type, const FGenIniBlock
 	Out.ModuleType = Type;
 	AppendNames(*Trigger, Out.TriggeredBy);
 	if (const FGenIniEntry* C = Block.Find(TEXT("ConflictsWith"))) { AppendNames(*C, Out.ConflictsWith); }
+	if (const FGenIniEntry* R = Block.Find(TEXT("RemovesUpgrades"))) { AppendNames(*R, Out.RemovesUpgrades); }
 	Out.bRequiresAllTriggers = Block.GetBool(TEXT("RequiresAllTriggers"));
 	auto Is = [&Type](const TCHAR* Name) { return Type.Equals(Name, ESearchCase::IgnoreCase); };
 
@@ -351,6 +438,8 @@ bool FGenUpgradeData::ParseSpecialPowerModule(const FString& Type, const FGenIni
 	{
 		Out.Type = EGenPowerModule::SpyVision;
 		Out.Duration = GenLogic::MsecToFrames(Block.GetFloat(TEXT("BaseDuration"), 0.f));
+		Out.BonusDurationPerCaptured = GenLogic::MsecToFrames(Block.GetFloat(TEXT("BonusDurationPerCaptured"), 0.f));
+		Out.MaxDuration = GenLogic::MsecToFrames(Block.GetFloat(TEXT("MaxDuration"), 0.f));
 	}
 	else if (Type.Equals(TEXT("SpecialAbility"), ESearchCase::IgnoreCase))
 	{
@@ -367,6 +456,11 @@ bool FGenUpgradeData::ParseSpecialPowerModule(const FString& Type, const FGenIni
 	{
 		Out.Type = EGenPowerModule::BaikonurLaunch;
 		Out.DetonationObject = Block.GetString(TEXT("DetonationObject"));
+	}
+	else if (Type.Equals(TEXT("FireWeaponPower"), ESearchCase::IgnoreCase))
+	{
+		Out.Type = EGenPowerModule::FireWeapon;
+		Out.MaxShotsToFire = Block.GetInt(TEXT("MaxShotsToFire"), 1);
 	}
 	return true;
 }
@@ -503,6 +597,7 @@ void FGenUpgradeData::ParseAutoHeal(const FGenIniBlock& Block, FGenAutoHeal& Out
 	Out.bStartsActive = Block.GetBool(TEXT("StartsActive"));
 	Out.bSingleBurst = Block.GetBool(TEXT("SingleBurst"));
 	Out.bAffectsWholePlayer = Block.GetBool(TEXT("AffectsWholePlayer"));
+	Out.bSkipSelf = Block.GetBool(TEXT("SkipSelfForHealing"));
 	for (const FGenIniEntry& E : Block.Entries)
 	{
 		if (E.Key.Equals(TEXT("KindOf"), ESearchCase::IgnoreCase)) { for (const FString& V : E.Values) { Out.KindOf.Add(V.ToUpper()); } }

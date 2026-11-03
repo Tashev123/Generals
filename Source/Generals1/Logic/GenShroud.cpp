@@ -26,6 +26,8 @@ void FGenShroud::Init(const FVector2f& MapSize, float InCellSize, int32 NumPlaye
 	CellsX = FMath::Max(1, FMath::CeilToInt32(MapSize.X / CellSize));
 	CellsY = FMath::Max(1, FMath::CeilToInt32(MapSize.Y / CellSize));
 	PlayerCount = FMath::Clamp(NumPlayers, 1, 32);
+	ActiveX = CellsX;
+	ActiveY = CellsY;
 	// "Passive shroud": nobody has looked anywhere yet.
 	Current.Init(1, PlayerCount * CellsX * CellsY);
 	Serials.Init(1, PlayerCount);
@@ -34,6 +36,7 @@ void FGenShroud::Init(const FVector2f& MapSize, float InCellSize, int32 NumPlaye
 void FGenShroud::Reset()
 {
 	CellsX = CellsY = 0;
+	ActiveX = ActiveY = 0;
 	PlayerCount = 0;
 	Current.Reset();
 	Serials.Reset();
@@ -42,7 +45,7 @@ void FGenShroud::Reset()
 
 EGenCellShroud FGenShroud::GetStatus(int32 Player, int32 X, int32 Y) const
 {
-	if (Player < 0 || Player >= PlayerCount || X < 0 || Y < 0 || X >= CellsX || Y >= CellsY)
+	if (Player < 0 || Player >= PlayerCount || X < 0 || Y < 0 || X >= ActiveX || Y >= ActiveY)
 	{
 		return EGenCellShroud::Shrouded;
 	}
@@ -133,11 +136,11 @@ void FGenShroud::ForEachCell(const FGenSighting& S, FnType Fn)
 	for (const FSpan& Span : Spans)
 	{
 		const int32 Y = S.CellY + Span.Y;
-		if (Y < 0 || Y >= CellsY)
+		if (Y < 0 || Y >= ActiveY)
 		{
 			continue;
 		}
-		const int32 X0 = FMath::Max(S.CellX + Span.X0, 0), X1 = FMath::Min(S.CellX + Span.X1, CellsX - 1);
+		const int32 X0 = FMath::Max(S.CellX + Span.X0, 0), X1 = FMath::Min(S.CellX + Span.X1, ActiveX - 1);
 		for (int32 X = X0; X <= X1; ++X)
 		{
 			Fn(Y * CellsX + X);
@@ -187,16 +190,85 @@ void FGenShroud::ProcessQueue(uint32 Frame)
 	}
 }
 
+void FGenShroud::SwitchActiveArea(int32 NewX, int32 NewY, TFunctionRef<void()> Forget, TFunctionRef<void()> Look)
+{
+	// processEntirePendingUndoShroudRevealQueue
+	for (const FPendingUndo& P : Pending)
+	{
+		UndoReveal(P.Sighting);
+	}
+	Pending.Reset();
+	// storeFoggedCells: what is clear now counts as permanently revealed (the objects' looks aren't taken back first).
+	enum : uint8 { DontTouch, Fog, Permanent };
+	const int32 StoreX = ActiveX, StoreY = ActiveY;
+	TArray<uint8> Store;
+	Store.Init(DontTouch, PlayerCount * StoreX * StoreY);
+	for (int32 Player = 0; Player < PlayerCount; ++Player)
+	{
+		for (int32 Y = 0; Y < StoreY; ++Y)
+		{
+			for (int32 X = 0; X < StoreX; ++X)
+			{
+				const EGenCellShroud Status = GetStatus(Player, X, Y);
+				Store[(Player * StoreY + Y) * StoreX + X] = Status == EGenCellShroud::Clear ? Permanent : (Status == EGenCellShroud::Fogged ? Fog : DontTouch);
+			}
+		}
+	}
+	Forget();
+	// reset + init
+	for (int16& C : Current)
+	{
+		C = 1;
+	}
+	for (uint32& Serial : Serials)
+	{
+		++Serial;
+	}
+	SetActiveCells(NewX, NewY);
+	auto Restore = [&](uint8 What)
+	{
+		// restoreFoggedCells, its early way out and all.
+		for (int32 Player = 0; Player < PlayerCount; ++Player)
+		{
+			for (int32 Y = 0; Y < StoreY; ++Y)
+			{
+				if (Y >= ActiveY)
+				{
+					return; // "All done."
+				}
+				for (int32 X = 0; X < StoreX && X < ActiveX; ++X)
+				{
+					if (Store[(Player * StoreY + Y) * StoreX + X] == What)
+					{
+						const int32 Index = Y * CellsX + X;
+						AddLooker(Player, Index);
+						if (What == Fog)
+						{
+							RemoveLooker(Player, Index);
+						}
+					}
+				}
+			}
+		}
+	};
+	Restore(Permanent);
+	Look();
+	Restore(Fog);
+}
+
 void FGenShroud::RevealMapForPlayer(int32 Player)
 {
 	if (Player < 0 || Player >= PlayerCount)
 	{
 		return;
 	}
-	for (int32 i = 0, Num = CellsX * CellsY; i < Num; ++i)
+	for (int32 Y = 0; Y < ActiveY; ++Y)
 	{
-		AddLooker(Player, i);
-		RemoveLooker(Player, i);
+		for (int32 X = 0; X < ActiveX; ++X)
+		{
+			AddLooker(Player, Y * CellsX + X);
+			RemoveLooker(Player, Y * CellsX + X);
+		}
 	}
 }
 
@@ -206,9 +278,12 @@ void FGenShroud::RevealMapForPlayerPermanently(int32 Player)
 	{
 		return;
 	}
-	for (int32 i = 0, Num = CellsX * CellsY; i < Num; ++i)
+	for (int32 Y = 0; Y < ActiveY; ++Y)
 	{
-		AddLooker(Player, i);
+		for (int32 X = 0; X < ActiveX; ++X)
+		{
+			AddLooker(Player, Y * CellsX + X);
+		}
 	}
 }
 
@@ -218,9 +293,31 @@ void FGenShroud::UndoRevealMapForPlayerPermanently(int32 Player)
 	{
 		return;
 	}
-	for (int32 i = 0, Num = CellsX * CellsY; i < Num; ++i)
+	for (int32 Y = 0; Y < ActiveY; ++Y)
 	{
-		RemoveLooker(Player, i);
+		for (int32 X = 0; X < ActiveX; ++X)
+		{
+			RemoveLooker(Player, Y * CellsX + X);
+		}
+	}
+}
+
+void FGenShroud::ShroudCells(const FGenSighting& S)
+{
+	for (int32 Player = 0; Player < PlayerCount; ++Player)
+	{
+		if (S.Mask & (1u << Player))
+		{
+			ForEachCell(S, [this, Player](int32 Index)
+			{
+				int16& C = Current[Player * CellsX * CellsY + Index];
+				if (C == 0)
+				{
+					C = 1;
+					++Serials[Player];
+				}
+			});
+		}
 	}
 }
 
@@ -230,13 +327,16 @@ void FGenShroud::ShroudMapForPlayer(int32 Player)
 	{
 		return;
 	}
-	for (int32 i = 0, Num = CellsX * CellsY; i < Num; ++i)
+	for (int32 Y = 0; Y < ActiveY; ++Y)
 	{
-		int16& C = Current[Player * CellsX * CellsY + i];
-		if (C == 0)
+		for (int32 X = 0; X < ActiveX; ++X)
 		{
-			C = 1;
-			++Serials[Player];
+			int16& C = Current[Player * CellsX * CellsY + Y * CellsX + X];
+			if (C == 0)
+			{
+				C = 1;
+				++Serials[Player];
+			}
 		}
 	}
 }
@@ -352,7 +452,10 @@ void UGenGameLogic::InitShroud()
 	const FGenGameData& GD = FGenGameData::Get();
 	const FBox2f Bounds = Map->GetLargestBounds();
 	Shroud.Init(Bounds.Max, GD.PartitionCellSize, Players.Num());
+	const FBox2f Active = Map->GetPlayableBounds();
+	Shroud.SetActiveCells(FMath::CeilToInt32(Active.Max.X / Shroud.GetCellSize()), FMath::CeilToInt32(Active.Max.Y / Shroud.GetCellSize()));
 	RadarEvents.Reset();
+	bUnderAttackGlow = false;
 	bHasLastRadarEvent = false;
 
 	// Who sees through whose eyes: allies share what they see.
@@ -804,6 +907,8 @@ void UGenGameLogic::TryUnderAttackEvent(const FGenObject& Obj)
 	{
 		return;
 	}
+	bUnderAttackGlow = true;
+	LastUnderAttackFrame = Frame;
 	const TCHAR* Label = TEXT("RADAR:UnderAttack");
 	// (The original plays its "structure under attack" sound for everything but harvesters.)
 	const TCHAR* Sound = TEXT("RadarNotifyStructureUnderAttackSound");

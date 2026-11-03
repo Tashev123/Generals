@@ -17,6 +17,7 @@ enum class EGenCommandType : uint8
 	ForceAttackGround,
 	SwitchWeapon,
 	CreateFormation,
+	Scatter,
 	Land,
 	Attack,
 	SteerGunship,
@@ -47,6 +48,8 @@ enum class EGenCommandType : uint8
 	Cheat,
 	/** From the game's host, not a player: Name says what (see UGenGameLogic::ExecSession). */
 	Session,
+	/** A campaign's NAMED_SELECTED: what the player has selected. Units: that. */
+	NoteSelection,
 	Count
 };
 

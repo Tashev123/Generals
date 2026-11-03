@@ -34,6 +34,17 @@ struct FGenSectionMaterial
 	FVector2f UVPerSec = FVector2f::ZeroVector;
 	FVector2f UVStart = FVector2f::ZeroVector;
 	FVector2f UVScale = FVector2f(1.f, 1.f);
+
+	// A second texture on the second set of coordinates. Stage 1 of the mesh's pass: DetailMode is the shader's
+	// detail colour function (2 scale, 4 add, ...), DetailAlphaMode its detail alpha function. Or a mesh's additive
+	// second pass (lights in the windows at night, glows): DetailMode 9, added to what the lights make of the rest.
+	FString DetailTexture;
+	uint8 DetailMode = 0;
+	uint8 DetailAlphaMode = 0;
+	FLinearColor DetailTint = FLinearColor::White;
+	FVector2f DetailUVPerSec = FVector2f::ZeroVector;
+	FVector2f DetailUVStart = FVector2f::ZeroVector;
+	FVector2f DetailUVScale = FVector2f(1.f, 1.f);
 };
 
 /**

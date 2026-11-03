@@ -75,7 +75,7 @@ int32 FGenObject::GetActiveBattlePlan() const
 
 float FGenObject::GetVisionRange() const
 {
-	return Template->VisionRange * VisionScalar;
+	return (MapVisionRange >= 0.f ? MapVisionRange : Template->VisionRange) * VisionScalar;
 }
 
 void FGenObject::UpdateBattlePlan(uint32 Frame)
@@ -328,6 +328,30 @@ void FGenObject::ChangeMaxHealth(float NewMax, const FString& ChangeType)
 	else if (ChangeType == TEXT("ADD_CURRENT_HEALTH_TOO")) { Health += MaxHealth - OldMax; }
 	else if (ChangeType == TEXT("FULLY_HEAL")) { Health = MaxHealth; }
 	Health = FMath::Clamp(Health, bDead ? 0.f : 1.f, MaxHealth);
+}
+
+void FGenObject::SetReceivingDifficultyBonus(bool bReceive)
+{
+	if (bReceive == !DifficultyBonusCondition.IsEmpty() || !Logic->IsCampaign()) // ("isInSinglePlayerGame")
+	{
+		return;
+	}
+	if (!bReceive)
+	{
+		ChangeMaxHealth(MaxHealth / DifficultyHealthFactor, TEXT("PRESERVE_RATIO"));
+		BonusConditions.Remove(DifficultyBonusCondition);
+		DifficultyBonusCondition.Reset();
+		DifficultyHealthFactor = 1.f;
+		return;
+	}
+	const TArray<FGenPlayer>& Players = Logic->GetPlayers();
+	const bool bHuman = Players.IsValidIndex(Owner) && Players[Owner].bHuman;
+	const int32 Difficulty = FMath::Clamp(Logic->GetMatchSettings().DefaultDifficulty, 0, 2);
+	static const TCHAR* Levels[3] = { TEXT("EASY"), TEXT("NORMAL"), TEXT("HARD") };
+	DifficultyBonusCondition = FString::Printf(TEXT("SOLO_%s_%s"), bHuman ? TEXT("HUMAN") : TEXT("AI"), Levels[Difficulty]);
+	BonusConditions.AddUnique(DifficultyBonusCondition);
+	DifficultyHealthFactor = FGenGameData::Get().SoloHealthBonus[bHuman ? 0 : 1][Difficulty];
+	ChangeMaxHealth(MaxHealth * DifficultyHealthFactor, TEXT("PRESERVE_RATIO"));
 }
 
 bool FGenObject::RecenterTurrets()

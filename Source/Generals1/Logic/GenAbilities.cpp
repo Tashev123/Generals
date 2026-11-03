@@ -124,7 +124,7 @@ bool UGenGameLogic::DefectObject(FGenObject& Obj, int32 NewOwner)
 	return true;
 }
 
-void UGenGameLogic::ChangeOwner(FGenObject& Obj, int32 NewOwner)
+void UGenGameLogic::ChangeOwner(FGenObject& Obj, int32 NewOwner, bool bCaptured)
 {
 	const int32 OldOwner = Obj.GetOwner();
 	if (OldOwner == NewOwner || !Players.IsValidIndex(NewOwner))
@@ -140,15 +140,19 @@ void UGenGameLogic::ChangeOwner(FGenObject& Obj, int32 NewOwner)
 	Obj.SetOwner(NewOwner);
 	AddBattlePlanBonuses(Obj, NewOwner);
 
-	// Object::onCapture: "everybody chills when they are captured"
-	Obj.OnPlayerCommand(false);
-	Obj.ClearAttack();
-	if (Obj.CanMove())
+	// Object::onCapture: "everybody chills when they are captured" (a script's Object::setTeam isn't a capture: it
+	// goes on with what it was doing, and isn't scored).
+	if (bCaptured)
 	{
-		Obj.CommandStop();
+		Obj.OnPlayerCommand(false);
+		Obj.ClearAttack();
+		if (Obj.CanMove())
+		{
+			Obj.CommandStop();
+		}
 	}
 	// ScoreKeeper::addObjectCaptured
-	if (!Players[NewOwner].bNeutral && Obj.IsKindOf(TEXT("STRUCTURE")))
+	if (bCaptured && !Players[NewOwner].bNeutral && Obj.IsKindOf(TEXT("STRUCTURE")))
 	{
 		++(Obj.IsKindOf(TEXT("SCORE")) ? Players[NewOwner].Score.FactionBuildingsCaptured : Players[NewOwner].Score.TechBuildingsCaptured);
 	}
@@ -171,8 +175,12 @@ void UGenGameLogic::ChangeOwner(FGenObject& Obj, int32 NewOwner)
 		UE_LOG(LogGenerals, Log, TEXT("  [capture f%u] #%u %s at (%.0f, %.0f) goes from p%d to p%d"), Frame, Obj.GetID(), *Obj.GetTemplate()->Name,
 			Obj.GetPosition().X, Obj.GetPosition().Y, OldOwner, NewOwner);
 	}
-	// "The skirmish ai doesn't know what to do with captured faction buildings except sell them."
-	if (Players[NewOwner].bSkirmishAI && Obj.IsKindOf(TEXT("STRUCTURE")) && IsFactionStructure(Obj))
+	// "Design needs the player to be able to sell buildings he steals from the AI's build list."
+	Obj.bScriptUnsellable = false;
+	// "The skirmish ai doesn't know what to do with captured faction buildings except sell them." (A mission's sides aren't
+	// skirmish AIs in the original - Player::setPlayerType gives them a plain AIPlayer - and mission 3's cut scene hands
+	// them a whole base.)
+	if (Players[NewOwner].bSkirmishAI && !IsCampaign() && Obj.IsKindOf(TEXT("STRUCTURE")) && IsFactionStructure(Obj))
 	{
 		FGenCommand Sell(EGenCommandType::Sell);
 		Sell.Player = NewOwner;
@@ -624,6 +632,7 @@ bool FGenObject::StartAbilityPreparation(const FGenAbilityData& D, EGenAbilityKi
 		}
 		SetModelCondition(UnpackingBit(), false);
 		SetModelCondition(RaisingFlagBit(), true);
+		SetDrawAnimDuration(D.PreparationFrames); // (draw->setAnimationCompletionTime: the flag is up when the time is up)
 		// "Warn the victim so he might have a chance to react!"
 		Logic->EvaEvent(TEXT("BuildingBeingStolen"), Target->GetOwner());
 		if (Target->GetOwner() == Logic->GetLocalPlayer())
@@ -856,6 +865,7 @@ void FGenObject::UpdateAbility(uint32 Frame)
 		SetModelCondition(RaisingFlagBit(), false);
 		SetModelCondition(FiringABit(), false);
 		SetModelCondition(PackingBit(), true);
+		SetDrawAnimDuration(AbilityAnimFrames); // ("Sync the animation length to the time it'll take to pack.")
 		Logic->PlaySoundAt(D.PackSound, *this);
 		if (bSuccess)
 		{
@@ -982,6 +992,7 @@ void FGenObject::UpdateAbility(uint32 Frame)
 			AbilityAnimFrames = FMath::Max(1, FMath::RoundToInt32(float(D.UnpackFrames) * Logic->GetRandom().FRandRange(1.f - D.PackUnpackVariation, 1.f + D.PackUnpackVariation)));
 			SetModelCondition(PackingBit(), false);
 			SetModelCondition(UnpackingBit(), true);
+			SetDrawAnimDuration(AbilityAnimFrames); // ("Sync the animation length to the time it'll take to unpack.")
 			Logic->PlaySoundAt(D.UnpackSound, *this);
 			if (bMoving)
 			{
@@ -1323,9 +1334,7 @@ void FGenObject::UpdateButtonHunt(uint32 Frame)
 		return; // busy with the last one
 	}
 	// scanClosestTarget: the best thing in range the ability can be used on - by the team's attack
-	// priorities, less a point for every so much distance. (Priority sets aren't ported; the one the
-	// scripts give capture teams is "tech buildings 5000", everything else the default 1 - so: the
-	// nearest tech building, and failing that the nearest thing of any kind.)
+	// priorities, less a point for every so much distance.
 	if (!Logic->IsPowerReady(*this, Module))
 	{
 		return;
@@ -1333,7 +1342,8 @@ void FGenObject::UpdateButtonHunt(uint32 Frame)
 	const EGenAbilityKind Kind = Power->AbilityKind;
 	const bool bFlagCapture = Kind == EGenAbilityKind::CaptureBuilding;
 	const FGenObject* Best = nullptr;
-	float BestScore = 0.f;
+	int32 BestEffective = 0, BestActual = 0;
+	const float Modifier = FMath::Max(FGenAIData::Get().AttackPriorityDistanceModifier, 1.f);
 	for (FGenObjectID Id : Logic->GetObjectIDs())
 	{
 		const FGenObject* O = Logic->FindObject(Id);
@@ -1361,11 +1371,16 @@ void FGenObject::UpdateButtonHunt(uint32 Frame)
 		{
 			continue;
 		}
-		const float Priority = (IsCaptureKind(Kind) && O->IsKindOf(TEXT("TECH_BUILDING"))) ? 5000.f : 1.f;
-		const float Score = FMath::Max(1.f, Priority - Dist / 100.f) + 1.f / (1.f + Dist); // (the nearer of equals)
-		if (Score > BestScore)
+		const int32 Priority = AttackInfo ? AttackInfo->GetPriority(O->GetTemplate()->Canonical()) : int32(Template->HuntScanRange - Dist);
+		if (Priority == 0)
 		{
-			BestScore = Score;
+			continue; // "don't attack 0 priority targets."
+		}
+		const int32 Effective = FMath::Max(1, Priority - int32(Dist / Modifier));
+		if (Effective > BestEffective || (Effective == BestEffective && Priority > BestActual))
+		{
+			BestEffective = Effective;
+			BestActual = Priority;
 			Best = O;
 		}
 	}

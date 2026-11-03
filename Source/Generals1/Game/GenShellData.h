@@ -45,6 +45,7 @@ public:
 	void Initialize();
 
 	const TArray<FGenMapInfo>& GetMaps() const { return Maps; }
+	/** A map of the list, or a generated one (a name of GenRandomMap's stands for its map; not in the list). */
 	const FGenMapInfo* FindMap(const FString& Name) const;
 	const TArray<FGenPlayerColorDef>& GetColors() const { return Colors; }
 	const TArray<int32>& GetMoneyChoices() const { return MoneyChoices; }
@@ -62,6 +63,9 @@ private:
 
 	bool bInitialized = false;
 	TArray<FGenMapInfo> Maps;
+	/** The generated maps asked about so far, by lower case name (the network server's thread asks too). */
+	mutable TMap<FString, TSharedPtr<FGenMapInfo>> RandomMaps;
+	mutable FCriticalSection RandomMapsLock;
 	TArray<FGenPlayerColorDef> Colors;
 	TArray<int32> MoneyChoices;
 	int32 DefaultMoney = 10000;

@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "Logic/GenLogicTypes.h"
 #include "Logic/GenScriptTypes.h"
+#include "Logic/GenTeams.h"
 #include "Map/GenMapData.h"
 
 class UGenGameLogic;
@@ -57,12 +58,17 @@ struct GENERALS1_API FGenAISideInfo
 	TArray<FString> SkillSets[5];                 // SkillSet1..5: sciences to buy, in order
 };
 
+struct FGenIniBlock;
+
 class GENERALS1_API FGenAIData
 {
 public:
 	static FGenAIData& Get();
 	void Initialize();
+	/** A map's map.ini: its AIData over this one's, for as long as the map lasts. */
+	void ApplyMapIni(const TArray<TSharedPtr<FGenIniBlock>>& Blocks);
 
+	float AttackPriorityDistanceModifier = 100.f; // "The distance required to reduce attack priority by 1."
 	float StructureSeconds = 0.f;
 	float TeamSeconds = 10.f;
 	int32 Wealthy = 7000;
@@ -91,7 +97,9 @@ public:
 	TMap<FString, TArray<FGenAIBuildListEntry>> BuildLists;       // key: side
 
 private:
+	void ApplyBlocks(const TArray<TSharedPtr<FGenIniBlock>>& Blocks);
 	bool bInitialized = false;
+	TSharedPtr<FGenAIData> MapIniSaved; // what it was before the loaded map's map.ini
 };
 
 // ---- the computer player ----------------------------------------------------------------------
@@ -138,24 +146,8 @@ struct GENERALS1_API FGenTeamInQueue
 	uint32 FrameStarted = 0;
 };
 
-/** Team instance. Id 0 is the player's default team: everything that belongs to no other team. */
-struct GENERALS1_API FGenTeam
-{
-	int32 Id = 0;
-	int32 Proto = INDEX_NONE;                   // index into the player's team prototypes
-	bool bActive = false;                       // false while it is being assembled
-	bool bCreated = false;                      // activated this frame: the on-create script is due
-	TArray<FGenObjectID> Members;
-	bool bGenericPending[FGenTeamProto::MaxGenericScripts];
-	int8 Recruitable = -1;                      // -1: as the prototype says
-	int32 CurUnits = 0;
-	int32 DestroyThreshold = -1;
-	bool bWasIdle = false;
-	bool bEnteredOrExited = false;
-	TArray<uint8> InsideFlags;                  // per watched trigger: was the whole team inside last frame
-
-	FGenTeam() { for (bool& B : bGenericPending) { B = true; } }
-};
+/** Team instance: the game's one team registry's (GenTeams.h), the same one a map's script engine uses. A player's default team
+ *  holds whatever it has that is on no other team. */
 
 /** A script whose actions run one after the other, each waiting for the team to finish the previous one. */
 struct GENERALS1_API FGenSequentialScript
@@ -168,9 +160,10 @@ struct GENERALS1_API FGenSequentialScript
 };
 
 /**
- * A skirmish computer player: AIPlayer / AISkirmishPlayer (base building from AIData.ini's build list,
- * dozers, gatherers, assembling teams) driven by the original skirmish scripts, with the part of the
- * script engine those scripts need (ScriptEngine, ScriptConditions, ScriptActions, Team).
+ * A computer player: AIPlayer / AISkirmishPlayer (base building from a build list, dozers, gatherers,
+ * assembling teams) driven by scripts. In a skirmish the build list is AIData.ini's and the player has the
+ * part of the script engine its own scripts need (GenSkirmishScripts.cpp); in a campaign mission the build
+ * list is the map's own side list and the scripts are the map's, so this is production only.
  */
 class GENERALS1_API FGenSkirmishAI
 {
@@ -181,6 +174,8 @@ public:
 
 	void NewMap();
 	void Update(uint32 Frame);
+	/** Team::notifyTeamOfObjectDeath: one of this player's team's members was destroyed. */
+	void NotifyTeamOfObjectDeath(FGenObject& Obj);
 	void OnUnitProduced(const FGenObject& Factory, FGenObject& Unit);
 	void OnStructureProduced(FGenObject& Building);
 
@@ -192,9 +187,30 @@ public:
 	/** One line for traces: money, buildings, teams, counters. */
 	FString Describe() const;
 
+	// --- what a map's script asks this player to do (GenMapScriptActions.cpp) ---
+	/** A_BUILD_TEAM: Team::buildSpecificTeam for a team definition the map named. */
+	void BuildTeamFromScript(int32 ProtoIndex) { BuildSpecificTeam(ProtoIndex, true); }
+	/** What a map's own scripts ask of the computer player of a Generals' Challenge side. */
+	bool ScriptSupplySourceSafe(int32 MinSupplies) { return IsSupplySourceSafe(MinSupplies); }
+	void ScriptBuildBySupplies(int32 MinimumCash, const FString& ThingName) { BuildBySupplies(MinimumCash, ThingName); }
+	void ScriptFollowApproachPath(FGenTeam& Team, const FString& Label, bool bMoveToStartOnly) { TeamFollowApproachPath(Team, Label, bMoveToStartOnly); }
+	void ScriptGuardSupplyCenter(FGenTeam& Team, int32 MinSupplies);
+	/** A_SKIRMISH_FIRE_SPECIAL_POWER_AT_MOST_COST. */
+	void FireSpecialPowerFromScript(const FString& PowerName) { FireSpecialPowerAtMostCost(PowerName); }
+	/** A_RECRUIT_TEAM: Player::recruitSpecificTeam. */
+	void RecruitTeamFromScript(int32 ProtoIndex, float RecruitRadius) { RecruitSpecificTeam(ProtoIndex, RecruitRadius); }
+	/** A_AI_PLAYER_BUILD_UPGRADE */
+	void BuildUpgradeFromScript(const FString& UpgradeName) { BuildUpgrade(UpgradeName); }
+	/** A_SET_BASE_CONSTRUCTION_SPEED: AIPlayer::setTeamDelaySeconds. */
+	void SetTeamSecondsFromScript(int32 Seconds) { ScriptTeamSeconds = Seconds; }
+	/** A_PLAYER_SELECT_SKILLSET: Player::friend_setSkillset, numbered from 1. */
+	void SetSkillsetFromScript(int32 Skillset) { SkillSetSelector = FMath::Clamp(Skillset - 1, 0, 4); }
+
 private:
 	// --- AIPlayer / AISkirmishPlayer (GenSkirmishAI.cpp) ---
 	void AdjustBuildList();
+	/** Player::addToBuildList: a building the game already placed becomes an entry of its own. */
+	void AddToBuildList(FGenObject& Building);
 	void ComputeCenterAndRadiusOfBase();
 	FGenObject* BuildStructureNow(FGenBuildListInfo& Info);
 	FGenObject* BuildStructureWithDozer(FGenBuildListInfo& Info);
@@ -241,21 +257,27 @@ private:
 	bool ComputeSuperweaponTarget(bool bTargetMilitaryUnits, int32 EnemyIndex, float WeaponRadius, FVector3f& OutPos) const;
 	int32 GetPlayerSuperweaponValue(const FVector2f& Center, int32 EnemyIndex, float Radius, bool bIncludeMilitaryUnits) const;
 
-	// --- teams ---
-	FGenTeam* FindTeam(int32 TeamId);
+	// --- teams (the game's team registry, GenTeams.h) ---
+	FGenTeam* FindTeam(int32 TeamId) const { return TF.FindTeam(TeamId); }
+	/** TeamFactory::createInactiveTeam, plus the definition's production condition when it runs its actions. */
 	FGenTeam& CreateTeam(int32 ProtoIndex);
-	int32 CountTeamInstances(int32 ProtoIndex) const;
-	int32 FindProto(const FString& Name) const;
+	int32 CountTeamInstances(int32 ProtoIndex) const { return TF.CountTeamInstances(ProtoIndex); }
+	int32 FindProto(const FString& Name) const { return TF.FindProto(Name); }
 	void SetObjectTeam(FGenObjectID Object, int32 TeamId);
-	int32 GetObjectTeam(FGenObjectID Object) const;
+	int32 GetObjectTeam(FGenObjectID Object) const { return TF.GetObjectTeam(Object); }
 	void SetTeamActive(FGenTeam& Team);
 	void DeleteTeam(int32 TeamId);
 	void PurgeDeadMembers();
 	FGenObject* TryToRecruit(const FGenTeam& ForTeam, const FGenThingTemplate& Thing, const FVector3f& Home, float MaxDist);
 	bool TeamHasUnits(const FGenTeam& Team) const;
 	bool TeamIsIdle(const FGenTeam& Team) const;
-	bool GetTeamCenter(const FGenTeam& Team, FVector2f& OutCenter) const;
+	bool GetTeamCenter(const FGenTeam& Team, FVector2f& OutCenter) const { return TF.GetTeamCenter(Team, OutCenter); }
 	void ForEachMember(const FGenTeam& Team, TFunctionRef<void(FGenObject&)> Fn) const;
+	/** Whether this player's teams and definitions are its own: in a campaign the registry holds every side's. */
+	bool Owns(const FGenTeam& Team) const { return Team.Player == Player; }
+	bool Owns(int32 ProtoIndex) const { return TF.ProtoPlayers.IsValidIndex(ProtoIndex) && TF.ProtoPlayers[ProtoIndex] == Player; }
+	/** The id of this player's default team (Player::setDefaultTeam). */
+	int32 DefaultTeamId() const { return TF.EnsureDefaultTeam(Player).Id; }
 	void UpdateTeamStates();
 	void UpdateGenericScripts();
 
@@ -273,7 +295,9 @@ private:
 	void CallSubroutine(const FString& ScriptName);
 	FGenScript* FindScript(const FString& Name);
 	FGenScriptGroup* FindGroup(const FString& Name);
-	bool EvaluateProductionCondition(FGenTeamProto& Proto);
+	/** TeamPrototype::evaluateProductionCondition. In a skirmish this engine owns its player's scripts; in a
+	 *  mission the map's engine does, so it asks there. */
+	bool EvaluateProductionCondition(int32 ProtoIndex);
 	void UpdateSequentialScripts();
 	void AppendSequentialScript(int32 TeamId, const FGenScript* Script);
 	void RemoveSequentialScripts(int32 TeamId);
@@ -292,6 +316,7 @@ private:
 	EGenDifficulty Difficulty = EGenDifficulty::Normal;
 	FString Side;
 	uint32 Frame = 0;
+	bool bCampaign = false;   // a mission's computer side: the map's scripts move it, this only builds
 
 	// AIPlayer
 	TArray<FGenBuildListInfo> BuildList;
@@ -300,6 +325,7 @@ private:
 	bool bReadyToBuildTeam = false;
 	bool bReadyToBuildStructure = false;
 	int32 TeamTimer = 0;
+	int32 ScriptTeamSeconds = -1;           // AIPlayer::m_teamSeconds, once a script has set it
 	int32 StructureTimer = 0;
 	int32 BuildDelay = 0;
 	int32 TeamDelay = 0;
@@ -307,8 +333,8 @@ private:
 	float BaseRadius = 0.f;
 	bool bBaseCenterSet = false;
 	FGenObjectID CurWarehouse = GenInvalidObjectID;
-	bool bCanBuildUnits = true;
-	bool bCanBuildBase = true;
+	// (Whether the player may build is on the player record, UGenGameLogic::CanBuildBase / CanBuildUnits -
+	// Player::m_canBuildBase / m_canBuildUnits, which a map's scripts set for any side.)
 	int32 CurrentEnemy = INDEX_NONE;
 	uint32 FrameToCheckEnemy = 0;
 	int32 SkillSetSelector = INDEX_NONE;        // which of the side's skill sets this player buys from
@@ -319,11 +345,14 @@ private:
 	float CurLeftFlankLeftDefenseAngle = 0.f, CurLeftFlankRightDefenseAngle = 0.f;
 	float CurRightFlankLeftDefenseAngle = 0.f, CurRightFlankRightDefenseAngle = 0.f;
 
-	// Teams
-	TArray<FGenTeamProto> Protos;
-	TArray<TUniquePtr<FGenTeam>> Teams;         // [0] = default team; pointers to teams stay valid as the list grows
-	int32 NextTeamId = 1;
-	TMap<FGenObjectID, int32> ObjectTeams;
+	// Teams: the game's one team registry (GenTeams.h), shared with a map's script engine, so that the teams this
+	// player builds are the ones the scripts name.
+	FGenTeamFactory& TF;
+	TArray<FGenTeamProto>& Protos = TF.Protos;
+	TArray<TUniquePtr<FGenTeam>>& Teams = TF.Teams;         // pointers stay valid as the list grows
+	TMap<int32, int32>& DefaultTeams = TF.DefaultTeams;     // player -> its default team's id
+	TMap<FGenObjectID, int32>& ObjectTeams = TF.ObjectTeams;
+	int32& NextTeamId = TF.NextTeamId;
 
 	// Script engine state (per player: flags, counters and timers of two computer players never mix)
 	struct FCounter { int32 Value = 0; bool bCountdown = false; };

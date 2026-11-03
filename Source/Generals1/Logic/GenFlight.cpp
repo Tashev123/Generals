@@ -22,7 +22,7 @@ bool FGenObject::IsAirborneTarget() const
 	}
 	const float Threshold = (Locomotor && Locomotor->AirborneTargetingHeight != MAX_int32) ? float(Locomotor->AirborneTargetingHeight)
 		: (IsUsingAirLoco() ? AirborneThreshold : FLT_MAX);
-	return Position.Z - Logic->GetGroundHeight(Position.X, Position.Y) > Threshold;
+	return Position.Z - Logic->GetGroundHeight(Position.X, Position.Y) - GetCarrierDeckHeight() > Threshold;
 }
 
 bool FGenObject::AreEnginesOn() const
@@ -263,8 +263,9 @@ void FGenObject::MaintainPosition(uint32 Frame)
 
 void FGenObject::UpdateFlightPhysics(uint32 Frame)
 {
-	// PhysicsBehavior::update: unlike ground units, nothing sticks an aircraft to the terrain.
-	float GroundZ = Logic->GetGroundHeight(Position.X, Position.Y);
+	// PhysicsBehavior::update: unlike ground units, nothing sticks an aircraft to the terrain - except the deck
+	// it is parked on, which the game counts as the ground under it.
+	float GroundZ = GroundHeightAt(Position.X, Position.Y);
 	const bool bMotive = Frame < MotiveForceExpires;
 
 	// applyGravitationalForces
@@ -305,7 +306,7 @@ void FGenObject::UpdateFlightPhysics(uint32 Frame)
 	Position += Velocity;
 
 	// do not pass through the ground
-	GroundZ = Logic->GetGroundHeight(Position.X, Position.Y);
+	GroundZ = GroundHeightAt(Position.X, Position.Y);
 	if (Position.Z <= GroundZ)
 	{
 		Velocity.Z += GroundZ - Position.Z;

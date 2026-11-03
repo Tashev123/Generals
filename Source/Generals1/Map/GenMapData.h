@@ -125,6 +125,12 @@ public:
 	TArray<FGenPolygonTrigger> PolygonTriggers;
 	TArray<FGenMapObject> Objects;
 	FGenDict WorldInfo;
+	/** TheGlobalData->m_weather == WEATHER_SNOWY: what stands on the map wears its snowy looks. */
+	bool IsSnowy() const
+	{
+		const FGenDictValue* V = WorldInfo.Find(TEXT("weather"));
+		return V && V->Int == 1;
+	}
 	TArray<FGenMapSide> Sides;
 	/** PlayerScriptsList: the scripts of each side, in the order of Sides (campaign maps; skirmish maps have empty ones). */
 	TArray<FGenScriptList> ScriptLists;
@@ -160,8 +166,10 @@ public:
 	const FGenMapObject* FindWaypointByID(int32 Id) const;
 	/** TerrainLogic::getClosestWaypointOnPath: nearest waypoint carrying that path label (case-insensitive), or null. */
 	const FGenMapObject* GetClosestWaypointOnPath(const FVector2f& Pos, const FString& Label) const;
-	/** The positions of a waypoint and of those its links lead to, in order (ground height not applied). */
-	void GetWaypointPath(const FGenMapObject& Start, TArray<FVector2f>& OutPath) const;
+	/** The positions of a waypoint and of those its links lead to, in order (ground height not applied). Returns where
+	 *  the path comes back to: the first position of a waypoint that the last one links back to, so the circuit is
+	 *  followed again from there (AIFollowWaypointPathState has no end for such a path); -1: the path ends there. */
+	int32 GetWaypointPath(const FGenMapObject& Start, TArray<FVector2f>& OutPath) const;
 
 	/** Cliff flag of a height map cell (array indices, border included). */
 	bool IsCliffCellIndex(int32 X, int32 Y) const;
@@ -169,6 +177,6 @@ public:
 	/** TerrainLogic::isUnderwater at a world position. */
 	bool IsUnderwater(float WorldX, float WorldY, float* OutWaterZ = nullptr) const;
 
-private:
+	/** The cells too steep to climb, from the heights (what old maps have no chunk for, and what a generated map needs). */
 	void InitCliffFlagsFromHeights();
 };

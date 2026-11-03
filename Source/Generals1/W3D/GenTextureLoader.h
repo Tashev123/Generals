@@ -32,4 +32,7 @@ namespace GenTextureLoader
 	 * "foo.tga" is looked up as Art\Textures\foo.dds first, then Art\Textures\foo.tga.
 	 */
 	GENERALS1_API UTexture2D* LoadGameTexture(const FString& TextureName, bool bSRGB = true);
+
+	/** The same texture's pixels on this side of the graphics card, kept once read. nullptr: there is none, or it is a DDS (the interface's sheets are TGAs). */
+	GENERALS1_API const FGenImage* LoadGameImage(const FString& TextureName);
 }

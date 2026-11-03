@@ -79,6 +79,7 @@ const TArray<FGenActionInfo>& FGenInput::GetActions()
 		{ EGenAction::AttackMove,        TEXT("AttackMove"),        TEXT("Attack move"),                  TEXT("Orders"),    FGenKeyChord(EKeys::A) },
 		{ EGenAction::Guard,             TEXT("Guard"),             TEXT("Guard"),                        TEXT("Orders"),    FGenKeyChord(EKeys::G) },
 		{ EGenAction::Formation,         TEXT("Formation"),         TEXT("Make / break formation"),       TEXT("Orders"),    FGenKeyChord(EKeys::F, true) },
+		{ EGenAction::Scatter,           TEXT("Scatter"),           TEXT("Scatter"),                      TEXT("Orders"),    FGenKeyChord(EKeys::X) },
 		{ EGenAction::SelectMatching,    TEXT("SelectMatching"),    TEXT("Select all of the same kind"),  TEXT("Selection"), FGenKeyChord(EKeys::E) },
 		{ EGenAction::SelectAllUnits,    TEXT("SelectAllUnits"),    TEXT("Select all fighting units"),    TEXT("Selection"), FGenKeyChord(EKeys::Q) },
 		{ EGenAction::SelectAllAircraft, TEXT("SelectAllAircraft"), TEXT("Select all aircraft"),          TEXT("Selection"), FGenKeyChord(EKeys::W) },

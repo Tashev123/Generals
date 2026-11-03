@@ -621,6 +621,11 @@ void UGenGameLogic::GroupMoveToPosition(const TArray<FGenObjectID>& Units, const
 	{
 		return;
 	}
+	// (Nobody is in anybody's way who is setting off with him: they stand parked only until the next frame's count.)
+	for (const FGenObject* O : Members)
+	{
+		Pathfinder.UpdateUnitPos(O->ID, FVector2f(O->Position.X, O->Position.Y), O->Template->GetBoundingCircleRadius(), true, O->GetLayer());
+	}
 	// (Steering: who went with whom - set once the orders are out, whichever way the group goes.)
 	const uint32 Group = ++LastMoveGroup;
 	ON_SCOPE_EXIT
@@ -770,6 +775,54 @@ void UGenGameLogic::GroupMoveToPosition(const TArray<FGenObjectID>& Units, const
 			Pathfinder.UpdateUnitGoal(O->ID, Dest, O->Template->GetBoundingCircleRadius(), GoalLayer);
 		}
 		GroupOrderMove(*O, FVector3f(Dest.X, Dest.Y, Pathfinder.GetLayerHeight(Dest.X, Dest.Y, GoalLayer, GetGroundHeight(Dest.X, Dest.Y))));
+	}
+}
+
+void UGenGameLogic::IssueScatter(const TArray<FGenObjectID>& Units)
+{
+	FGenCommand C(EGenCommandType::Scatter);
+	C.Units = Units;
+	SubmitCommand(MoveTemp(C));
+}
+
+void UGenGameLogic::ExecScatter(const FGenCommand& C)
+{
+	// AIGroup::groupScatter: "compute current centroid of the team", the ones furthest from it first.
+	TArray<FGenObject*> Members;
+	FVector2f Center(0.f, 0.f);
+	for (FGenObjectID Id : C.Units)
+	{
+		FGenObject* O = FindObject(Id);
+		if (O && O->CanMove() && !O->IsDead() && !O->IsContained())
+		{
+			Members.Add(O);
+			Center += FVector2f(O->Position.X, O->Position.Y);
+		}
+	}
+	if (Members.Num() == 0)
+	{
+		return;
+	}
+	Center /= float(Members.Num());
+	for (const FGenObject* O : Members)
+	{
+		Pathfinder.RemoveUnitGoal(O->ID);
+		Pathfinder.UpdateUnitPos(O->ID, FVector2f(O->Position.X, O->Position.Y), O->Template->GetBoundingCircleRadius(), true, O->GetLayer());
+	}
+	Members.StableSort([&Center](const FGenObject& A, const FGenObject& B)
+	{
+		return FVector2f::DistSquared(FVector2f(A.GetPosition().X, A.GetPosition().Y), Center) > FVector2f::DistSquared(FVector2f(B.GetPosition().X, B.GetPosition().Y), Center);
+	});
+	const uint32 Group = ++LastMoveGroup;
+	for (FGenObject* O : Members)
+	{
+		Center.X -= 0.01f; // (one that stands in the very middle goes somewhere too)
+		const FVector2f UnitPos(O->Position.X, O->Position.Y);
+		const FVector2f Dest = UnitPos + (UnitPos - Center).GetSafeNormal() * (4.f * O->Template->GetBoundingCircleRadius());
+		O->FormationID = 0;
+		O->FormationSpeed = 0.f;
+		O->MoveGroup = Group;
+		GroupOrderMove(*O, FVector3f(Dest.X, Dest.Y, GetGroundHeight(Dest.X, Dest.Y)));
 	}
 }
 

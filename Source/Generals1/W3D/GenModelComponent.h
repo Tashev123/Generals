@@ -51,6 +51,8 @@ public:
 
 	/** Restores every sub-object's visibility to its mesh default (before a state's hide/show list). */
 	void ResetSubObjectVisibility();
+	/** For tests: the names of the sub-objects that show now and have this in their names. */
+	void GetShownSubObjectsLike(const TCHAR* Part, TArray<FString>& Out) const;
 
 	UFUNCTION(BlueprintCallable, Category = "Generals")
 	void SetHouseColor(const FLinearColor& Color);
@@ -102,6 +104,8 @@ public:
 	 * thins the whole model out (0 = solid), Glow 0..1 tints it the colour of a detected unit.
 	 */
 	void SetStealthLook(float FadeOut, float Glow);
+	/** Marks the model for the picture of what stands behind a building (M_Occluded): 0 no, else its colour's number. */
+	void SetOccludedMark(int32 Mark);
 
 	/** Drawable::getTintColor / getSelectionColor: light added to the model as it is drawn (the flash of something just selected). */
 	void SetTint(const FLinearColor& Tint);
@@ -122,6 +126,8 @@ public:
 	 * nearer than that makes it less.
 	 */
 	bool RaycastWorld(const FVector& Origin, const FVector& Dir, double& InOutT) const;
+	/** (Test runs: what RaycastWorld has to go on.) */
+	FString DescribePick() const;
 
 	/** True while a non-looping animation is still playing. */
 	bool IsAnimationPlaying() const;
@@ -255,6 +261,7 @@ private:
 	int32 PingPongDir = 1;
 	FLinearColor HouseColor = FLinearColor(0.2f, 0.4f, 1.f);
 	float StealthFade = 0.f;
+	int32 OccludedMark = 0;
 	float StealthGlow = 0.f;
 	FLinearColor ObjectTint = FLinearColor(0.f, 0.f, 0.f, 0.f);
 	int32 SwayType = 0;               // SetSway

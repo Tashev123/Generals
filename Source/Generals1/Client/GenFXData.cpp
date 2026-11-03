@@ -444,6 +444,66 @@ bool FGenFXData::Initialize()
 	return true;
 }
 
+void FGenFXData::ApplyMapIni(const TArray<TSharedPtr<FGenIniBlock>>& Blocks)
+{
+	Initialize();
+	auto Restore = [](auto& Map, auto& Saved)
+	{
+		for (const auto& It : Saved)
+		{
+			if (It.Value.IsSet()) { Map.Add(It.Key, It.Value.GetValue()); }
+			else { Map.Remove(It.Key); }
+		}
+		Saved.Reset();
+	};
+	Restore(ParticleSystems, MapIniSavedSystems);
+	Restore(FXLists, MapIniSavedLists);
+	Restore(OCLs, MapIniSavedOCLs);
+	auto Save = [](auto& Map, auto& Saved, const FString& Key)
+	{
+		if (!Saved.Contains(Key))
+		{
+			const auto* Old = Map.Find(Key);
+			using FValue = typename TDecay<decltype(*Old)>::Type;
+			Saved.Add(Key, Old ? TOptional<FValue>(*Old) : TOptional<FValue>());
+		}
+	};
+	for (const TSharedPtr<FGenIniBlock>& B : Blocks)
+	{
+		const FString Key = B->Name().ToLower();
+		if (B->Keyword.Equals(TEXT("ParticleSystem"), ESearchCase::IgnoreCase))
+		{
+			Save(ParticleSystems, MapIniSavedSystems, Key);
+			FGenParticleSystemTemplate& T = ParticleSystems.FindOrAdd(Key);
+			T.Name = B->Name();
+			ParseParticleSystem(*B, T);
+		}
+		else if (B->Keyword.Equals(TEXT("FXList"), ESearchCase::IgnoreCase))
+		{
+			Save(FXLists, MapIniSavedLists, Key);
+			FGenFXList& L = FXLists.FindOrAdd(Key);
+			L.Name = B->Name();
+			L.Nuggets.Reset();
+			for (const FGenIniEntry& E : B->Entries)
+			{
+				if (E.Block) { ParseFXNugget(E.Key, *E.Block, L); }
+			}
+		}
+		else if (B->Keyword.Equals(TEXT("ObjectCreationList"), ESearchCase::IgnoreCase))
+		{
+			Save(OCLs, MapIniSavedOCLs, Key);
+			FGenOCL& L = OCLs.FindOrAdd(Key);
+			L.Name = B->Name();
+			L.Nuggets.Reset();
+			L.Payloads.Reset();
+			for (const FGenIniEntry& E : B->Entries)
+			{
+				if (E.Block) { ParseOCLNugget(E.Key, *E.Block, L); }
+			}
+		}
+	}
+}
+
 const FGenParticleSystemTemplate* FGenFXData::FindParticleSystem(const FString& Name) const
 {
 	return Name.IsEmpty() ? nullptr : ParticleSystems.Find(Name.ToLower());

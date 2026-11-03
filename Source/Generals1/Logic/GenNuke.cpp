@@ -102,9 +102,11 @@ void FGenObject::UpdateNeutronMissile(uint32 Frame)
 		}
 		Position += Velocity;
 		Logic->DoFXObj(D.IgnitionFX, *this);
-		if (!M.Weapon->ProjectileExhaust.IsEmpty())
+		const FGenObject* Shooter = Logic->FindObject(M.Launcher);
+		const FString& Exhaust = M.Weapon->GetProjectileExhaust(Shooter ? Shooter->GetVeterancyLevel() : 0);
+		if (!Exhaust.IsEmpty())
 		{
-			Logic->AttachParticleSystem(M.Weapon->ProjectileExhaust, ID);
+			Logic->AttachParticleSystem(Exhaust, ID);
 		}
 		M.State = EGenMissileState::Attack;
 		M.StateFrame = Frame;

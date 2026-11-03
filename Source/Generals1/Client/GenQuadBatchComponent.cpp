@@ -229,10 +229,14 @@ void UGenQuadBatchComponent::AddMaterial(UMaterialInterface* Material)
 	{
 		return;
 	}
+	const uint64 NeededBefore = GetMaterialRelevance(GMaxRHIShaderPlatform).Raw;
 	UsedMaterials.Add(Material);
-	if (UsedMaterials.Num() == 1)
+	// (Now there can be a proxy. And a proxy knows what its materials need from when it was made: the first material that
+	// reads the picture behind it - a microwave tank's heat haze - has to be told to the engine, or the picture isn't
+	// copied for it and it comes out black. All the others come and go without a new proxy for each.)
+	if (UsedMaterials.Num() == 1 || GetMaterialRelevance(GMaxRHIShaderPlatform).Raw != NeededBefore)
 	{
-		MarkRenderStateDirty(); // (now there can be a proxy)
+		MarkRenderStateDirty();
 	}
 }
 

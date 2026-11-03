@@ -4,12 +4,18 @@
 #include "GameFramework/HUD.h"
 #include "Game/GenInput.h"
 #include "Game/GenSettings.h"
+#include "Logic/GenMatch.h"
+#include "Map/GenRandomMap.h"
 #include "GenHUD.generated.h"
 
+enum class EGenHudPart : uint8;
 class AGenGameMode;
+struct FGenCampaign;
+struct FGenMatchSettings;
 class AGenPlayerController;
 class FGenMapData;
 class FGenNetClient;
+class FGenObject;
 struct FGenSetupData;
 class UGenGameLogic;
 class UTexture2D;
@@ -44,14 +50,66 @@ public:
 	void OpenOptions();
 	bool IsOptionsOpen() const { return Options.bOpen; }
 
+	/** What a campaign map's scripts show over the view (GenHUDCinematic.cpp): the letterbox and military captions. */
+	void OnScriptEvent(const struct FGenScriptClientEvent& E, UGenGameLogic* Logic);
+	/** CAMERA_LETTERBOX_BEGIN: the bars are on (or coming on); the interface stays out of the way. */
+	bool IsLetterboxed() const { return Cine.bLetterbox; }
+
 private:
+	/** InGameUI's cinematic state: the letterbox (Display::setLetterBox) and the military subtitle. */
+	struct FCinematic
+	{
+		bool bLetterbox = false;
+		double LetterboxChanged = -100.0;   // real seconds
+		FString Caption;
+		double CaptionStart = 0.0;          // logic frame time
+		float CaptionFrames = 0.f;          // how long it stands before it fades
+		int32 CaptionTyped = 0;             // characters that have clicked so far
+	};
+	FCinematic Cine;
+	void DrawScriptFade(UGenGameLogic* Logic);
+	void DrawLetterbox();
+	/** "Hold Space to skip" in a mission's intro; the black screen while it is being skipped. */
+	void DrawIntroSkip(const AGenGameMode* GM);
+public:
+	void ClearMilitaryCaption() { Cine.Caption.Reset(); }
+private:
+	void DrawMilitaryCaption(UGenGameLogic* Logic);
+
 	void DrawGroundCircle(const FVector& CenterUE, float RadiusUE, const FLinearColor& Color);
 	void DrawPlacement(AGenPlayerController* PC, UGenGameLogic* Logic);
 	void DrawControlBar(AGenPlayerController* PC, UGenGameLogic* Logic);
 	void DrawPowerBar(const class FGenControlBar& Bar, UGenGameLogic* Logic);
 	void DrawExpBar(const class FGenControlBar& Bar, UGenGameLogic* Logic);
-	/** A mapped image stretched over a screen rectangle; false: there is no such image. */
+	/** A mapped image stretched over a screen rectangle, on whole pixels; false: there is no such image. */
 	bool DrawMappedImage(const FString& Name, const FBox2D& R, const FLinearColor& Tint = FLinearColor::White);
+	/** A cameo: the game's own picture as it is, in the HUD style's corners; bGrey: as what can't be used looks. */
+	bool DrawCameo(const FString& Name, const FBox2D& R, const FLinearColor& Tint, bool bGrey = false);
+	/** A cameo's picture in grey, made the first time it is asked for (a few a frame, not to hold the frame up); nullptr: not now, or not at all. */
+	UTexture2D* GetGreyCameo(const FString& Name);
+	/** A part of the bar from the HUD style, for exactly that many pixels; nullptr: the style doesn't make it. */
+	UTexture2D* GetBarPart(EGenHudPart Part, int32 Variant, const FIntPoint& Size);
+	bool DrawBarPart(EGenHudPart Part, int32 Variant, const FBox2D& R, const FLinearColor& Tint = FLinearColor::White);
+	/** The bar's sections, made for the screen they are on. False: they can't be made. */
+	bool DrawBarPods(const class FGenControlBar& Bar);
+	/** Part of a capsule (a whole-length picture of the full bar) as far as Done pixels: its near end, then the far end's cap. */
+	void DrawCapsule(UTexture2D* Texture, const FBox2D& Whole, double Done, bool bUpwards);
+	TMap<uint64, UTexture2D*> BarParts;
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UTexture2D>> BarPartTextures;
+	UPROPERTY(Transient)
+	TMap<FString, TObjectPtr<UTexture2D>> GreyCameos;
+	uint64 GreyCameoFrame = 0;
+	double GreyCameoSpent = 0.0;                // seconds of this frame gone on making them
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UTexture2D>> BarPods;     // by EGenBarPod
+	const class FGenControlBar* BarNow = nullptr;   // the bar being drawn
+	const class FGenHudStyle* BarPodsStyle = nullptr;  // what BarParts and BarPods were made for
+	const struct FGenBarShape* BarPodsShape = nullptr;
+	float BarPodsScale = 0.f;
+	/** A line of text as it stands on the screen: the shell's Roboto, made at that size (GenShell.cpp). */
+	FVector2D BarTextSize(const FString& Text, float Pixels, bool bBold) const;
+	void DrawBarLine(const FString& Text, float X, float Y, const FLinearColor& Color, float Pixels, bool bBold);
 	/** W3DDisplay::drawRemainingRectClock: the part not done yet, swept clockwise from twelve o'clock. */
 	void DrawRemainingClock(const FBox2D& R, float Done, const FLinearColor& Color);
 	/** A line of text in a window's rectangle at a font size in pixels. */
@@ -62,7 +120,14 @@ private:
 	/** InGameUI's superweapon countdowns (every player's PublicTimer powers), and the adviser's "ready". */
 	void DrawSuperweaponTimers(UGenGameLogic* Logic);
 	TMap<uint64, bool> SuperweaponEvaPlayed;   // SuperweaponInfo::m_evaReadyPlayed, by object and power module
-	void DrawVeterancy(AGenPlayerController* PC, UGenGameLogic* Logic);
+	/** computeHealthRegion: the box of the health bar, which the icons over an object go by. */
+	bool GetHealthRegion(AGenPlayerController* PC, UGenGameLogic* Logic, const FGenObject& O, FBox2D& Out) const;
+	float GetIconScale() const;
+	/** Drawable::drawIconUI: what is over an object whether it is selected or not - healing, enthusiasm, what has disabled it, its rank. */
+	void DrawStatusIcons(AGenPlayerController* PC, UGenGameLogic* Logic);
+	/** Drawable::drawAmmo, drawContained */
+	void DrawPips(UGenGameLogic* Logic, const FGenObject& O, const FBox2D& HealthRegion);
+	void DrawBombIcons(AGenPlayerController* PC, UGenGameLogic* Logic);
 	void DrawGameOver(UGenGameLogic* Logic);
 	/** The pause the hotkey asked for, with no menu up: the message in the middle of the screen. */
 	void DrawPause(AGenGameMode* GM, UGenGameLogic* Logic);
@@ -104,8 +169,14 @@ private:
 		bool bMapSelect = false;
 		FString MapChoice;
 		float MapScroll = 0.f;
+		int32 MapTab = 0;               // 0 the maps of the game, 1 a random map
+		FString OfficialChoice;         // what was chosen in the list while the other tab is up
+		FGenRandomMapParams RandomMap;  // what the random map tab is set to
+		bool bRandomMapSet = false;     // ... it has been (it keeps that for the next time)
+		FString RandomSeedText;
 		bool bEditingName = false;      // the player's name has the keyboard
 		bool bEditingAddress = false;   // ... the network game's address has it
+		bool bEditingSeed = false;      // ... the random map's seed has it
 		FString JoinAddress;            // what has been typed there
 		bool bJoinAddressLoaded = false;
 		// test automation
@@ -116,6 +187,10 @@ private:
 		float DeltaTime = 0.f;
 		TMap<FString, float> Anim;
 		bool bQuitConfirm = false;      // the in-game menu asks whether to quit to the desktop
+		int32 SaveMode = 0;             // the list of saved games is up: 1 to save, 2 to load
+		int32 SavePage = 0;
+		FString SaveConfirm;            // what a second click saves over ("del:" and a file: deletes)
+		TArray<struct FGenSaveInfo> SaveList;
 	};
 	/** The setup the menu shows: the skirmish's, or (a network game) a copy of the host's lobby that this frame's
 	 *  clicks change and that is then sent to the host. */
@@ -136,9 +211,20 @@ private:
 	void EndShell();
 	void DrawSkirmishMenu(AGenGameMode* GM);
 	void DrawMapSelect();
+	void DrawMapList();
 	void DrawMapPreview(const FGenMapInfo& Map, const FBox2D& Area, bool bInteractive);
+	// (GenShellRandomMap.cpp)
+	/** The random map tab comes up: set to the map that is chosen if that is a random one, else to what it was last. */
+	void OpenRandomMapOptions(const FGenSetupData* Setup);
+	void DrawRandomMapOptions();
 	void DrawLoading();
 	void DrawQuitMenu(AGenGameMode* GM);
+	// (GenShellSave.cpp)
+	void OpenSaveLoad(bool bSaving);
+	void DrawSaveLoadList(AGenGameMode* GM, float Top);
+	void DrawSaveLoadPanel(AGenGameMode* GM);
+	void DrawLoadGameMenu(AGenGameMode* GM);
+	void DrawResumeScreen(AGenGameMode* GM);
 	void DrawScoreScreen(AGenGameMode* GM, UGenGameLogic* Logic);
 
 	FBox2D ShellRect(float X, float Y, float W, float H) const;
@@ -186,6 +272,23 @@ private:
 	void DrawShellMenu(AGenGameMode* GM);
 	void DrawMainMenu(AGenGameMode* GM);
 	void DrawOnlineMenu(AGenGameMode* GM);
+	/** The campaign menu (GenShellCampaign.cpp). */
+	void DrawCampaignMenu(AGenGameMode* GM);
+	void DrawChallengeMenu(AGenGameMode* GM);
+	/** ChallengeLoadScreen: the two generals. */
+	void DrawChallengeLoading(const FGenCampaign& Campaign, const FString& MissionName);
+	/** displayChallengeWinLoss: the opponent's picture and last word, from that height down. */
+	void DrawChallengeResult(const FGenMatchSettings& Match, bool bWon, float Top);
+	struct FCampaignMenu
+	{
+		FString Campaign = TEXT("USA");
+		FString Mission;
+		int32 Difficulty = 1;
+		int32 General = INDEX_NONE;   // (the Challenge: an index of GetChallengeGenerals)
+		FString Opponent;             // (its mission)
+	};
+	FCampaignMenu CampaignMenu;
+	bool bChallengeSoundPlayed = false;
 	/** How far the element with this id has eased towards bOn (0..1): hover and press feedback. */
 	float ShellAnim(const FString& Id, bool bOn, float Speed = 14.f);
 	/** ShellText with letter spacing (thousandths of an em) and the shadow optional. */
@@ -252,6 +355,8 @@ private:
 
 	UPROPERTY(Transient)
 	TMap<FString, TObjectPtr<UTexture2D>> MapPreviews;
+	/** The generated maps among them, oldest first: only the last few are kept (every new seed is a new picture). */
+	TArray<FString> RandomMapPreviews;
 
 	/** The radar's picture of the terrain, made once per map. */
 	UPROPERTY(Transient)

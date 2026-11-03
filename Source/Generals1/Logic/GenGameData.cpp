@@ -1,5 +1,10 @@
 #include "Logic/GenGameData.h"
 #include "Core/GenFileSystem.h"
+#include "Client/GenFXData.h"
+#include "Core/GenIni.h"
+#include "Logic/GenCommandData.h"
+#include "Logic/GenSkirmishAI.h"
+#include "Logic/GenUpgrades.h"
 #include "Generals1.h"
 #include "HAL/IConsoleManager.h"
 
@@ -208,16 +213,42 @@ namespace
 			else if (Is(TEXT("ProjectileStreamName"))) { W.ProjectileStreamName = E.Value(); }
 			else if (Is(TEXT("AllowAttackGarrisonedBldgs"))) { W.bAllowAttackGarrisonedBldgs = E.AsBool(); }
 			else if (Is(TEXT("FireFX"))) { W.FireFX = E.Value(); }
+			else if (Is(TEXT("VeterancyFireFX")) && E.Values.Num() >= 2)
+			{
+				// "VeterancyFireFX = HEROIC WeaponFX_HeroicComanche20mmCannonFire"
+				static const TCHAR* Ranks[4] = { TEXT("REGULAR"), TEXT("VETERAN"), TEXT("ELITE"), TEXT("HEROIC") };
+				for (int32 r = 0; r < 4; ++r)
+				{
+					if (E.Values[0].Equals(Ranks[r], ESearchCase::IgnoreCase))
+					{
+						W.VeterancyFireFX.SetNum(r + 1);
+						W.VeterancyFireFX[r] = E.Value(1);
+					}
+				}
+			}
 			else if (Is(TEXT("ProjectileDetonationFX"))) { W.ProjectileDetonationFX = E.Value(); }
 			else if (Is(TEXT("FireOCL"))) { W.FireOCL = E.Value(); }
 			else if (Is(TEXT("ProjectileDetonationOCL"))) { W.ProjectileDetonationOCL = E.Value(); }
 			else if (Is(TEXT("ProjectileExhaust"))) { W.ProjectileExhaust = E.Value(); }
+			else if (Is(TEXT("VeterancyProjectileExhaust")) && E.Values.Num() >= 2)
+			{
+				static const TCHAR* Ranks[4] = { TEXT("REGULAR"), TEXT("VETERAN"), TEXT("ELITE"), TEXT("HEROIC") };
+				for (int32 r = 0; r < 4; ++r)
+				{
+					if (E.Values[0].Equals(Ranks[r], ESearchCase::IgnoreCase))
+					{
+						W.VeterancyProjectileExhaust.SetNum(r + 1);
+						W.VeterancyProjectileExhaust[r] = E.Value(1);
+					}
+				}
+			}
 			else if (Is(TEXT("LaserName"))) { W.LaserName = E.Value(); }
 			else if (Is(TEXT("RequestAssistRange"))) { W.RequestAssistRange = E.AsFloat(); }
 			else if (Is(TEXT("LaserBoneName"))) { W.LaserBoneName = E.Value(); }
 			else if (Is(TEXT("FireSound"))) { W.FireSound = E.Value(); }
 			else if (Is(TEXT("FireSoundLoopTime"))) { W.FireSoundLoopTime = GenLogic::MsecToFrames(E.AsFloat()); }
 			else if (Is(TEXT("ClipSize"))) { W.ClipSize = E.AsInt(); }
+			else if (Is(TEXT("ShowsAmmoPips"))) { W.bShowsAmmoPips = E.AsBool(); }
 			else if (Is(TEXT("ClipReloadTime"))) { W.ClipReloadTime = GenLogic::MsecToFrames(E.AsFloat()); }
 			else if (Is(TEXT("ContinuousFireOne"))) { W.ContinuousFireOne = E.AsInt(); }
 			else if (Is(TEXT("ContinuousFireTwo"))) { W.ContinuousFireTwo = E.AsInt(); }
@@ -285,6 +316,36 @@ namespace
 			else if (Is(TEXT("AntiAirborneVehicle"))) { W.bAntiAirborneVehicle = E.AsBool(); }
 			else if (Is(TEXT("AntiAirborneInfantry"))) { W.bAntiAirborneInfantry = E.AsBool(); }
 			else if (Is(TEXT("DamageDealtAtSelfPosition"))) { W.bDamageDealtAtSelfPosition = E.AsBool(); }
+			else if (Is(TEXT("MinWeaponSpeed"))) { W.MinWeaponSpeed = GenLogic::VelocityPerFrame(E.AsFloat()); }
+			else if (Is(TEXT("ScaleWeaponSpeed"))) { W.bScaleWeaponSpeed = E.AsBool(); }
+			else if (Is(TEXT("ShockWaveAmount"))) { W.ShockWaveAmount = E.AsFloat(); }
+			else if (Is(TEXT("ShockWaveRadius"))) { W.ShockWaveRadius = E.AsFloat(); }
+			else if (Is(TEXT("ShockWaveTaperOff"))) { W.ShockWaveTaperOff = E.AsFloat(); }
+			else if (Is(TEXT("MissileCallsOnDie"))) { W.bMissileCallsOnDie = E.AsBool(); }
+			else if (Is(TEXT("PlayFXWhenStealthed"))) { W.bPlayFXWhenStealthed = E.AsBool(); }
+			else if (Is(TEXT("AutoReloadWhenIdle"))) { W.AutoReloadWhenIdle = GenLogic::MsecToFrames(E.AsFloat()); }
+			else if (Is(TEXT("LeechRangeWeapon"))) { W.bLeechRange = E.AsBool(); }
+			else if (Is(TEXT("HistoricBonusTime"))) { W.HistoricBonusTime = GenLogic::MsecToFrames(E.AsFloat()); }
+			else if (Is(TEXT("HistoricBonusCount"))) { W.HistoricBonusCount = FMath::RoundToInt32(E.AsFloat()); }
+			else if (Is(TEXT("HistoricBonusRadius"))) { W.HistoricBonusRadius = E.AsFloat(); }
+			else if (Is(TEXT("HistoricBonusWeapon"))) { W.HistoricBonusWeapon = E.Value(); }
+			else if (Is(TEXT("ProjectileCollidesWith")))
+			{
+				// (INI::parseBitString32: the list replaces what was there.)
+				static const TCHAR* Names[] = { TEXT("ALLIES"), TEXT("ENEMIES"), TEXT("STRUCTURES"), TEXT("SHRUBBERY"), TEXT("PROJECTILES"), TEXT("WALLS"),
+					TEXT("SMALL_MISSILES"), TEXT("BALLISTIC_MISSILES"), TEXT("CONTROLLED_STRUCTURES") };
+				W.ProjectileCollideMask = 0;
+				for (const FString& V : E.Values)
+				{
+					for (int32 n = 0; n < UE_ARRAY_COUNT(Names); ++n)
+					{
+						if (V.Equals(Names[n], ESearchCase::IgnoreCase))
+						{
+							W.ProjectileCollideMask |= 1u << n;
+						}
+					}
+				}
+			}
 		}
 	}
 
@@ -312,6 +373,22 @@ namespace
 		T.FirePitch = FMath::DegreesToRadians(B.GetFloat(TEXT("FirePitch"), 0.f));
 		T.MinPitch = FMath::DegreesToRadians(B.GetFloat(TEXT("MinPhysicalPitch"), 0.f));
 		T.GroundUnitPitch = FMath::DegreesToRadians(B.GetFloat(TEXT("GroundUnitPitch"), 0.f));
+		T.bFiresWhileTurning = B.GetBool(TEXT("FiresWhileTurning"));
+		for (const FGenIniEntry& E : B.Entries)
+		{
+			// TurretAIData::parseTurretSweep / parseTurretSweepSpeed ("TurretFireAngleSweep = PRIMARY 25")
+			const bool bSweep = E.Key.Equals(TEXT("TurretFireAngleSweep"), ESearchCase::IgnoreCase);
+			if ((bSweep || E.Key.Equals(TEXT("TurretSweepSpeedModifier"), ESearchCase::IgnoreCase)) && E.Values.Num() >= 2)
+			{
+				const int32 Slot = E.Values[0].Equals(TEXT("PRIMARY"), ESearchCase::IgnoreCase) ? 0 : (E.Values[0].Equals(TEXT("SECONDARY"), ESearchCase::IgnoreCase) ? 1 : 2);
+				if (bSweep) { T.FireAngleSweep[Slot] = FMath::DegreesToRadians(FCString::Atof(*E.Values[1])); }
+				else { T.SweepSpeedModifier[Slot] = FCString::Atof(*E.Values[1]); }
+			}
+		}
+		T.MinIdleScanAngle = FMath::DegreesToRadians(B.GetFloat(TEXT("MinIdleScanAngle"), 0.f));
+		T.MaxIdleScanAngle = FMath::DegreesToRadians(B.GetFloat(TEXT("MaxIdleScanAngle"), 0.f));
+		T.MinIdleScanInterval = GenLogic::MsecToFrames(B.GetFloat(TEXT("MinIdleScanInterval"), 9999999.f));
+		T.MaxIdleScanInterval = GenLogic::MsecToFrames(B.GetFloat(TEXT("MaxIdleScanInterval"), 9999999.f));
 		if (const FGenIniEntry* E = B.Find(TEXT("ControlledWeaponSlots")))
 		{
 			T.ControlledSlots = ParseWeaponSlots(E->Values);
@@ -406,6 +483,12 @@ namespace
 			}
 			else if (Is(TEXT("Turret"))) { S.Turret = E.Value(0); }
 			else if (Is(TEXT("TurretPitch"))) { S.TurretPitch = E.Value(0); }
+			else if (Is(TEXT("AltTurret"))) { S.AltTurret = E.Value(0); }
+			else if (Is(TEXT("AltTurretPitch"))) { S.AltTurretPitch = E.Value(0); }
+			else if (Is(TEXT("TurretArtAngle"))) { S.TurretArtAngle[0] = FMath::DegreesToRadians(FCString::Atof(*E.Value(0))); }
+			else if (Is(TEXT("AltTurretArtAngle"))) { S.TurretArtAngle[1] = FMath::DegreesToRadians(FCString::Atof(*E.Value(0))); }
+			else if (Is(TEXT("TurretArtPitch"))) { S.TurretArtPitch[0] = FMath::DegreesToRadians(FCString::Atof(*E.Value(0))); }
+			else if (Is(TEXT("AltTurretArtPitch"))) { S.TurretArtPitch[1] = FMath::DegreesToRadians(FCString::Atof(*E.Value(0))); }
 			else if (Is(TEXT("WeaponMuzzleFlash")) && E.Values.Num() > 1)
 			{
 				if (bCopiedFromDefault && !bFlashReplaced) { S.MuzzleFlashBones.Reset(); S.MuzzleFlashSlots.Reset(); }
@@ -530,9 +613,14 @@ float FGenThingTemplate::GetBoundingCircleRadius() const
 
 float FGenThingTemplate::GetBoundingSphereRadius() const
 {
+	// GeometryInfo::calcBoundingStuff
 	const float Circle = GetBoundingCircleRadius();
 	const float HalfH = GeometryHeight * 0.5f;
-	return GeometryType.Equals(TEXT("SPHERE"), ESearchCase::IgnoreCase) ? GeometryMajorRadius : FMath::Sqrt(Circle * Circle + HalfH * HalfH);
+	if (IsBox())
+	{
+		return FMath::Sqrt(Circle * Circle + HalfH * HalfH);
+	}
+	return GeometryType.Equals(TEXT("SPHERE"), ESearchCase::IgnoreCase) ? GeometryMajorRadius : FMath::Max(HalfH, GeometryMajorRadius);
 }
 
 const FGenDrawModule* FGenThingTemplate::PrimaryDraw() const
@@ -656,8 +744,21 @@ bool FGenGameData::Initialize()
 				}
 			}
 			UnitReallyDamagedThreshold = B->GetFloat(TEXT("UnitReallyDamagedThreshold"), UnitReallyDamagedThreshold);
+			for (int32 Who = 0; Who < 2; ++Who)
+			{
+				static const TCHAR* Levels[3] = { TEXT("Easy"), TEXT("Normal"), TEXT("Hard") };
+				for (int32 Level = 0; Level < 3; ++Level)
+				{
+					const FString Key = FString::Printf(TEXT("%sSoloPlayerHealthBonus_%s"), Who == 0 ? TEXT("Human") : TEXT("AI"), Levels[Level]);
+					if (const FGenIniEntry* R = B->Find(*Key)) { SoloHealthBonus[Who][Level] = ParsePercent(R->Value()); }
+				}
+			}
 			if (const FGenIniEntry* R = B->Find(TEXT("BaseRegenHealthPercentPerSecond"))) { BaseRegenHealthPercentPerSecond = ParsePercent(R->Value()); }
 			if (const FGenIniEntry* R = B->Find(TEXT("BaseRegenDelay"))) { BaseRegenDelay = GenLogic::MsecToFrames(R->AsFloat()); }
+			if (const FGenIniEntry* R = B->Find(TEXT("HistoricDamageLimit"))) { HistoricDamageLimit = GenLogic::MsecToFrames(R->AsFloat()); }
+			if (const FGenIniEntry* R = B->Find(TEXT("UseBehindBuildingMarker"))) { bUseBehindBuildingMarker = R->AsBool(); }
+			if (const FGenIniEntry* R = B->Find(TEXT("DefaultOcclusionDelay"))) { DefaultOcclusionDelay = GenLogic::MsecToFrames(R->AsFloat()); }
+			if (const FGenIniEntry* R = B->Find(TEXT("OccludedColorLuminanceScale"))) { OccludedColorLuminanceScale = R->AsFloat(); }
 			auto Percent = [&B](const TCHAR* Key, float& Out)
 			{
 				if (const FGenIniEntry* E = B->Find(Key)) { Out = ParsePercent(E->Value()); }
@@ -958,24 +1059,7 @@ bool FGenGameData::Initialize()
 	for (const TPair<FString, TSharedPtr<FGenIniBlock>>& It : ObjectBlocks)
 	{
 		TSharedPtr<FGenThingTemplate> T = BuildTemplate(It.Value->Name(), It.Value);
-		if (DefaultThing)
-		{
-			// OverrideableByLikeKind: only where the object has no module of the kind itself.
-			if (!T->Stealth.bValid)
-			{
-				T->Stealth = DefaultThing->Stealth;
-			}
-			// InheritableModule (elite and heroic units mend themselves). One self-repair per object here,
-			// so an object with an AutoHealBehavior of its own keeps just that.
-			if (!T->AutoHeal.bValid && DefaultThing->AutoHeal.bValid)
-			{
-				T->AutoHeal = DefaultThing->AutoHeal;
-				for (const FGenUpgradeModule& M : DefaultThing->UpgradeModules)
-				{
-					if (M.Effect == EGenUpgradeEffect::AutoHeal) { T->UpgradeModules.Add(M); }
-				}
-			}
-		}
+		InheritDefaultModules(*T);
 		Templates.Add(It.Key, T);
 	}
 	// Build variations know which template they stand in for, so that type checks treat them alike.
@@ -991,6 +1075,7 @@ bool FGenGameData::Initialize()
 	}
 
 	bInitialized = true;
+	DumpStatsIfAsked();
 	UE_LOG(LogGenerals, Log, TEXT("Game data: %d object templates, %d terrain types (%.2fs)"),
 		Templates.Num(), TerrainTypes.Num(), FPlatformTime::Seconds() - Start);
 	return true;
@@ -1028,7 +1113,45 @@ TSharedPtr<FGenIniBlock> FGenGameData::MergeBlocks(const FGenIniBlock* Base, con
 {
 	TSharedPtr<FGenIniBlock> Out = MakeShared<FGenIniBlock>(*Base);
 	TSet<FString> ReplacedKeys;
+	// ThingTemplate's AddModule / ReplaceModule <tag>: what they hold comes in as if written here; ReplaceModule
+	// takes out the module of that tag first, its replacement going in at its place.
+	TArray<FGenIniEntry> Entries;
 	for (const FGenIniEntry& E : Override.Entries)
+	{
+		if (E.Block && E.Key.Equals(TEXT("AddModule"), ESearchCase::IgnoreCase))
+		{
+			Entries.Append(E.Block->Entries);
+		}
+		else if (E.Block && E.Key.Equals(TEXT("ReplaceModule"), ESearchCase::IgnoreCase))
+		{
+			const int32 Old = Out->Entries.IndexOfByPredicate([&E](const FGenIniEntry& X)
+			{
+				return IsModuleKey(X.Key) && ModuleTag(X).Equals(E.Value(0), ESearchCase::IgnoreCase);
+			});
+			if (Old != INDEX_NONE)
+			{
+				Out->Entries.RemoveAt(Old);
+				Out->Entries.Insert(E.Block->Entries, Old);
+			}
+			else
+			{
+				Entries.Append(E.Block->Entries);
+			}
+		}
+		else if (E.Key.Equals(TEXT("RemoveModule"), ESearchCase::IgnoreCase))
+		{
+			// ThingTemplate::parseRemoveModule: the module of that tag is gone from this object.
+			Out->Entries.RemoveAll([&E](const FGenIniEntry& X)
+			{
+				return IsModuleKey(X.Key) && ModuleTag(X).Equals(E.Value(0), ESearchCase::IgnoreCase);
+			});
+		}
+		else
+		{
+			Entries.Add(E);
+		}
+	}
+	for (const FGenIniEntry& E : Entries)
 	{
 		if (IsModuleKey(E.Key))
 		{
@@ -1050,7 +1173,23 @@ TSharedPtr<FGenIniBlock> FGenGameData::MergeBlocks(const FGenIniBlock* Base, con
 		}
 		// Plain fields: the override's occurrences replace all base occurrences of that key.
 		const FString K = E.Key.ToLower();
-		if (!ReplacedKeys.Contains(K))
+		if (K == TEXT("locomotor"))
+		{
+			// AIUpdateModuleData::parseLocomotorSet: a line is that one set's (SET_NORMAL, SET_TAXIING...).
+			Out->Entries.RemoveAll([&E](const FGenIniEntry& X)
+			{
+				return X.Key.Equals(E.Key, ESearchCase::IgnoreCase) && X.Value(0).Equals(E.Value(0), ESearchCase::IgnoreCase);
+			});
+			Out->Entries.Add(E);
+			continue;
+		}
+		// BitFlags::parse: "+THIS -THAT" change the flags as they stand, only a plain list replaces them
+		// (BuildTemplate goes through the lines in order).
+		const bool bChangesKinds = K == TEXT("kindof") && E.Values.ContainsByPredicate([](const FString& V)
+		{
+			return V.StartsWith(TEXT("+")) || V.StartsWith(TEXT("-"));
+		});
+		if (!bChangesKinds && !ReplacedKeys.Contains(K))
 		{
 			ReplacedKeys.Add(K);
 			Out->Entries.RemoveAll([&](const FGenIniEntry& X) { return X.Key.Equals(E.Key, ESearchCase::IgnoreCase); });
@@ -1069,7 +1208,28 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 	{
 		if (E.Key.Equals(TEXT("KindOf"), ESearchCase::IgnoreCase))
 		{
-			for (const FString& V : E.Values) { T->KindOf.Add(V.ToUpper()); }
+			// BitFlags::parse
+			bool bPlainList = false;
+			for (const FString& V : E.Values)
+			{
+				const FString Kind = V.ToUpper();
+				if (Kind == TEXT("NONE"))
+				{
+					T->KindOf.Reset();
+					break;
+				}
+				if (Kind.StartsWith(TEXT("+"))) { T->KindOf.Add(Kind.Mid(1)); }
+				else if (Kind.StartsWith(TEXT("-"))) { T->KindOf.Remove(Kind.Mid(1)); }
+				else
+				{
+					if (!bPlainList)
+					{
+						T->KindOf.Reset();
+						bPlainList = true;
+					}
+					T->KindOf.Add(Kind);
+				}
+			}
 			T->bKindInfantry = T->KindOf.Contains(TEXT("INFANTRY"));
 			T->bKindNoCollide = T->KindOf.Contains(TEXT("NO_COLLIDE"));
 		}
@@ -1080,6 +1240,7 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 		else if (E.Key.Equals(TEXT("GeometryMinorRadius"), ESearchCase::IgnoreCase)) { T->GeometryMinorRadius = E.AsFloat(); }
 		else if (E.Key.Equals(TEXT("GeometryHeight"), ESearchCase::IgnoreCase)) { T->GeometryHeight = E.AsFloat(); }
 		else if (E.Key.Equals(TEXT("BuildCost"), ESearchCase::IgnoreCase)) { T->BuildCost = E.AsFloat(); }
+		else if (E.Key.Equals(TEXT("RefundValue"), ESearchCase::IgnoreCase)) { T->RefundValue = E.AsInt(); }
 		else if (E.Key.Equals(TEXT("TransportSlotCount"), ESearchCase::IgnoreCase)) { T->TransportSlotCount = E.AsInt(); }
 		else if (E.Key.Equals(TEXT("BuildVariations"), ESearchCase::IgnoreCase)) { T->BuildVariations = E.Values; }
 		else if (E.Key.Equals(TEXT("ButtonImage"), ESearchCase::IgnoreCase)) { T->ButtonImage = E.Value(0); }
@@ -1180,7 +1341,8 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 			}
 			if (Type.Equals(TEXT("AutoHealBehavior"), ESearchCase::IgnoreCase))
 			{
-				FGenUpgradeData::ParseAutoHeal(*E.Block, T->AutoHeal);
+				if (T->AutoHeal.bValid) { FGenUpgradeData::ParseAutoHeal(*E.Block, T->MoreAutoHeals.AddDefaulted_GetRef()); }
+				else { FGenUpgradeData::ParseAutoHeal(*E.Block, T->AutoHeal); }
 			}
 			else if (Type.Equals(TEXT("FlammableUpdate"), ESearchCase::IgnoreCase))
 			{
@@ -1561,6 +1723,71 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				T->HeightDieInitialDelay = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("InitialDelay"), 0.f));
 				T->bHeightDieSnapToGround = E.Block->GetBool(TEXT("SnapToGroundOnDeath"));
 			}
+			else if (Type.Equals(TEXT("PowerPlantUpdate"), ESearchCase::IgnoreCase))
+			{
+				T->RodsExtendFrames = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("RodsExtendTime"), 0.f));
+			}
+			else if (Type.Equals(TEXT("FirestormDynamicGeometryInfoUpdate"), ESearchCase::IgnoreCase))
+			{
+				const FGenIniBlock& B = *E.Block;
+				FGenFirestorm& F = T->Firestorm;
+				F.bValid = true;
+				F.InitialDelay = GenLogic::MsecToFrames(B.GetFloat(TEXT("InitialDelay"), 0.f));
+				F.InitialMajorRadius = B.GetFloat(TEXT("InitialMajorRadius"), 0.f);
+				F.FinalMajorRadius = B.GetFloat(TEXT("FinalMajorRadius"), 0.f);
+				F.TransitionTime = GenLogic::MsecToFrames(B.GetFloat(TEXT("TransitionTime"), 0.f));
+				F.bReverseAtTransitionTime = B.GetBool(TEXT("ReverseAtTransitionTime"));
+				F.ScorchSize = B.GetFloat(TEXT("ScorchSize"), 0.f);
+				F.ParticleOffsetZ = B.GetFloat(TEXT("ParticleOffsetZ"), 0.f);
+				F.FXList = B.GetString(TEXT("FXList"));
+				F.DelayBetweenDamageFrames = GenLogic::MsecToFrames(B.GetFloat(TEXT("DelayBetweenDamageFrames"), 0.f));
+				F.DamageAmount = B.GetFloat(TEXT("DamageAmount"), 0.f);
+				F.MaxHeightForDamage = B.GetFloat(TEXT("MaxHeightForDamage"), F.MaxHeightForDamage);
+				for (int32 i = 1; i <= 16; ++i)
+				{
+					const FString System = B.GetString(*FString::Printf(TEXT("ParticleSystem%d"), i));
+					if (!System.IsEmpty())
+					{
+						F.ParticleSystems.Add(System);
+					}
+				}
+			}
+			else if (Type.Equals(TEXT("BunkerBusterBehavior"), ESearchCase::IgnoreCase))
+			{
+				const FGenIniBlock& B = *E.Block;
+				FGenBunkerBuster& K = T->BunkerBuster;
+				K.bValid = true;
+				K.UpgradeRequired = B.GetString(TEXT("UpgradeRequired"));
+				K.DetonationFX = B.GetString(TEXT("DetonationFX"));
+				K.CrashThroughFX = B.GetString(TEXT("CrashThroughBunkerFX"));
+				K.CrashThroughFXFrames = FMath::Max(1, GenLogic::MsecToFrames(B.GetFloat(TEXT("CrashThroughBunkerFXFrequency"), 133.f)));
+				K.ShockwaveWeapon = B.GetString(TEXT("ShockwaveWeaponTemplate"));
+				K.OccupantDamageWeapon = B.GetString(TEXT("OccupantDamageWeaponTemplate"));
+			}
+			else if (Type.Equals(TEXT("NeutronBlastBehavior"), ESearchCase::IgnoreCase))
+			{
+				const FGenIniBlock& B = *E.Block;
+				FGenNeutronShell& N = T->NeutronShell;
+				N.bValid = true;
+				N.BlastRadius = B.GetFloat(TEXT("BlastRadius"), N.BlastRadius);
+				if (B.Find(TEXT("AffectAirborne"))) { N.bAffectAirborne = B.GetBool(TEXT("AffectAirborne")); }
+				if (B.Find(TEXT("AffectAllies"))) { N.bAffectAllies = B.GetBool(TEXT("AffectAllies")); }
+			}
+			else if (Type.Equals(TEXT("FireWeaponWhenDamagedBehavior"), ESearchCase::IgnoreCase))
+			{
+				const FGenIniBlock& B = *E.Block;
+				FGenWhenDamaged& W = T->WhenDamaged;
+				// (No object of the data has it wait for an upgrade: each that has it starts active.)
+				W.bValid = B.GetBool(TEXT("StartsActive"));
+				static const TCHAR* States[] = { TEXT("Pristine"), TEXT("Damaged"), TEXT("ReallyDamaged"), TEXT("Rubble") };
+				for (int32 s = 0; s < 4; ++s)
+				{
+					W.Weapons[s] = B.GetString(*FString::Printf(TEXT("ReactionWeapon%s"), States[s]));
+					W.Weapons[4 + s] = B.GetString(*FString::Printf(TEXT("ContinuousWeapon%s"), States[s]));
+				}
+				if (const FGenIniEntry* DT = B.Find(TEXT("DamageTypes"))) { W.DamageTypes = DT->Values; }
+				W.DamageAmount = B.GetFloat(TEXT("DamageAmount"), 0.f);
+			}
 			else if (Type.Equals(TEXT("FireWeaponWhenDeadBehavior"), ESearchCase::IgnoreCase))
 			{
 				FGenThingTemplate::FDeathWeapon& D = T->DeathWeapons.AddDefaulted_GetRef();
@@ -1609,6 +1836,7 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				S.bGrantedBySpecialPower = E.Block->GetBool(TEXT("GrantedBySpecialPower"));
 				S.bDisguisesAsTeam = E.Block->GetBool(TEXT("DisguisesAsTeam"));
 				S.DisguiseFrames = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("DisguiseTransitionTime"), 0.f));
+				S.RevealDistanceFromTarget = FCString::Atof(*E.Block->GetString(TEXT("RevealDistanceFromTarget"), TEXT("0"))); // (the data writes "100.0f")
 				S.DisguiseRevealFrames = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("DisguiseRevealTransitionTime"), 0.f));
 				S.DisguiseFX = E.Block->GetString(TEXT("DisguiseFX"));
 				S.DisguiseRevealFX = E.Block->GetString(TEXT("DisguiseRevealFX"));
@@ -1627,6 +1855,7 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				D.PingSound = E.Block->GetString(TEXT("PingSound"));
 				D.LoudPingSound = E.Block->GetString(TEXT("LoudPingSound"));
 				D.IRParticleSys = E.Block->GetString(TEXT("IRParticleSysName"));
+				D.IRGridParticleSys = E.Block->GetString(TEXT("IRGridParticleSysName"));
 				D.IRBrightParticleSys = E.Block->GetString(TEXT("IRBrightParticleSysName"));
 				D.IRBeaconParticleSys = E.Block->GetString(TEXT("IRBeaconParticleSysName"));
 				D.IRParticleSysBone = E.Block->GetString(TEXT("IRParticleSysBone"));
@@ -2081,6 +2310,8 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				C.bShouldDrawPips = B.GetBool(TEXT("ShouldDrawPips"), true);
 				C.DamagePercentToUnits = ParsePercent(B.GetString(TEXT("DamagePercentToUnits"), TEXT("0%")));
 				C.bBurnedDeathToUnits = B.GetBool(TEXT("BurnedDeathToUnits"), true);
+				C.bDestroyRidersNotFreeToExit = B.GetBool(TEXT("DestroyRidersWhoAreNotFreeToExit"));
+				C.bWeaponBonusPassedToPassengers = B.GetBool(TEXT("WeaponBonusPassedToPassengers"));
 				C.NumberOfExitPaths = B.GetInt(TEXT("NumberOfExitPaths"), 1);
 				C.ExitDelay = GenLogic::MsecToFrames(B.GetFloat(TEXT("ExitDelay"), 0.f));
 				C.bGoAggressiveOnExit = B.GetBool(TEXT("GoAggressiveOnExit"));
@@ -2125,10 +2356,14 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 			{
 				T->bParachute = true;
 				T->ParachuteOpenDist = E.Block->GetFloat(TEXT("ParachuteOpenDist"), 0.f);
+				T->ParachutePitchRateMax = GenLogic::AngularVelocityPerFrame(E.Block->GetFloat(TEXT("PitchRateMax"), 0.f));
+				T->ParachuteRollRateMax = GenLogic::AngularVelocityPerFrame(E.Block->GetFloat(TEXT("RollRateMax"), 0.f));
+				T->ParachuteLowAltitudeDamping = E.Block->GetFloat(TEXT("LowAltitudeDamping"), 0.2f);
 				T->ParachuteOpenSound = E.Block->GetString(TEXT("ParachuteOpenSound"));
 			}
 			else if (Type.Equals(TEXT("FireWeaponUpdate"), ESearchCase::IgnoreCase))
 			{
+				T->FireWeaponUpdateExclusive.Add(GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("ExclusiveWeaponDelay"), 0.f)));
 				T->FireWeaponUpdates.Emplace(E.Block->GetString(TEXT("Weapon")), GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("InitialDelay"), 0.f)));
 			}
 			else if (Type.Equals(TEXT("SmartBombTargetHomingUpdate"), ESearchCase::IgnoreCase))
@@ -2145,9 +2380,16 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				T->bHasDeletion = true;
 				T->DeletionMin = T->DeletionMax = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("Lifetime"), 1000.f));
 			}
+			if (const FGenIniEntry* Mood = E.Block->Find(TEXT("MoodAttackCheckRate")))
+			{
+				T->MoodAttackCheckRate = GenLogic::MsecToFrames(Mood->AsFloat());
+			}
 			if (IsBodyModule(Type))
 			{
 				T->BodyType = Type;
+				T->SubdualDamageCap = E.Block->GetFloat(TEXT("SubdualDamageCap"), 0.f);
+				T->SubdualDamageHealRate = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("SubdualDamageHealRate"), 0.f));
+				T->SubdualDamageHealAmount = E.Block->GetFloat(TEXT("SubdualDamageHealAmount"), 0.f);
 				T->MaxHealth = E.Block->GetFloat(TEXT("MaxHealth"), T->MaxHealth);
 				T->InitialHealth = E.Block->GetFloat(TEXT("InitialHealth"), T->MaxHealth);
 				if (Type.Equals(TEXT("UndeadBody"), ESearchCase::IgnoreCase))
@@ -2377,6 +2619,58 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				T->ParkingApproachHeight = E.Block->GetFloat(TEXT("ApproachHeight"), 0.f);
 				T->bParkInHangars = E.Block->GetBool(TEXT("ParkInHangars"));
 				T->ParkingHealPerSecond = E.Block->GetFloat(TEXT("HealAmountPerSecond"), 0.f);
+				T->ParkingDeckHeightOffset = E.Block->GetFloat(TEXT("LandingDeckHeightOffset"), 0.f);
+			}
+			else if (Type.Equals(TEXT("FlightDeckBehavior"), ESearchCase::IgnoreCase))
+			{
+				// A flight deck is a parking place with the same spaces and runways, so the airfield's
+				// code applies to it as well; the INI names the bones instead of following the airfield's
+				// naming, and lists them in the order the game walks them (R1S1, R2S1, R1S2...).
+				T->bParkingPlace = true;
+				T->bFlightDeck = true;
+				T->bHasAI = true; // (FlightDeckBehavior is an AIUpdateInterface: orders reach it, it does nothing with them itself)
+				T->ParkingCols = E.Block->GetInt(TEXT("NumRunways"), 0);          // the game's m_numCols
+				T->ParkingRows = E.Block->GetInt(TEXT("NumSpacesPerRunway"), 0);  // ... and m_numRows
+				T->ParkingApproachHeight = E.Block->GetFloat(TEXT("ApproachHeight"), 0.f);
+				T->ParkingHealPerSecond = E.Block->GetFloat(TEXT("HealAmountPerSecond"), 0.f);
+				T->ParkingDeckHeightOffset = E.Block->GetFloat(TEXT("LandingDeckHeightOffset"), 0.f);
+				T->FlightPayloadTemplate = E.Block->GetString(TEXT("PayloadTemplate"));
+				T->DeckLaunchWaveFrames = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("LaunchWaveDelay"), 0.f));
+				T->DeckLaunchRampFrames = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("LaunchRampDelay"), 0.f));
+				T->DeckLowerRampFrames = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("LowerRampDelay"), 0.f));
+				T->DeckCatapultFireFrames = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("CatapultFireDelay"), 0.f));
+				T->DeckCleanupFrames = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("ParkingCleanupPeriod"), 0.f));
+				T->DeckHumanFollowFrames = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("HumanFollowPeriod"), 0.f));
+				T->DeckReplacementFrames = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("ReplacementDelay"), 0.f));
+				T->DeckDockAnimationFrames = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("DockAnimationDelay"), 0.f));
+				T->FlightRunways.SetNum(T->ParkingCols);
+				auto Strip = [&E](const FString& Key, FString& Start, FString& End)
+				{
+					if (const FGenIniEntry* V = E.Block->Find(*Key); V && V->Values.Num() >= 2)
+					{
+						Start = V->Values[0];
+						End = V->Values[1];
+					}
+				};
+				for (int32 R = 0; R < T->ParkingCols; ++R)
+				{
+					FGenThingTemplate::FFlightDeckRunway& RW = T->FlightRunways[R];
+					if (const FGenIniEntry* V = E.Block->Find(*FString::Printf(TEXT("Runway%dSpaces"), R + 1)))
+					{
+						RW.SpaceBones = V->Values;
+					}
+					Strip(FString::Printf(TEXT("Runway%dTakeoff"), R + 1), RW.TakeoffStart, RW.TakeoffEnd);
+					Strip(FString::Printf(TEXT("Runway%dLanding"), R + 1), RW.LandingStart, RW.LandingEnd);
+					if (const FGenIniEntry* V = E.Block->Find(*FString::Printf(TEXT("Runway%dTaxi"), R + 1)))
+					{
+						RW.TaxiBones = V->Values;
+					}
+					if (const FGenIniEntry* V = E.Block->Find(*FString::Printf(TEXT("Runway%dCreation"), R + 1)))
+					{
+						RW.CreationBones = V->Values;
+					}
+					RW.CatapultSystem = E.Block->GetString(*FString::Printf(TEXT("Runway%dCatapultSystem"), R + 1));
+				}
 			}
 			else if (Type.Equals(TEXT("JetSlowDeathBehavior"), ESearchCase::IgnoreCase))
 			{
@@ -2486,6 +2780,12 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				D.SinkDelay = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("SinkDelay"), 0.f));
 				D.SinkRate = GenLogic::VelocityPerFrame(E.Block->GetFloat(TEXT("SinkRate"), 0.f));
 				D.ProbabilityModifier = E.Block->GetInt(TEXT("ProbabilityModifier"), 10);
+				D.ModifierBonusPerOverkillPercent = ParsePercent(E.Block->GetString(TEXT("ModifierBonusPerOverkillPercent"), TEXT("0%")));
+				D.SinkDelayVariance = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("SinkDelayVariance"), 0.f));
+				D.FlingForce = E.Block->GetFloat(TEXT("FlingForce"), 0.f);
+				D.FlingForceVariance = E.Block->GetFloat(TEXT("FlingForceVariance"), 0.f);
+				D.FlingPitch = FMath::DegreesToRadians(E.Block->GetFloat(TEXT("FlingPitch"), 0.f));
+				D.FlingPitchVariance = FMath::DegreesToRadians(E.Block->GetFloat(TEXT("FlingPitchVariance"), 0.f));
 				if (const FGenIniEntry* DT = E.Block->Find(TEXT("DeathTypes"))) { D.DeathTypes = DT->Values; }
 				if (const FGenIniEntry* ES = E.Block->Find(TEXT("ExemptStatus"))) { D.ExemptStatus = ES->Values; }
 				if (const FGenIniEntry* RS = E.Block->Find(TEXT("RequiredStatus"))) { D.RequiredStatus = RS->Values; }
@@ -2508,6 +2808,10 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				}
 				T->SlowDeaths.Add(MoveTemp(D));
 			}
+			else if (Type.Equals(TEXT("SpecialPowerCompletionDie"), ESearchCase::IgnoreCase))
+			{
+				if (const FGenIniEntry* SP = E.Block->Find(TEXT("SpecialPowerTemplate"))) { T->SpecialPowerCompletion = SP->Value(); }
+			}
 			else if (Type.Equals(TEXT("DestroyDie"), ESearchCase::IgnoreCase))
 			{
 				FGenDieModule& M = T->DieModules.AddDefaulted_GetRef();
@@ -2523,6 +2827,7 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				P.bValid = true;
 				P.FirstHeight = E.Block->GetFloat(TEXT("FirstHeight"), 0.f);
 				P.SecondHeight = E.Block->GetFloat(TEXT("SecondHeight"), 0.f);
+				P.FlightPathAdjustPerFrame = GenLogic::VelocityPerFrame(E.Block->GetFloat(TEXT("FlightPathAdjustDistPerSecond"), 0.f));
 				if (const FGenIniEntry* F = E.Block->Find(TEXT("FirstPercentIndent"))) { P.FirstPercentIndent = ParsePercent(F->Value()); }
 				if (const FGenIniEntry* F = E.Block->Find(TEXT("SecondPercentIndent"))) { P.SecondPercentIndent = ParsePercent(F->Value()); }
 				ParseGarrisonHitKill(*E.Block, P);
@@ -2563,6 +2868,7 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 					T->MissileInitialDist = E.Block->GetFloat(TEXT("DistanceToTravelBeforeTurning"), 0.f);
 					T->MissileDiveDistance = E.Block->GetFloat(TEXT("DistanceToTargetBeforeDiving"), 0.f);
 					T->MissileLockDistance = E.Block->GetFloat(TEXT("DistanceToTargetForLock"), 75.f);
+					T->MissileDistanceScatterWhenJammed = E.Block->GetFloat(TEXT("DistanceScatterWhenJammed"), 75.f);
 					T->MissileIgnitionFX = E.Block->GetString(TEXT("IgnitionFX"));
 					T->bMissileDetonateOnNoFuel = E.Block->GetBool(TEXT("DetonateOnNoFuel"));
 					T->bMissileDetonateCallsKill = E.Block->GetBool(TEXT("DetonateCallsKill"));
@@ -2621,7 +2927,29 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 				}
 				T->bDeliverPayloadAI = Type.Equals(TEXT("DeliverPayloadAIUpdate"), ESearchCase::IgnoreCase);
 			T->bForbidPlayerCommands = E.Block->GetBool(TEXT("ForbidPlayerCommands"), false);
-				if (T->bDeliverPayloadAI) { T->DeliverDoorDelay = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("DoorDelay"), 0.f)); }
+				if (T->bDeliverPayloadAI)
+				{
+					T->DeliverDoorDelay = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("DoorDelay"), 0.f));
+					// DeliverPayloadAIUpdate::deliverPayloadViaModuleData: what a script's reinforcements fly by.
+					T->DeliverModule = MakeShared<FGenDeliverPayload>();
+					T->DeliverModule->MaxAttempts = E.Block->GetInt(TEXT("MaxAttempts"), 1);
+					T->DeliverModule->DropDelay = GenLogic::MsecToFrames(E.Block->GetFloat(TEXT("DropDelay"), 0.f));
+					T->DeliverModule->DeliveryDistance = E.Block->GetFloat(TEXT("DeliveryDistance"), 0.f);
+					T->DeliverModule->PutInContainer = E.Block->GetString(TEXT("PutInContainer"));
+					auto ParseOffset = [](const FGenIniEntry* Line, FVector3f& Out)
+					{
+						TArray<FString> Tok;
+						if (Line) { GenIni::Tokenize(Line->Raw, Tok, TEXT(" \t=:")); }
+						for (int32 t = 0; t + 1 < Tok.Num(); t += 2)
+						{
+							if (Tok[t].Equals(TEXT("X"), ESearchCase::IgnoreCase)) { Out.X = FCString::Atof(*Tok[t + 1]); }
+							else if (Tok[t].Equals(TEXT("Y"), ESearchCase::IgnoreCase)) { Out.Y = FCString::Atof(*Tok[t + 1]); }
+							else if (Tok[t].Equals(TEXT("Z"), ESearchCase::IgnoreCase)) { Out.Z = FCString::Atof(*Tok[t + 1]); }
+						}
+					};
+					ParseOffset(E.Block->Find(TEXT("DropOffset")), T->DeliverModule->DropOffset);
+					ParseOffset(E.Block->Find(TEXT("DropVariance")), T->DeliverModule->DropVariance);
+				}
 				if (const FGenIniEntry* Boost = E.Block->Find(TEXT("UpgradedSupplyBoost"))) { T->UpgradedSupplyBoost = Boost->AsInt(); }
 				T->bAutoAcquireEnemiesWhenIdle = E.Block->GetBool(TEXT("AutoAcquireEnemiesWhenIdle"), T->bAutoAcquireEnemiesWhenIdle);
 				// (AIUpdateInterface::getNextMoodTarget. Said outright it holds for anything; left unsaid - which
@@ -2636,6 +2964,7 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 					T->bAutoAcquireWhenStealthed = Acquire->Values.ContainsByPredicate([](const FString& V) { return V.Equals(TEXT("Stealthed"), ESearchCase::IgnoreCase); });
 				T->bAutoAcquireBuildings = Acquire->Values.ContainsByPredicate([](const FString& V) { return V.Equals(TEXT("ATTACK_BUILDINGS"), ESearchCase::IgnoreCase); });
 				}
+				if (E.Block->Find(TEXT("TurretsLinked"))) { T->bTurretsLinked = E.Block->GetBool(TEXT("TurretsLinked")); }
 				for (const FGenIniEntry& Sub : E.Block->Entries)
 				{
 					if (Sub.Block && Sub.Key.Equals(TEXT("Turret"), ESearchCase::IgnoreCase)) { ParseTurret(*Sub.Block, T->Turrets[0]); }
@@ -2662,6 +2991,8 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 						WS.Weapons[Index] = WE.Values[1].Equals(TEXT("None"), ESearchCase::IgnoreCase) ? FString() : WE.Values[1];
 					}
 				}
+				else if (WE.Key.Equals(TEXT("ShareWeaponReloadTime"), ESearchCase::IgnoreCase)) { WS.bShareReloadTime = WE.AsBool(); }
+				else if (WE.Key.Equals(TEXT("WeaponLockSharedAcrossSets"), ESearchCase::IgnoreCase)) { WS.bLockSharedAcrossSets = WE.AsBool(); }
 				else if (WE.Key.Equals(TEXT("PreferredAgainst"), ESearchCase::IgnoreCase) && WE.Values.Num() >= 2)
 				{
 					const uint32 Slot = ParseWeaponSlots({ WE.Values[0] });
@@ -2728,6 +3059,7 @@ TSharedPtr<FGenThingTemplate> FGenGameData::BuildTemplate(const FString& Name, c
 			D.Block = E.Block;
 			D.bOkToChangeModelColor = E.Block->GetBool(TEXT("OkToChangeModelColor"));
 			D.AttachToBoneInContainer = E.Block->GetString(TEXT("AttachToBoneInContainer"));
+			D.AttachToBone = E.Block->GetString(TEXT("AttachToBoneInAnotherModule"));
 			D.RequiredScience = E.Block->GetString(TEXT("RequiredScience"));
 			if (const FGenIniEntry* Feedback = E.Block->Find(TEXT("ProjectileBoneFeedbackEnabledSlots")))
 			{
@@ -2967,8 +3299,215 @@ const FString& FGenGameData::BaseSideOf(const FString& Side) const
 	return P ? P->BaseSide : None;
 }
 
+void FGenGameData::DumpStatsIfAsked() const
+{
+	// -GenDumpStats=<file>: every number this code took from the game's data, as it holds it, for Tools/compare_stats.py.
+	FString Path;
+	if (!FParse::Value(FCommandLine::Get(), TEXT("GenDumpStats="), Path))
+	{
+		return;
+	}
+	TArray<FString> Out;
+	auto Add = [&Out](const TCHAR* Kind, const FString& Name, const TCHAR* Field, const FString& Value)
+	{
+		Out.Add(FString::Printf(TEXT("%s|%s|%s|%s"), Kind, *Name.ToLower(), Field, *Value));
+	};
+	auto F = [](float V) { return FString::Printf(TEXT("%.6f"), V); };
+	auto I = [](int32 V) { return FString::FromInt(V); };
+	for (const TPair<FString, FGenWeaponTemplate>& It : Weapons)
+	{
+		const FGenWeaponTemplate& W = It.Value;
+		const auto A = [&](const TCHAR* Field, const FString& V) { Add(TEXT("W"), W.Name, Field, V); };
+		A(TEXT("PrimaryDamage"), F(W.PrimaryDamage));
+		A(TEXT("MinWeaponSpeed"), F(W.MinWeaponSpeed));
+		A(TEXT("ScaleWeaponSpeed"), I(W.bScaleWeaponSpeed ? 1 : 0));
+		A(TEXT("PrimaryDamageRadius"), F(W.PrimaryDamageRadius));
+		A(TEXT("SecondaryDamage"), F(W.SecondaryDamage));
+		A(TEXT("SecondaryDamageRadius"), F(W.SecondaryDamageRadius));
+		A(TEXT("AttackRange"), F(W.AttackRange));
+		A(TEXT("MinimumAttackRange"), F(W.MinimumAttackRange));
+		A(TEXT("ScatterRadius"), F(W.ScatterRadius));
+		A(TEXT("ScatterRadiusVsInfantry"), F(W.ScatterRadiusVsInfantry));
+		A(TEXT("DamageType"), W.DamageType);
+		A(TEXT("DeathType"), W.DeathType);
+		A(TEXT("WeaponSpeed"), F(W.WeaponSpeed));
+		A(TEXT("ClipSize"), I(W.ClipSize));
+		A(TEXT("ClipReloadTime"), I(W.ClipReloadTime));
+		A(TEXT("DelayMin"), I(W.DelayBetweenShotsMin));
+		A(TEXT("DelayMax"), I(W.DelayBetweenShotsMax));
+		A(TEXT("PreAttackDelay"), I(W.PreAttackDelay));
+		A(TEXT("ProjectileObject"), W.ProjectileObject.ToLower());
+		A(TEXT("AntiGround"), I(W.bAntiGround ? 1 : 0));
+		A(TEXT("AntiAirborneVehicle"), I(W.bAntiAirborneVehicle ? 1 : 0));
+		A(TEXT("AntiAirborneInfantry"), I(W.bAntiAirborneInfantry ? 1 : 0));
+		A(TEXT("RadiusDamageAffects"), I(int32(W.RadiusDamageAffects)));
+		TArray<FString> Bonus;
+		for (const FGenWeaponBonus& B : W.Bonuses)
+		{
+			Bonus.Add(FString::Printf(TEXT("%s/%d/%.4f"), *B.Condition, int32(B.Field), B.Value));
+		}
+		Bonus.Sort();
+		A(TEXT("Bonuses"), FString::Join(Bonus, TEXT(";")));
+	}
+	for (const TPair<FString, FGenArmorTemplate>& It : Armors)
+	{
+		const FGenArmorTemplate& R = It.Value;
+		Add(TEXT("A"), R.Name, TEXT("DEFAULT"), F(R.DefaultCoefficient));
+		for (const TPair<FString, float>& C : R.Coefficients)
+		{
+			Add(TEXT("A"), R.Name, *C.Key, F(C.Value));
+		}
+	}
+	for (const TPair<FString, FGenLocomotorTemplate>& It : Locomotors)
+	{
+		const FGenLocomotorTemplate& L = It.Value;
+		Add(TEXT("L"), It.Key, TEXT("Speed"), F(L.Speed));
+		Add(TEXT("L"), It.Key, TEXT("TurnRate"), F(L.TurnRate));
+		Add(TEXT("L"), It.Key, TEXT("Acceleration"), F(L.Acceleration));
+		Add(TEXT("L"), It.Key, TEXT("Braking"), F(L.Braking));
+	}
+	for (const TPair<FString, TSharedPtr<FGenThingTemplate>>& It : Templates)
+	{
+		const FGenThingTemplate& T = *It.Value;
+		const auto A = [&](const TCHAR* Field, const FString& V) { Add(TEXT("O"), T.Name, Field, V); };
+		A(TEXT("MaxHealth"), F(T.MaxHealth));
+		A(TEXT("InitialHealth"), F(T.InitialHealth));
+		A(TEXT("BodyType"), T.BodyType.ToLower());
+		A(TEXT("BuildCost"), F(T.BuildCost));
+		A(TEXT("RefundValue"), I(T.RefundValue));
+		A(TEXT("SubdualDamageCap"), F(T.SubdualDamageCap));
+		A(TEXT("SubdualDamageHealRate"), I(T.SubdualDamageHealRate));
+		A(TEXT("SubdualDamageHealAmount"), F(T.SubdualDamageHealAmount));
+		A(TEXT("BuildTime"), F(T.BuildTime));
+		A(TEXT("VisionRange"), F(T.VisionRange));
+		A(TEXT("ShroudClearingRange"), F(T.ShroudClearingRange));
+		A(TEXT("EnergyProduction"), I(T.EnergyProduction));
+		A(TEXT("EnergyBonus"), I(T.EnergyBonus));
+		A(TEXT("CrusherLevel"), I(T.CrusherLevel));
+		A(TEXT("CrushableLevel"), I(T.CrushableLevel));
+		A(TEXT("TransportSlotCount"), I(T.TransportSlotCount));
+		A(TEXT("ExperienceValues"), FString::Printf(TEXT("%d %d %d %d"), T.ExperienceValues[0], T.ExperienceValues[1], T.ExperienceValues[2], T.ExperienceValues[3]));
+		A(TEXT("ExperienceRequired"), FString::Printf(TEXT("%d %d %d %d"), T.ExperienceRequired[0], T.ExperienceRequired[1], T.ExperienceRequired[2], T.ExperienceRequired[3]));
+		TArray<FString> Sets;
+		for (const FGenArmorSetEntry& S : T.ArmorSets)
+		{
+			TArray<FString> C = S.Conditions;
+			C.Sort();
+			Sets.Add(FString::Printf(TEXT("[%s]%s"), *FString::Join(C, TEXT(",")), *S.Armor.ToLower()));
+		}
+		Sets.Sort();
+		A(TEXT("ArmorSets"), FString::Join(Sets, TEXT(";")));
+		Sets.Reset();
+		for (const FGenWeaponSetEntry& S : T.WeaponSets)
+		{
+			TArray<FString> C = S.Conditions;
+			C.Sort();
+			Sets.Add(FString::Printf(TEXT("[%s]%s,%s,%s"), *FString::Join(C, TEXT(",")), *S.Weapons[0].ToLower(), *S.Weapons[1].ToLower(), *S.Weapons[2].ToLower()));
+		}
+		Sets.Sort();
+		A(TEXT("WeaponSets"), FString::Join(Sets, TEXT(";")));
+	}
+	FGenUpgradeData::Get().DumpStats(Out);
+	// Everything as read, whichever code goes on to use it: the merged objects, modules and all, and every other INI file.
+	const TFunction<void(const FString&, const FGenIniBlock&)> Tree = [&](const FString& At, const FGenIniBlock& B)
+	{
+		for (const FGenIniEntry& E : B.Entries)
+		{
+			Out.Add(FString::Printf(TEXT("T|%s|%s|%s"), *At.ToLower(), *E.Key.ToLower(), *FString::Join(E.Values, TEXT(" ")).ToLower()));
+			if (E.Block)
+			{
+				Tree(At + TEXT("/") + E.Key + TEXT(":") + FString::Join(E.Block->Args, TEXT(" ")), *E.Block);
+			}
+		}
+	};
+	for (const TPair<FString, TSharedPtr<FGenIniBlock>>& It : ObjectBlocks)
+	{
+		Tree(TEXT("object:") + It.Key, *It.Value);
+	}
+	for (const FString& File : FGenFileSystem::Get().FindFiles(TEXT("Data\\INI\\"), TEXT(".ini")))
+	{
+		const FString Lower = File.ToLower();
+		if (Lower.Contains(TEXT("\\object\\")) || Lower.Contains(TEXT("\\mappedimages\\")))
+		{
+			continue;
+		}
+		TArray<TSharedPtr<FGenIniBlock>> Blocks;
+		GenIni::ParseFile(File, Blocks);
+		const FString Short = FPaths::GetBaseFilename(File);
+		for (const TSharedPtr<FGenIniBlock>& B : Blocks)
+		{
+			Tree(Short + TEXT("/") + B->Keyword + TEXT(":") + FString::Join(B->Args, TEXT(" ")), *B);
+		}
+	}
+	Out.Sort();
+	FFileHelper::SaveStringArrayToFile(Out, *Path);
+	UE_LOG(LogGenerals, Log, TEXT("Game data: %d values written to %s"), Out.Num(), *Path);
+}
+
+void FGenGameData::InheritDefaultModules(FGenThingTemplate& T) const
+{
+	if (!DefaultThing)
+	{
+		return;
+	}
+	// OverrideableByLikeKind: only where the object has no module of the kind itself.
+	if (!T.Stealth.bValid)
+	{
+		T.Stealth = DefaultThing->Stealth;
+	}
+	// InheritableModule "means don't remove me by default when copied from default": elite and heroic units mend
+	// themselves, beside any AutoHealBehavior of their own (a GLA vehicle's junk repair).
+	if (DefaultThing->AutoHeal.bValid)
+	{
+		T.VeterancyAutoHeal = DefaultThing->AutoHeal;
+		for (const FGenUpgradeModule& M : DefaultThing->UpgradeModules)
+		{
+			if (M.Effect == EGenUpgradeEffect::AutoHeal)
+			{
+				FGenUpgradeModule& Added = T.UpgradeModules.Add_GetRef(M);
+				Added.bVeterancyAutoHeal = true;
+			}
+		}
+	}
+}
+
 void FGenGameData::ApplyMapIni(const FString& MapFolder)
 {
+	// What the last map changed goes back first ("map.ini" lasts as long as its map: TheThingFactory::reset and
+	// the like). (Templates it made stay alive: something may still hold on to one.)
+	for (const TPair<FString, TSharedPtr<FGenIniBlock>>& It : MapIniSavedBlocks)
+	{
+		if (It.Value) { ObjectBlocks.Add(It.Key, It.Value); }
+		else { ObjectBlocks.Remove(It.Key); }
+	}
+	for (const TPair<FString, TSharedPtr<FGenThingTemplate>>& It : MapIniSavedTemplates)
+	{
+		if (const TSharedPtr<FGenThingTemplate>* Now = Templates.Find(It.Key))
+		{
+			MapIniRetiredTemplates.Add(*Now);
+		}
+		if (It.Value) { Templates.Add(It.Key, It.Value); }
+		else { Templates.Remove(It.Key); }
+	}
+	for (const TPair<FString, TOptional<FGenLocomotorTemplate>>& It : MapIniSavedLocomotors)
+	{
+		if (It.Value.IsSet()) { Locomotors.Add(It.Key, It.Value.GetValue()); }
+		else { Locomotors.Remove(It.Key); }
+	}
+	for (const TPair<FString, TOptional<FGenWeaponTemplate>>& It : MapIniSavedWeapons)
+	{
+		if (It.Value.IsSet()) { Weapons.Add(It.Key, It.Value.GetValue()); }
+		else { Weapons.Remove(It.Key); }
+	}
+	MapIniSavedBlocks.Reset();
+	MapIniSavedTemplates.Reset();
+	MapIniSavedLocomotors.Reset();
+	MapIniSavedWeapons.Reset();
+	FGenFXData::Get().ApplyMapIni(TArray<TSharedPtr<FGenIniBlock>>());
+	FGenCommandData::Get().ApplyMapIni(TArray<TSharedPtr<FGenIniBlock>>());
+	FGenUpgradeData::Get().ApplyMapIni(TArray<TSharedPtr<FGenIniBlock>>());
+	FGenAIData::Get().ApplyMapIni(TArray<TSharedPtr<FGenIniBlock>>());
+
 	const FString Path = MapFolder / TEXT("map.ini");
 	if (!FGenFileSystem::Get().Exists(Path))
 	{
@@ -2976,17 +3515,64 @@ void FGenGameData::ApplyMapIni(const FString& MapFolder)
 	}
 	TArray<TSharedPtr<FGenIniBlock>> Blocks;
 	GenIni::ParseFile(Path, Blocks);
+	FGenFXData::Get().ApplyMapIni(Blocks);
+	FGenCommandData::Get().ApplyMapIni(Blocks);
+	FGenUpgradeData::Get().ApplyMapIni(Blocks);
+	FGenAIData::Get().ApplyMapIni(Blocks);
+	// (Locomotors first: an object's own definition may name one of them.)
+	for (const TSharedPtr<FGenIniBlock>& B : Blocks)
+	{
+		if (B->Keyword.Equals(TEXT("Locomotor"), ESearchCase::IgnoreCase))
+		{
+			const FString Key = B->Name().ToLower();
+			if (!MapIniSavedLocomotors.Contains(Key))
+			{
+				const FGenLocomotorTemplate* Old = Locomotors.Find(Key);
+				MapIniSavedLocomotors.Add(Key, Old ? TOptional<FGenLocomotorTemplate>(*Old) : TOptional<FGenLocomotorTemplate>());
+			}
+			FGenLocomotorTemplate& L = Locomotors.FindOrAdd(Key);
+			L.Name = B->Name();
+			ParseLocomotor(*B, L);
+		}
+		else if (B->Keyword.Equals(TEXT("Weapon"), ESearchCase::IgnoreCase))
+		{
+			// WeaponStore::newOverride: the fields it gives, over a copy of what was there.
+			const FString Key = B->Name().ToLower();
+			if (!MapIniSavedWeapons.Contains(Key))
+			{
+				const FGenWeaponTemplate* Old = Weapons.Find(Key);
+				MapIniSavedWeapons.Add(Key, Old ? TOptional<FGenWeaponTemplate>(*Old) : TOptional<FGenWeaponTemplate>());
+			}
+			FGenWeaponTemplate& W = Weapons.FindOrAdd(Key);
+			W.Name = B->Name();
+			ParseWeapon(*B, W);
+		}
+	}
 	for (const TSharedPtr<FGenIniBlock>& B : Blocks)
 	{
 		const bool bObject = B->Keyword.Equals(TEXT("Object"), ESearchCase::IgnoreCase);
 		const bool bReskin = B->Keyword.Equals(TEXT("ObjectReskin"), ESearchCase::IgnoreCase);
 		if (bObject || bReskin)
 		{
-			AddObjectBlock(B, bReskin);
 			const FString Key = B->Name().ToLower();
+			if (!MapIniSavedBlocks.Contains(Key))
+			{
+				const TSharedPtr<FGenIniBlock>* OldBlock = ObjectBlocks.Find(Key);
+				MapIniSavedBlocks.Add(Key, OldBlock ? *OldBlock : nullptr);
+				const TSharedPtr<FGenThingTemplate>* OldTemplate = Templates.Find(Key);
+				MapIniSavedTemplates.Add(Key, OldTemplate ? *OldTemplate : nullptr);
+			}
+			AddObjectBlock(B, bReskin);
 			if (const TSharedPtr<FGenIniBlock>* Merged = ObjectBlocks.Find(Key))
 			{
-				Templates.Add(Key, BuildTemplate(B->Name(), *Merged));
+				if (const TSharedPtr<FGenThingTemplate>* Replaced = Templates.Find(Key))
+				{
+					MapIniRetiredTemplates.Add(*Replaced);
+				}
+				// (What every object inherits too: Burton on missions 3 and 4 is changed by their map.ini, and had no self-repair.)
+				TSharedPtr<FGenThingTemplate> Rebuilt = BuildTemplate(B->Name(), *Merged);
+				InheritDefaultModules(*Rebuilt);
+				Templates.Add(Key, Rebuilt);
 			}
 		}
 	}

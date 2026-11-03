@@ -88,6 +88,23 @@ namespace GenWeaponAffects
 	};
 }
 
+/** WeaponCollideMaskType (ProjectileCollidesWith). */
+namespace GenWeaponCollide
+{
+	enum : uint32
+	{
+		Allies = 1 << 0,
+		Enemies = 1 << 1,
+		Structures = 1 << 2,
+		Shrubbery = 1 << 3,
+		Projectiles = 1 << 4,
+		Walls = 1 << 5,
+		SmallMissiles = 1 << 6,
+		BallisticMissiles = 1 << 7,
+		ControlledStructures = 1 << 8,
+	};
+}
+
 /** WeaponReloadType (AutoReloadsClip). */
 enum class EGenReloadType : uint8
 {
@@ -126,6 +143,8 @@ struct GENERALS1_API FGenContainData
 	bool bAllowNeutral = true;
 	bool bPassengersAllowedToFire = false;
 	bool bShouldDrawPips = true;        // ShouldDrawPips = No: how full it is isn't shown (a gunship's only "passenger" is its gun)
+	bool bDestroyRidersNotFreeToExit = false; // the container dies with them stuck inside: gone, rather than killed
+	bool bWeaponBonusPassedToPassengers = false; // its riders shoot with its weapon bonuses too
 	float DamagePercentToUnits = 0.f;   // share of their health the occupants lose when the container dies (1 = all die)
 	bool bBurnedDeathToUnits = true;
 	int32 NumberOfExitPaths = 1;        // ExitStartNN / ExitEndNN bones
@@ -192,15 +211,18 @@ struct GENERALS1_API FGenWeaponTemplate
 	bool bAntiMine = false;                    // AntiMine: may be aimed at mines and demo traps (a dozer's disarming tool)
 	float ContinueAttackRange = 0.f;           // with its victim gone, on to the nearest like it within this of where that was
 	FString FireFX;
+	TArray<FString> VeterancyFireFX;    // "VeterancyFireFX = LEVEL Name": the flash that rank fires with instead (an empty slot keeps FireFX)
 	FString ProjectileDetonationFX;
 	FString FireOCL;
 	FString ProjectileDetonationOCL;
 	FString ProjectileExhaust;          // particle system attached to the projectile
+	TArray<FString> VeterancyProjectileExhaust; // "VeterancyProjectileExhaust = LEVEL Name": the exhaust that rank's shots trail instead (an empty slot keeps ProjectileExhaust)
 	FString LaserName;                  // the shot is a beam: an object with W3DLaserDraw that lives a moment
 	float RequestAssistRange = 0.f;     // firing it asks those of its kind this close to fire a clip too (AssistedTargetingUpdate)
 	FString LaserBoneName;              // ... from this bone of the shooter's model
 	FString FireSound;
 	int32 FireSoundLoopTime = 0;        // frames: the fire sound loops for as long as shots come no further apart than this
+	bool bShowsAmmoPips = false;
 	int32 ClipSize = 0;                 // 0 = unlimited
 	int32 ClipReloadTime = 0;           // frames
 	// FiringTracker: a weapon that speeds up as it keeps firing (its CONTINUOUS_FIRE_MEAN / _FAST bonuses).
@@ -222,9 +244,34 @@ struct GENERALS1_API FGenWeaponTemplate
 	bool bAntiAirborneInfantry = false;
 	bool bDamageDealtAtSelfPosition = false;
 	TArray<FGenWeaponBonus> Bonuses;
+	float MinWeaponSpeed = 999999.f;    // ScaleWeaponSpeed: a lobbed shot flies from this (at its nearest) ...
+	bool bScaleWeaponSpeed = false;     // ... to WeaponSpeed (at its furthest), per frame
+	float ShockWaveAmount = 0.f;        // what the blast throws things about with
+	float ShockWaveRadius = 0.f;
+	float ShockWaveTaperOff = 0.f;
+	uint32 ProjectileCollideMask = GenWeaponCollide::Structures; // ProjectileCollidesWith: what its shot runs into on the way
+	bool bMissileCallsOnDie = false;    // its missile dies of DETONATED when it goes off (its InstantDeathBehavior's FX)
+	bool bPlayFXWhenStealthed = false;  // fires with its flash even from hiding
+	int32 AutoReloadWhenIdle = 0;       // frames without a shot after which the clip is full again
+	bool bLeechRange = false;           // LeechRangeWeapon: from its first shot, "unlimited range for the remainder of the attack"
+	// So many hits this close together make something more of it (napalm: a firestorm).
+	int32 HistoricBonusTime = 0;        // frames
+	int32 HistoricBonusCount = 0;
+	float HistoricBonusRadius = 0.f;
+	FString HistoricBonusWeapon;
 
 	bool IsProjectile() const { return !ProjectileObject.IsEmpty(); }
 	bool IsLaser() const { return !LaserName.IsEmpty(); }
+	/** Weapon::getFireFX: the flash this rank fires with, or FireFX where it has none of its own. */
+	const FString& GetFireFX(int32 Rank) const
+	{
+		return (Rank >= 0 && Rank < VeterancyFireFX.Num() && !VeterancyFireFX[Rank].IsEmpty()) ? VeterancyFireFX[Rank] : FireFX;
+	}
+	/** The exhaust this rank's shots trail, or ProjectileExhaust where it has none of its own. */
+	const FString& GetProjectileExhaust(int32 Rank) const
+	{
+		return (Rank >= 0 && Rank < VeterancyProjectileExhaust.Num() && !VeterancyProjectileExhaust[Rank].IsEmpty()) ? VeterancyProjectileExhaust[Rank] : ProjectileExhaust;
+	}
 };
 
 /** Armor.ini entry: damage multipliers per damage type. */
@@ -354,6 +401,8 @@ struct GENERALS1_API FGenWeaponSetEntry
 {
 	TArray<FString> Conditions;         // empty = None
 	FString Weapons[3];                 // PRIMARY, SECONDARY, TERTIARY
+	bool bShareReloadTime = false;      // ShareWeaponReloadTime: a shot from one slot holds all of them back
+	bool bLockSharedAcrossSets = false; // WeaponLockSharedAcrossSets: changing to this set keeps a locked weapon locked
 	bool bNoAutoChoose[3] = { false, false, false }; // "AutoChooseSources = SECONDARY NONE": only used when asked for by name
 	TArray<FString> PreferredAgainst[3]; // "PreferredAgainst = PRIMARY INFANTRY": always chosen against any of these
 };
@@ -373,11 +422,18 @@ struct GENERALS1_API FGenTurretData
 	float NaturalAngle = 0.f;           // radians
 	uint32 ControlledSlots = 0;         // bit per weapon slot
 	int32 RecenterTime = 0;             // frames
+	float FireAngleSweep[3] = { 0.f, 0.f, 0.f };   // TurretFireAngleSweep: while firing this slot the gun swings this far (radians) ...
+	float SweepSpeedModifier[3] = { 1.f, 1.f, 1.f }; // ... at this share of its turn rate
+	bool bFiresWhileTurning = false;    // firing doesn't cut off the sound of the turret turning
 	bool bAllowsPitch = false;          // the barrel goes up and down as well
 	float PitchRate = 0.01f;            // radians per frame
 	float NaturalPitch = 0.f;
 	float FirePitch = 0.f;              // above 0: it fires at this pitch, wherever the target is (artillery)
 	float MinPitch = 0.f;               // MinPhysicalPitch
+	float MinIdleScanAngle = 0.f;       // TurretAIIdleScanState: idle, it looks this far off its natural angle (radians) ...
+	float MaxIdleScanAngle = 0.f;
+	int32 MinIdleScanInterval = 0;      // ... every so many frames
+	int32 MaxIdleScanInterval = 0;
 	float GroundUnitPitch = 0.f;        // above 0: against things on the ground it aims this much higher at full range
 };
 
@@ -391,6 +447,12 @@ struct GENERALS1_API FGenSlowDeath
 	int32 SinkDelay = 0;
 	float SinkRate = 0.f;               // units per frame
 	int32 ProbabilityModifier = 10;
+	float ModifierBonusPerOverkillPercent = 0.f; // getProbabilityModifier: severely killed, the more spectacular death is likelier
+	int32 SinkDelayVariance = 0;        // frames
+	float FlingForce = 0.f;             // thrown into the air (0: not) ...
+	float FlingForceVariance = 0.f;
+	float FlingPitch = 0.f;             // ... at this angle (radians)
+	float FlingPitchVariance = 0.f;
 	TArray<FString> DeathTypes;         // raw DeathTypes tokens
 	TArray<FString> ExemptStatus;       // ... and the raw DieMuxData ExemptStatus tokens
 	TArray<FString> RequiredStatus;     // ... and RequiredStatus: every one of them must be set (a combat cycle's rider)
@@ -526,6 +588,7 @@ struct GENERALS1_API FGenDumbProjectile
 	TArray<FString> GarrisonHitKillRequired;  // ... of these kinds (all of them, upper case)
 	TArray<FString> GarrisonHitKillForbidden;
 	FString GarrisonHitKillFX;                // (at the building)
+	float FlightPathAdjustPerFrame = 0.f;     // how far the aim of the shot in flight follows a moving victim (0: not at all)
 };
 
 /** Faction definition (PlayerTemplate.ini). */
@@ -593,6 +656,10 @@ struct GENERALS1_API FGenModelConditionState
 	TArray<TPair<FString, bool>> HideShow; // (sub-object, bHide) in order
 	FString Turret;
 	FString TurretPitch;
+	FString AltTurret;              // AltTurret / AltTurretPitch: the second turret's bones
+	FString AltTurretPitch;
+	float TurretArtAngle[2] = { 0.f, 0.f }; // TurretArtAngle / AltTurretArtAngle: which way the turret's art points when the logic says 0 (radians)
+	float TurretArtPitch[2] = { 0.f, 0.f };
 	TArray<FString> MuzzleFlashBones; // WeaponMuzzleFlash bone prefixes (hidden unless firing)
 	TArray<int32> MuzzleFlashSlots;   // weapon slot (0..2) for each entry above
 	TArray<FString> RecoilBones;      // WeaponRecoilBone bone prefixes (barrels that kick back when firing)
@@ -615,6 +682,54 @@ struct FGenNeutronMissile
 	float SpecialAccelFactor = 1.f;      // the lift-off: for SpecialSpeedTime its height is set outright ...
 	int32 SpecialSpeedTime = 0;          // ... frames
 	float SpecialSpeedHeight = 0.f;      // ... rising this far in that time
+};
+
+/** FirestormDynamicGeometryInfoUpdate: a fire that grows out from where it lit and shrinks back. */
+struct FGenFirestorm
+{
+	bool bValid = false;
+	int32 InitialDelay = 0;              // frames
+	float InitialMajorRadius = 0.f;
+	float FinalMajorRadius = 0.f;
+	int32 TransitionTime = 0;            // frames, each way
+	bool bReverseAtTransitionTime = false;
+	float ScorchSize = 0.f;
+	float ParticleOffsetZ = 0.f;
+	TArray<FString> ParticleSystems;
+	FString FXList;
+	int32 DelayBetweenDamageFrames = 0;
+	float DamageAmount = 0.f;
+	float MaxHeightForDamage = 20.f;
+};
+
+/** BunkerBusterBehavior: with its upgrade, what the shot does to what is inside the thing it was aimed at. */
+struct FGenBunkerBuster
+{
+	bool bValid = false;
+	FString UpgradeRequired;
+	FString DetonationFX;
+	FString CrashThroughFX;
+	int32 CrashThroughFXFrames = 4;
+	FString ShockwaveWeapon;
+	FString OccupantDamageWeapon;
+};
+
+/** NeutronBlastBehavior: where it dies, the soldiers and the drivers die. */
+struct FGenNeutronShell
+{
+	bool bValid = false;
+	float BlastRadius = 10.f;
+	bool bAffectAirborne = true;
+	bool bAffectAllies = true;
+};
+
+/** FireWeaponWhenDamagedBehavior: Weapons[damage state] on being hurt, Weapons[4 + damage state] all the time. */
+struct FGenWhenDamaged
+{
+	bool bValid = false;
+	FString Weapons[8];
+	TArray<FString> DamageTypes;
+	float DamageAmount = 0.f;
 };
 
 /** NeutronMissileSlowDeathBehavior: the blast waves where the nuclear missile dies. */
@@ -782,6 +897,7 @@ struct GENERALS1_API FGenDrawModule
 	FGenConditionBits IgnoreConditions;
 	bool bOkToChangeModelColor = false;
 	uint8 ProjectileBoneFeedbackSlots = 0; // ProjectileBoneFeedbackEnabledSlots (bit per slot): the launch bones' sub-objects go as their shots are fired
+	FString AttachToBone;                  // AttachToBoneInAnotherModule: its model sits on that bone of another module's (a Technical's gunner on the truck bed)
 	FString AttachToBoneInContainer;       // W3DDependencyModelDraw: riding in the open, it is drawn on this bone of what carries it
 	FString RequiredScience;               // W3DScienceModelDraw: only players with this science see it (a salvage crate)
 	bool bAnimationsRequirePower = true;   // AnimationsRequirePower: its animations stand still while the building is short of power
@@ -826,6 +942,7 @@ struct GENERALS1_API FGenStealthData
 	float MoveThresholdSpeed = 0.f;         // per frame
 	bool bInnateStealth = true;             // otherwise an upgrade or a power has to give it
 	float FriendlyOpacityMin = 0.5f;        // how faint its owner sees it at the low point of the pulse
+	float RevealDistanceFromTarget = 0.f;   // this close to what it is attacking it shows itself
 	bool bDisguisesAsTeam = false;          // disguises itself instead (the bomb truck)
 	int32 DisguiseFrames = 0;               // DisguiseTransitionTime: fading out, into the other look, back in
 	int32 DisguiseRevealFrames = 0;         // DisguiseRevealTransitionTime
@@ -850,6 +967,7 @@ struct GENERALS1_API FGenStealthDetector
 	// range) and particle systems at a bone.
 	FString PingSound;
 	FString LoudPingSound;
+	FString IRGridParticleSys;              // IRGridParticleSysName: where it found somebody
 	FString IRParticleSys;                  // IRParticleSysName (IRBrightParticleSysName when something was found)
 	FString IRBrightParticleSys;
 	FString IRBeaconParticleSys;            // IRBeaconParticleSysName
@@ -997,6 +1115,7 @@ struct GENERALS1_API FGenThingTemplate
 	bool bAutoAcquireWhenStealthed = false;     // "AutoAcquireEnemiesWhenIdle = Yes Stealthed": opens fire even though it gives it away
 	bool bAutoAcquireBuildings = false;         // "... ATTACK_BUILDINGS": goes for plain buildings by itself too
 	FGenTurretData Turrets[2];          // Turret, AltTurret
+	bool bTurretsLinked = false;        // TurretsLinked: both aim at what is attacked, and fire together at a spot
 	/** "SET_NORMAL" -> locomotor template names. */
 	TMap<FString, TArray<FString>> LocomotorSets;
 
@@ -1074,6 +1193,8 @@ struct GENERALS1_API FGenThingTemplate
 	int32 HuntScanFrames = 30;
 	float HuntScanRange = 9999.f;
 	FGenAutoHeal AutoHeal;
+	FGenAutoHeal VeterancyAutoHeal;     // Default\Object.ini's InheritableModule: elite and heroic units mend themselves, whatever else they have
+	TArray<FGenAutoHeal> MoreAutoHeals; // the ambulance has one for infantry and one for vehicles
 	FString LaserMuzzleParticleSystem;  // LaserUpdate: a flare where the beam leaves the weapon ...
 	FString LaserTargetParticleSystem;  // ... and one where it strikes
 	FGenFlammable Flammable;
@@ -1081,6 +1202,7 @@ struct GENERALS1_API FGenThingTemplate
 	FGenTopple Topple;
 	FGenStructureCollapse Collapse;
 	FGenStructureTopple StructureTopple;
+	FString SpecialPowerCompletion;     // SpecialPowerCompletionDie: the power its death finishes (for the scripts)
 	bool bHasOwnDieModule = false;      // it brings a module that answers to its death (so the default DestroyDie is not its)
 	int32 UpgradedSupplyBoost = 0;              // extra money per load once the player has Supply Lines
 	// Things that fall out of aircraft (and the markers powers leave on the ground)
@@ -1225,6 +1347,7 @@ struct GENERALS1_API FGenThingTemplate
 	int32 DeletionMin = 0;
 	int32 DeletionMax = 0;
 	bool bDeliverPayloadAI = false;             // DeliverPayloadAIUpdate: a transport flying a delivery
+	TSharedPtr<struct FGenDeliverPayload> DeliverModule; // its module's own numbers, for a script's reinforcements
 	int32 DeliverDoorDelay = 0;                 // frames between arriving and the first drop
 	float SmartBombCourseCorrection = 0.f;      // SmartBombTargetHomingUpdate: how strongly a bomb holds its line (1 = not at all)
 	int32 EMPDisabledDuration = 0;              // EMPUpdate: frames that vehicles and buildings caught in it stay dead
@@ -1233,7 +1356,17 @@ struct GENERALS1_API FGenThingTemplate
 	bool bEMPSparesOwnBuildings = false;
 	bool bParachute = false;                    // ParachuteContain: carries one soldier down
 	float ParachuteOpenDist = 0.f;              // ... after falling freely this far
+	float ParachutePitchRateMax = 0.f;          // ... sways from a kick of up to this (radians per frame) ...
+	float ParachuteRollRateMax = 0.f;
+	float ParachuteLowAltitudeDamping = 0.2f;   // ... damped by this much more near the ground
+	int32 RodsExtendFrames = 0;                 // PowerPlantUpdate: POWER_PLANT_UPGRADING lasts this long, then POWER_PLANT_UPGRADED
 	FString ParachuteOpenSound;                 // ... heard from the rider when the canopy opens
+	TArray<int32> FireWeaponUpdateExclusive;        // ... ExclusiveWeaponDelay (frames): "Firing a real weapon surpresses this module"
+	int32 RefundValue = 0;              // what selling it gives back (0: SellPercentage of the cost)
+	float SubdualDamageCap = 0.f;       // a body that can be subdued (0: can't) takes that much of SUBDUAL_ damage ...
+	int32 SubdualDamageHealRate = 0;    // ... and loses SubdualDamageHealAmount of it every this many frames
+	float SubdualDamageHealAmount = 0.f;
+	int32 MoodAttackCheckRate = 0;      // frames between an idle unit's looks round for something to shoot (0: 2 seconds)
 	TArray<TPair<FString, int32>> FireWeaponUpdates; // FireWeaponUpdate: (weapon, initial delay in frames) fired where the object is, whenever ready
 	bool bHasProduction = false;        // ProductionUpdate: can queue units
 	int32 MaxQueueEntries = 9;
@@ -1352,6 +1485,10 @@ struct GENERALS1_API FGenThingTemplate
 	FGenHeliDeath HeliDeath;
 	FGenNeutronMissile NeutronMissile;
 	FGenNeutronBlast NeutronBlast;
+	FGenFirestorm Firestorm;            // FirestormDynamicGeometryInfoUpdate
+	FGenBunkerBuster BunkerBuster;      // BunkerBusterBehavior
+	FGenNeutronShell NeutronShell;      // NeutronBlastBehavior
+	FGenWhenDamaged WhenDamaged;        // FireWeaponWhenDamagedBehavior
 	FGenMissileLauncherBuilding MissileLauncher;
 	FGenParticleCannon ParticleCannon;
 	FGenSpectreGunship Gunship;
@@ -1457,6 +1594,29 @@ struct GENERALS1_API FGenThingTemplate
 	float ParkingApproachHeight = 0.f;
 	bool bParkInHangars = false;
 	float ParkingHealPerSecond = 0.f;
+	float ParkingDeckHeightOffset = 0.f;   // LandingDeckHeightOffset: what the ground under an aircraft parked here is
+	/** FlightDeckBehavior (campaign only): a ship's deck. The same spaces and runways as an airfield, but the
+	 *  bones are the ones the INI names in the order it lists them, and the deck is stocked with aircraft as
+	 *  the ship is built. */
+	bool bFlightDeck = false;
+	struct FFlightDeckRunway
+	{
+		TArray<FString> SpaceBones;                 // RunwayNSpaces
+		FString TakeoffStart, TakeoffEnd;           // RunwayNTakeoff: the two bones of the strip
+		FString LandingStart, LandingEnd;           // RunwayNLanding: a deck has strips of its own to come down on
+		TArray<FString> TaxiBones;                  // RunwayNTaxi: the way from the end of the landing to the parked planes
+		TArray<FString> CreationBones;              // RunwayNCreation: a new plane comes up at the first, and taxis by the rest
+		FString CatapultSystem;                     // RunwayNCatapultSystem: the steam that fires when a plane goes
+	};
+	TArray<FFlightDeckRunway> FlightRunways;
+	FString FlightPayloadTemplate;                  // PayloadTemplate: what stands on each space
+	/** A deck sends its aircraft one at a time: the ramp is raised once, then a plane may go every
+	 *  LaunchWaveDelay once the ramp has been up LaunchRampDelay. ParkingCleanupPeriod is how often the deck
+	 *  looks for a plane that should move up to an empty space nearer the start of its runway, and
+	 *  HumanFollowPeriod is the lag it gives a plane that moves after the one in front of it. */
+	int32 DeckLaunchWaveFrames = 0, DeckLaunchRampFrames = 0, DeckLowerRampFrames = 0, DeckCatapultFireFrames = 0;
+	int32 DeckCleanupFrames = 0, DeckHumanFollowFrames = 0;
+	int32 DeckReplacementFrames = 0, DeckDockAnimationFrames = 0; // ReplacementDelay, DockAnimationDelay: a lost plane's replacement
 
 	// Crushing: a mover with CrusherLevel above the other's CrushableLevel drives over it; anything with
 	// SquishCollide (infantry) is squished by any crusher.
@@ -1477,6 +1637,7 @@ struct GENERALS1_API FGenThingTemplate
 	int32 MissileFuelLifetime = 0;      // ... frames of fuel (0: no end)
 	float MissileInitialDist = 0.f;     // DistanceToTravelBeforeTurning
 	float MissileDiveDistance = 0.f;    // DistanceToTargetBeforeDiving: from here on the preferred height no longer counts
+	float MissileDistanceScatterWhenJammed = 0.f; // MissileAIUpdate: jammed, it lands up to this far off
 	float MissileLockDistance = 75.f;   // DistanceToTargetForLock: from here on it is moved straight at the target
 	FString MissileIgnitionFX;
 	bool bMissileDetonateOnNoFuel = false;
@@ -1538,6 +1699,7 @@ public:
 	const FString& BaseSideOf(const FString& Side) const;
 	const TArray<FGenPlayerTemplate>& GetPlayerTemplates() const { return PlayerTemplates; }
 	const TMap<FString, TSharedPtr<FGenThingTemplate>>& GetTemplates() const { return Templates; }
+	void DumpStatsIfAsked() const;
 
 	const FGenWeaponTemplate* FindWeapon(const FString& Name) const;
 	const FGenArmorTemplate* FindArmor(const FString& Name) const;
@@ -1558,6 +1720,10 @@ public:
 	float LowEnergyPenaltyModifier = 0.4f;        // how hard a power shortage slows production
 	float MinLowEnergyProductionSpeed = 0.5f;
 	float MaxLowEnergyProductionSpeed = 0.8f;
+	int32 HistoricDamageLimit = 0;                // frames a weapon's historic damage is remembered
+	bool bUseBehindBuildingMarker = true;         // what stands behind a building shows in its owner's colour
+	int32 DefaultOcclusionDelay = 90;             // frames: not while it is coming out of a building
+	float OccludedColorLuminanceScale = 0.5f;
 	float MultipleFactory = 0.f;                  // build time is multiplied by this for every further factory of the kind (1 in the game's data)
 	float AllowedHeightVariationForBuilding = 10.f;
 	int32 ValuePerSupplyBox = 100;                // money for each supply box delivered
@@ -1566,6 +1732,7 @@ public:
 	TArray<FGenWeaponBonus> GlobalWeaponBonuses;  // GameData.ini WeaponBonus lines: apply to every weapon (GARRISONED RANGE 133% ...)
 	float SupplyBuildBorder = 0.f;                // supply centers keep this far from supply piles
 	float GroupMoveClickToGatherFactor = 1.f;     // GroupMoveClickToGatherAreaFactor: a click inside the group's own area (scaled so) gathers it in
+	float SoloHealthBonus[2][3] = { { 1.f, 1.f, 1.f }, { 1.f, 1.f, 1.f } }; // Human / AISoloPlayerHealthBonus_Easy .. _Hard
 	bool bDrawSkyBox = false;                     // DrawSkyBox: the sky box (new_skybox.w3d) round the camera
 	bool bUseCloudMap = false;                    // UseCloudMap: cloud shadows sliding over the terrain and the roads
 	bool bUseLightMap = false;                    // UseLightMap: the light map (TSNoiseUrb) multiplied over them
@@ -1579,11 +1746,20 @@ public:
 	void ApplyMapIni(const FString& MapFolder);
 
 private:
+	// What the loaded map's map.ini replaced (null / unset: it wasn't there before).
+	TMap<FString, TSharedPtr<FGenIniBlock>> MapIniSavedBlocks;
+	TMap<FString, TSharedPtr<FGenThingTemplate>> MapIniSavedTemplates;
+	TMap<FString, TOptional<FGenLocomotorTemplate>> MapIniSavedLocomotors;
+	TMap<FString, TOptional<FGenWeaponTemplate>> MapIniSavedWeapons;
+	TArray<TSharedPtr<FGenThingTemplate>> MapIniRetiredTemplates;
+
 	void AddObjectBlock(const TSharedPtr<FGenIniBlock>& Block, bool bReskin);
 	TSharedPtr<FGenThingTemplate> BuildTemplate(const FString& Name, const TSharedPtr<FGenIniBlock>& Merged) const;
 	static TSharedPtr<FGenIniBlock> MergeBlocks(const FGenIniBlock* Base, const FGenIniBlock& Override);
 
 	bool bInitialized = false;
+	/** The modules every object gets from DefaultThing. */
+	void InheritDefaultModules(FGenThingTemplate& T) const;
 	/** Default\Object.ini's DefaultThingTemplate: the modules every object has unless it brings its own
 	    (a stealth module that waits for the GPS scrambler, and self-repair for elite and heroic units). */
 	TSharedPtr<FGenThingTemplate> DefaultThing;

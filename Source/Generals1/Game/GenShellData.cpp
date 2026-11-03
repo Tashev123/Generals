@@ -3,6 +3,7 @@
 #include "Core/GenIni.h"
 #include "Logic/GenCommandData.h"
 #include "Logic/GenGameData.h"
+#include "Map/GenRandomMap.h"
 #include "Generals1.h"
 
 namespace
@@ -106,6 +107,22 @@ void FGenShellData::Initialize()
 
 const FGenMapInfo* FGenShellData::FindMap(const FString& Name) const
 {
+	if (GenRandomMap::IsRandomName(Name))
+	{
+		const FString Key = Name.ToLower();
+		FScopeLock Lock(&RandomMapsLock);
+		if (const TSharedPtr<FGenMapInfo>* Found = RandomMaps.Find(Key))
+		{
+			return Found->Get();
+		}
+		const TSharedPtr<FGenMapInfo> Info = MakeShared<FGenMapInfo>();
+		if (!GenRandomMap::MakeInfo(Name, *Info))
+		{
+			return nullptr;
+		}
+		RandomMaps.Add(Key, Info);
+		return Info.Get();
+	}
 	return Maps.FindByPredicate([&Name](const FGenMapInfo& M) { return M.Name.Equals(Name, ESearchCase::IgnoreCase); });
 }
 

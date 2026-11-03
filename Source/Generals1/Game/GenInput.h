@@ -19,6 +19,7 @@ enum class EGenAction : uint8
 	AttackMove,
 	Guard,
 	Formation,
+	Scatter,
 	SelectMatching,
 	SelectAllUnits,
 	SelectAllAircraft,

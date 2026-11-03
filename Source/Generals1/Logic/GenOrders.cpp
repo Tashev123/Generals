@@ -86,18 +86,30 @@ void UGenGameLogic::CatchUp()
 	{
 		PublishFrame();
 	}
-	const double Until = FPlatformTime::Seconds() + 0.04;
+	// (Loading a saved game there is nothing to see but the loading screen: nearly all of the frame goes to the steps.)
+	const double Until = FPlatformTime::Seconds() + (bResuming ? 0.25 : 0.04);
 	int32 Steps = 0;
 	if (Audio)
 	{
 		Audio->SetSuspended(true); // (minutes of the match in a second: its sounds aren't played)
 	}
-	while (OrderSource && OrderSource->IsFrameReady(Frame) && Frame == CompletedFrame && FPlatformTime::Seconds() < Until)
+	while ((OrderSource ? OrderSource->IsFrameReady(Frame) : (bCinematicSkip || bResuming)) && Frame == CompletedFrame && FPlatformTime::Seconds() < Until)
 	{
 		RunStep();
 		++Steps;
+		if (bResuming && Frame >= ResumeUntilFrame)
+		{
+			FinishResume();
+			break;
+		}
+		if (bCinematicSkip && (!MapScripts || !MapScripts->IsInputDisabled()))
+		{
+			bCinematicSkip = false; // the scripts have given the player the game
+			UE_LOG(LogGenerals, Log, TEXT("Intro skipped: the mission starts at frame %u"), Frame);
+			break;
+		}
 	}
-	if (Audio)
+	if (Audio && !bResuming)
 	{
 		Audio->SetSuspended(false);
 	}
@@ -190,6 +202,7 @@ void UGenGameLogic::ExecuteCommand(const FGenCommand& In)
 	case EGenCommandType::ForceAttackGround: ExecForceAttackGround(C); break;
 	case EGenCommandType::SwitchWeapon: ExecSwitchWeapon(C); break;
 	case EGenCommandType::CreateFormation: ExecCreateFormation(C); break;
+	case EGenCommandType::Scatter: ExecScatter(C); break;
 	case EGenCommandType::Land: ExecLand(C); break;
 	case EGenCommandType::Attack: ExecAttack(C); break;
 	case EGenCommandType::SteerGunship: ExecSteerGunship(C); break;
@@ -217,6 +230,7 @@ void UGenGameLogic::ExecuteCommand(const FGenCommand& In)
 	case EGenCommandType::PurchaseScience: PurchaseScience(C.Player, C.Name); break;
 	case EGenCommandType::Cheat: ExecCheat(C); break;
 	case EGenCommandType::Session: ExecSession(C); break;
+	case EGenCommandType::NoteSelection: if (MapScripts) { MapScripts->SetSelectedForScripts(C.Units); } break;
 	default: break;
 	}
 }
@@ -248,6 +262,18 @@ void UGenGameLogic::ExecCheat(const FGenCommand& C)
 			GrantPlayerUpgrade(Local, *Upgrade);
 		}
 		UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: upgrade %s %s"), Frame, *Arg, Upgrade ? TEXT("granted") : TEXT("unknown"));
+	}
+	else if (What.Equals(TEXT("script"), ESearchCase::IgnoreCase))
+	{
+		// "script,Name": that script of the map's is enabled (a mission's ending without playing up to it).
+		if (MapScripts) { MapScripts->TestEnableScript(Arg); }
+		UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: script %s enabled"), Frame, *Arg);
+	}
+	else if (What.Equals(TEXT("runscript"), ESearchCase::IgnoreCase))
+	{
+		// "runscript,Name": that script's actions, now (a scene without playing up to it).
+		if (MapScripts) { MapScripts->TestRunScript(Arg); }
+		UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: script %s run"), Frame, *Arg);
 	}
 	else if (What.Equals(TEXT("kill"), ESearchCase::IgnoreCase))
 	{
@@ -501,6 +527,32 @@ void UGenGameLogic::SetPlayback(TUniquePtr<FGenReplay> Replay)
 	Playback = MoveTemp(Replay);
 	PlaybackNext = 0;
 	PlaybackMismatchFrame = 0;
+}
+
+void UGenGameLogic::BeginResume(uint32 UntilFrame)
+{
+	ResumeUntilFrame = UntilFrame;
+	bResuming = UntilFrame > Frame;
+	if (!bResuming)
+	{
+		Playback.Reset();
+	}
+	else if (Audio)
+	{
+		Audio->SetSuspended(true);
+	}
+}
+
+void UGenGameLogic::FinishResume()
+{
+	UE_LOG(LogGenerals, Log, TEXT("Saved game: back at frame %u%s"), Frame, PlaybackMismatchFrame != 0
+		? *FString::Printf(TEXT(" - it came out differently from frame %u on (another build of the game?)"), PlaybackMismatchFrame) : TEXT(", every frame the same"));
+	bResuming = false;
+	Playback.Reset();
+	if (Audio)
+	{
+		Audio->SetSuspended(false);
+	}
 }
 
 void UGenGameLogic::PlaceSetupObjects(const TArray<FGenSetupObject>& SetupObjects)

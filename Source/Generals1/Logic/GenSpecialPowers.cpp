@@ -197,6 +197,10 @@ bool UGenGameLogic::FireSpecialPower(FGenObject& Source, int32 Module, const FVe
 	}
 	const FGenSpecialPowerModule& M = Source.GetTemplate()->PowerModules[Module];
 	const FGenSpecialPowerTemplate* PowerTemplate = FGenUpgradeData::Get().FindPower(M.Power);
+	if (MapScripts)
+	{
+		MapScripts->NoteSpecialPowerTriggered(Source.GetOwner(), M.Power); // (SpecialPowerModule::aboutToDoSpecialPower)
+	}
 	if (!PowerTemplate)
 	{
 		return false;
@@ -222,6 +226,7 @@ bool UGenGameLogic::FireSpecialPower(FGenObject& Source, int32 Module, const FVe
 	case EGenPowerModule::Other:
 		if (!bCannon)
 		{
+			UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [power f%u] #%u %s: %s (module %s) ISN'T PORTED"), Frame, Source.GetID(), *Source.GetTemplate()->Name, *T.Name, *M.ModuleType);
 			return false;
 		}
 		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [power f%u] p%d fires %s at (%.0f, %.0f)"), Frame, Player, *T.Name, TargetPos.X, TargetPos.Y);
@@ -248,7 +253,14 @@ bool UGenGameLogic::FireSpecialPower(FGenObject& Source, int32 Module, const FVe
 		{
 			return false;
 		}
-		PlaySoundAt(M.InitiateSound, Source);
+		// (CommandXlat's pickAndPlayUnitVoiceResponse: the module's sound answers the player's click - one voice for the
+		// selection, "simply play the first one that comes along". A script's order says nothing: mission 3's scene has its
+		// five Lotuses set off in silence, and plays the one line it wants itself.)
+		if (!bFromScript && Players.IsValidIndex(Player) && Players[Player].bHuman && InitiateVoiceFrame != Frame)
+		{
+			InitiateVoiceFrame = Frame;
+			PlaySoundAt(M.InitiateSound, Source);
+		}
 		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [ability f%u] #%u p%d %s sets off to use %s on #%u"), Frame, Source.GetID(), Player, *Source.GetTemplate()->Name, *T.Name, TargetObj);
 		return true;
 	}
@@ -262,7 +274,11 @@ bool UGenGameLogic::FireSpecialPower(FGenObject& Source, int32 Module, const FVe
 		}
 		Source.OnPlayerCommand(false);
 		Source.SetCleanupAreaParameters(TargetPos, M.CleanupMoveRange);
-		PlaySoundAt(M.InitiateSound, Source);
+		if (!bFromScript && Players.IsValidIndex(Player) && Players[Player].bHuman && InitiateVoiceFrame != Frame)
+		{
+			InitiateVoiceFrame = Frame;
+			PlaySoundAt(M.InitiateSound, Source);
+		}
 		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [cleanup f%u] #%u p%d %s is sent to clean up round (%.0f, %.0f), %.0f about"), Frame, Source.GetID(), Player,
 			*Source.GetTemplate()->Name, TargetPos.X, TargetPos.Y, M.CleanupMoveRange);
 		break;
@@ -322,6 +338,29 @@ bool UGenGameLogic::FireSpecialPower(FGenObject& Source, int32 Module, const FVe
 		}
 		break;
 	}
+	case EGenPowerModule::FireWeapon:
+	{
+		// FireWeaponPower::doSpecialPowerAtLocation / AtObject: fully loaded, so many shots, turrets and all.
+		if (Source.IsDisabled())
+		{
+			return false;
+		}
+		Source.ReloadAllAmmo();
+		Source.OnPlayerCommand(false);
+		if (Victim)
+		{
+			Source.ClearAttack();
+			Source.CommandAttack(TargetObj, false);
+			Source.AttackShotsLeft = M.MaxShotsToFire;
+		}
+		else
+		{
+			Source.CommandFireAtPosition(TargetPos, M.MaxShotsToFire, INDEX_NONE);
+		}
+		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [power f%u] #%u %s fires %s (%d shots) at (%.0f, %.0f)"), Frame, Source.GetID(), *Source.GetTemplate()->Name, *T.Name,
+			M.MaxShotsToFire, TargetPos.X, TargetPos.Y);
+		break;
+	}
 	case EGenPowerModule::CashHack:
 	{
 		// CashHackSpecialPower: money straight out of the pocket of whoever owns the targeted building.
@@ -355,7 +394,14 @@ bool UGenGameLogic::FireSpecialPower(FGenObject& Source, int32 Module, const FVe
 		// SpyVisionSpecialPower -> SpyVisionUpdate::activateSpyVision: for the duration, what the enemy's
 		// units see, this player sees too. (Kept per player here; the original marks each enemy unit.)
 		FGenPlayer& Spy = Players[Player];
-		Spy.SpyVisionEndFrame = Frame + uint32(FMath::Max(M.Duration, 1));
+		// ("increases in range and duration of effect the more units we have captured within us")
+		int32 SpyFrames = M.Duration;
+		if (Source.GetContain())
+		{
+			SpyFrames += GetRiders(Source).Num() * M.BonusDurationPerCaptured;
+			SpyFrames = FMath::Min(SpyFrames, M.MaxDuration);
+		}
+		Spy.SpyVisionEndFrame = Frame + uint32(FMath::Max(SpyFrames, 1));
 		Spy.SpyVisionSource = Source.GetID();
 		for (FGenPlayer& Other : Players)
 		{
@@ -446,6 +492,15 @@ void UGenGameLogic::ExecFireWeapon(const FGenCommand& C)
 		if (U && Victim && !U->IsDead() && !U->IsContained() && Slot >= 0 && Slot < 3 && U->GetWeapon(Slot).Template)
 		{
 			U->OnPlayerCommand(false);
+			if (OrderToDeck(U, EGenCommandType::FireWeapon, FVector3f::ZeroVector, C.Target, Slot))
+			{
+				// The carrier's button (Command_AircraftCarrierFire) has nothing to shoot: its weapon
+				// AircraftCarrierOrderLaunch has no projectile and 0.00001 damage, so the button is only a way
+				// for the player to point at something. What it points at is taken as the deck's order, and a
+				// plane is sent at it. This is a house rule: the game's own switch has no case for
+				// FIRE_WEAPON, so there the button would only clear whatever the deck was doing.
+				continue;
+			}
 			U->CommandAttackWithSlot(C.Target, Slot);
 		}
 	}
@@ -759,7 +814,8 @@ bool FGenObject::UpdateDelivery(uint32 Frame)
 		}
 		if (D.ItemsLeft > 0)
 		{
-			DropPayloadItem(Frame);
+			if (D.bRiders) { DropRider(Frame); }
+			else { DropPayloadItem(Frame); }
 		}
 		for (int32 n = 0; n < P.VisibleItemsDroppedPerInterval && D.VisibleLeft > 0; ++n)
 		{
@@ -876,10 +932,79 @@ void FGenObject::DropPayloadItem(uint32 Frame)
 		Item->ID, Pos.X, Pos.Y, Pos.Z - Logic->GetGroundHeight(Pos.X, Pos.Y));
 }
 
+void FGenObject::StartRiderDelivery(const FVector3f& Target)
+{
+	// DeliverPayloadAIUpdate::deliverPayloadViaModuleData: "THIS GETS CALLED FOR SCRIPTED REINFORCEMENTS ONLY" - what
+	// it carries is what was put in it, and it drops that by its module's own numbers.
+	if (!Template->DeliverModule)
+	{
+		return;
+	}
+	Delivery = MakeUnique<FDelivery>();
+	FDelivery& D = *Delivery;
+	D.Data = Template->DeliverModule.Get();
+	D.Target = FVector3f(Target.X, Target.Y, Logic->GetGroundHeight(Target.X, Target.Y));
+	D.MoveTo = D.Target;
+	D.bRiders = true;
+	D.ItemsLeft = Logic->GetRiders(*this).Num();
+	// (It comes from off the map, at height and at speed: nothing shows it climbing.)
+	if (Locomotor)
+	{
+		const float Orient = FMath::Atan2(D.Target.Y - Position.Y, D.Target.X - Position.X);
+		SetOrientation(Orient);
+		SetPosition(FVector3f(Position.X, Position.Y, Logic->GetGroundHeight(Position.X, Position.Y) + Locomotor->PreferredHeight));
+		Velocity = FVector3f(FMath::Cos(Orient), FMath::Sin(Orient), 0.f) * Locomotor->Speed;
+		SnapshotPrevious();
+	}
+}
+
+void FGenObject::DropRider(uint32 Frame)
+{
+	// DeliveringState::update: the first of those on board goes out (AIExitState), below the aircraft, in its parachute.
+	FDelivery& D = *Delivery;
+	const FGenDeliverPayload& P = *D.Data;
+	const TArray<FGenObjectID>& Riders = Logic->GetRiders(*this);
+	FGenObject* Item = Riders.Num() > 0 ? Logic->FindObject(Riders[0]) : nullptr;
+	--D.ItemsLeft;
+	if (!Item)
+	{
+		return;
+	}
+	D.ItemsLeft = Riders.Num() - 1;
+	Logic->RemoveFromContain(*this, *Item);
+	FRandomStream& Rand = Logic->GetRandom();
+	FVector3f Pos = Position + P.DropOffset;
+	if (P.DropVariance.X > 0.f) { Pos.X += Rand.FRandRange(-P.DropVariance.X, P.DropVariance.X); }
+	if (P.DropVariance.Y > 0.f) { Pos.Y += Rand.FRandRange(-P.DropVariance.Y, P.DropVariance.Y); }
+	if (P.DropVariance.Z > 0.f) { Pos.Z += Rand.FRandRange(-P.DropVariance.Z, P.DropVariance.Z); }
+	Item->SetPosition(Pos);
+	Item->SnapshotPrevious();
+	const FGenThingTemplate* ChuteT = P.PutInContainer.IsEmpty() ? nullptr : FGenGameData::Get().FindTemplate(P.PutInContainer);
+	FGenObject* Chute = (ChuteT && ChuteT->bParachute) ? Logic->CreateObject(ChuteT, Owner, Pos, Orientation) : nullptr;
+	if (Chute)
+	{
+		Chute->Producer = ID;
+		Chute->CarryUnderParachute(*Item, nullptr, Template->Contain.bKeepVelocityOnExit ? Velocity : FVector3f::ZeroVector);
+	}
+	else
+	{
+		Item->Velocity = Velocity;
+		Item->bFalling = true;
+		Item->bFreePhysics = true;
+		Item->Goal = D.Target;
+	}
+	UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [power f%u] #%u %s lets #%u %s out at (%.0f, %.0f), %d still on board"), Frame, ID, *Template->Name, Item->ID,
+		*Item->Template->Name, Pos.X, Pos.Y, D.ItemsLeft);
+}
+
 void FGenObject::CarryUnderParachute(FGenObject& Rider, const FVector3f* LandAt, const FVector3f& StartVelocity)
 {
 	ParachuteRider = Rider.ID;
 	bFalling = true;
+	// ParachuteContain::ParachuteContain: "m_pitchRate = GameLogicRandomValueReal(-d->m_pitchRateMax, d->m_pitchRateMax)"
+	ChutePitch = ChuteRoll = 0.f;
+	ChutePitchRate = Logic->GetRandom().FRandRange(-Template->ParachutePitchRateMax, Template->ParachutePitchRateMax);
+	ChuteRollRate = Logic->GetRandom().FRandRange(-Template->ParachuteRollRateMax, Template->ParachuteRollRateMax);
 	bChuteLandsWhereItOpens = LandAt == nullptr;
 	Goal = LandAt ? *LandAt : FVector3f(Position.X, Position.Y, 0.f);
 	Velocity = StartVelocity;
@@ -964,7 +1089,14 @@ void FGenObject::UpdateAreaWeapons(uint32 Frame)
 		{
 			continue;
 		}
-		Logic->DoFXPos(W->FireFX, Position, nullptr, 0.f, nullptr, W->PrimaryDamageRadius);
+		// FireWeaponUpdate::isOKToFire: "Firing a real weapon surpresses this module"
+		const int32 Exclusive = Template->FireWeaponUpdateExclusive.IsValidIndex(i) ? Template->FireWeaponUpdateExclusive[i] : 0;
+		if (Exclusive > 0 && (Frame < FMath::Max3(Weapons[0].LastShotFrame, Weapons[1].LastShotFrame, Weapons[2].LastShotFrame) + uint32(Exclusive)
+			&& FMath::Max3(Weapons[0].LastShotFrame, Weapons[1].LastShotFrame, Weapons[2].LastShotFrame) != 0))
+		{
+			continue;
+		}
+		Logic->DoFXPos(W->GetFireFX(GetVeterancyLevel()), Position, nullptr, 0.f, nullptr, W->PrimaryDamageRadius);
 		if (!W->FireOCL.IsEmpty()) { Logic->DoOCL(W->FireOCL, *this); }
 		Logic->DealDamage(*W, ID, GenInvalidObjectID, Position, true);
 		uint32 Delay = uint32(FMath::Max(1, W->DelayBetweenShotsMin));
@@ -1113,6 +1245,22 @@ bool FGenObject::UpdatePayload(uint32 Frame)
 			Velocity.X = Vel.X;
 			Velocity.Y = Vel.Y;
 			Velocity.Z += FMath::Clamp(-Sink - Velocity.Z, -Brake, Brake);
+			// ParachuteContain::update: the canopy and its rider swing on a spring, and hang straight when they get near the
+			// ground ("so that things land vertically").
+			const float PitchStiffness = Locomotor ? Locomotor->PitchStiffness : 0.1f, RollStiffness = Locomotor ? Locomotor->RollStiffness : 0.1f;
+			const float NearGround = (Rider && Rider->Position.Z - Logic->GetGroundHeight(Rider->Position.X, Rider->Position.Y) <= 20.f) ? Template->ParachuteLowAltitudeDamping : 0.f;
+			const float PitchDamping = (Locomotor ? Locomotor->PitchDamping : 0.9f) + NearGround, RollDamping = (Locomotor ? Locomotor->RollDamping : 0.9f) + NearGround;
+			ChutePitchRate += -PitchStiffness * ChutePitch - PitchDamping * ChutePitchRate;
+			ChuteRollRate += -RollStiffness * ChuteRoll - RollDamping * ChuteRollRate;
+			ChutePitch += ChutePitchRate;
+			ChuteRoll += ChuteRollRate;
+			const FQuat4f Sway = FQuat4f(FVector3f::UpVector, Orientation) * FQuat4f(FVector3f::ForwardVector, ChuteRoll) * FQuat4f(FVector3f::RightVector, ChutePitch);
+			SetRotation(Sway);
+			UE_CLOG(Logic->IsTracing() && Logic->GetFrame() % 10 == 0, LogGenerals, Log, TEXT("  [chute f%u] #%u pitch %.1f roll %.1f degrees"), Logic->GetFrame(), ID, FMath::RadiansToDegrees(ChutePitch), FMath::RadiansToDegrees(ChuteRoll));
+			if (Rider && !Rider->bDead)
+			{
+				Rider->SetRotation(FQuat4f(FVector3f::UpVector, Rider->Orientation) * FQuat4f(FVector3f::ForwardVector, ChuteRoll) * FQuat4f(FVector3f::RightVector, ChutePitch));
+			}
 		}
 		Position += Velocity;
 		const float Ground = Logic->GetGroundHeight(Position.X, Position.Y);
@@ -1129,6 +1277,7 @@ bool FGenObject::UpdatePayload(uint32 Frame)
 			{
 				// ParachuteContain::onRemoving
 				Rider->bHeldByParachute = false;
+				Rider->SetOrientation(Rider->Orientation); // (draw->setInstanceMatrix(NULL): upright again)
 				Rider->SetModelCondition(FreeFallBit(), false);
 				Rider->SetModelCondition(ParachutingBit(), false);
 				Rider->SnapshotPrevious();

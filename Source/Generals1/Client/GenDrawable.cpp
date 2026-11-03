@@ -112,6 +112,8 @@ void GenDrawable::NoteTemplate(const FGenThingTemplate& Template)
 			}
 			Assets->NoteMovedBonePrefix(S.Model, S.Turret);
 			Assets->NoteMovedBonePrefix(S.Model, S.TurretPitch);
+			Assets->NoteMovedBonePrefix(S.Model, S.AltTurret);
+			Assets->NoteMovedBonePrefix(S.Model, S.AltTurretPitch);
 			for (const FString& Tire : Draw.Vehicle.Tires) { Assets->NoteMovedBonePrefix(S.Model, Tire); }
 			Assets->NoteMovedBonePrefix(S.Model, Draw.Vehicle.CabBone);
 			Assets->NoteMovedBonePrefix(S.Model, Draw.Vehicle.TrailerBone);

@@ -5,6 +5,7 @@
 #include "Map/GenRoads.h"
 #include "Map/GenTerrain.h"
 #include "Map/GenWater.h"
+#include "Async/ParallelFor.h"
 #include "Engine/Texture2D.h"
 #include "TextureResource.h"
 
@@ -90,7 +91,12 @@ bool GenRadar::PixelToWorld(const FVector2D& Pixel, const FBox2D& Window, const 
 UTexture2D* GenRadar::BuildTerrainTexture(const FGenMapData& Map, const UGenTerrainComponent& Terrain, const TArray<FGenBridgeInfo>& Bridges, float& OutAverageZ)
 {
 	const FVector2f MapSize = Map.GetPlayableBounds().Max;
-	const float XSample = MapSize.X / float(CellWidth), YSample = MapSize.Y / float(CellHeight);
+	const float CellX = MapSize.X / float(CellWidth), CellY = MapSize.Y / float(CellHeight);
+	// (The original's picture has one sample per radar cell, which is coarse on today's screens; everything else on the
+	// radar stays in radar cells.)
+	constexpr int32 Detail = 4;
+	const int32 PicW = CellWidth * Detail, PicH = CellHeight * Detail;
+	const float XSample = CellX / Detail, YSample = CellY / Detail;
 	const FColor WaterByte = FGenWaterSettings::Get().RadarWaterColor; // (a map may have its own)
 	const FLinearColor WaterColor(WaterByte.R / 255.f, WaterByte.G / 255.f, WaterByte.B / 255.f, 1.f);
 
@@ -113,7 +119,7 @@ UTexture2D* GenRadar::BuildTerrainTexture(const FGenMapData& Map, const UGenTerr
 	{
 		for (int32 X = 0; X < CellWidth; X += 2)
 		{
-			const float WX = X * XSample, WY = Y * YSample;
+			const float WX = X * CellX, WY = Y * CellY;
 			if (!Map.IsUnderwater(WX, WY))
 			{
 				SumZ += Map.GetGroundHeight(WX, WY);
@@ -122,19 +128,20 @@ UTexture2D* GenRadar::BuildTerrainTexture(const FGenMapData& Map, const UGenTerr
 		}
 	}
 	OutAverageZ = NumZ > 0 ? float(SumZ / NumZ) : 0.f;
+	const float AverageZ = OutAverageZ;
 
-	// One sample per radar cell: its colour as land and, where it is under water, as water.
+	// One sample per texel: its colour as land and, where it is under water, as water.
 	TArray<FLinearColor> Land, Water;
 	TArray<bool> bWet, bBridge;
-	Land.SetNumUninitialized(CellWidth * CellHeight);
-	Water.SetNumUninitialized(CellWidth * CellHeight);
-	bWet.SetNumUninitialized(CellWidth * CellHeight);
-	bBridge.Init(false, CellWidth * CellHeight);
-	for (int32 Y = 0; Y < CellHeight; ++Y)
+	Land.SetNumUninitialized(PicW * PicH);
+	Water.SetNumUninitialized(PicW * PicH);
+	bWet.SetNumUninitialized(PicW * PicH);
+	bBridge.Init(false, PicW * PicH);
+	ParallelFor(PicH, [&](int32 Y)
 	{
-		for (int32 X = 0; X < CellWidth; ++X)
+		for (int32 X = 0; X < PicW; ++X)
 		{
-			const int32 i = Y * CellWidth + X;
+			const int32 i = Y * PicW + X;
 			const float WX = X * XSample, WY = Y * YSample;
 			const float Z = Map.GetGroundHeight(WX, WY);
 			// "check to see if this point is part of a working bridge": it has the bridge type's colour,
@@ -144,7 +151,7 @@ UTexture2D* GenRadar::BuildTerrainTexture(const FGenMapData& Map, const UGenTerr
 			{
 				const FColor RC = Bridge->Type->RadarColor;
 				Land[i] = FLinearColor(RC.R / 255.f, RC.G / 255.f, RC.B / 255.f, 1.f);
-				InterpolateColorForHeight(Land[i], (Bridge->FromLeft.Z + Bridge->FromRight.Z + Bridge->ToLeft.Z + Bridge->ToRight.Z) / 4.f, OutAverageZ, HiZ, LoZ);
+				InterpolateColorForHeight(Land[i], (Bridge->FromLeft.Z + Bridge->FromRight.Z + Bridge->ToLeft.Z + Bridge->ToRight.Z) / 4.f, AverageZ, HiZ, LoZ);
 				Water[i] = Land[i];
 				bWet[i] = false;
 				bBridge[i] = true;
@@ -155,16 +162,16 @@ UTexture2D* GenRadar::BuildTerrainTexture(const FGenMapData& Map, const UGenTerr
 			// (The original passes these three heights in this order: the terrain average as "high" and the
 			// map's highest point as "middle". So land only ever gets darker, the lower it lies.)
 			Land[i] = Terrain.GetTerrainColorAt(Map, WX, WY);
-			InterpolateColorForHeight(Land[i], Z, OutAverageZ, HiZ, LoZ);
+			InterpolateColorForHeight(Land[i], Z, AverageZ, HiZ, LoZ);
 			Water[i] = WaterColor;
 			if (bWet[i])
 			{
 				InterpolateColorForHeight(Water[i], Z, WaterZ, WaterZ, LoZ);
 			}
 		}
-	}
+	});
 
-	UTexture2D* Texture = UTexture2D::CreateTransient(CellWidth, CellHeight, PF_B8G8R8A8, TEXT("GenRadarTerrain"));
+	UTexture2D* Texture = UTexture2D::CreateTransient(PicW, PicH, PF_B8G8R8A8, TEXT("GenRadarTerrain"));
 	if (!Texture)
 	{
 		return nullptr;
@@ -180,24 +187,24 @@ UTexture2D* GenRadar::BuildTerrainTexture(const FGenMapData& Map, const UGenTerr
 	{
 		return nullptr;
 	}
-	for (int32 Y = 0; Y < CellHeight; ++Y)
+	ParallelFor(PicH, [&](int32 Y)
 	{
-		for (int32 X = 0; X < CellWidth; ++X)
+		for (int32 X = 0; X < PicW; ++X)
 		{
 			// "How many tiles from the center tile we will sample away": one, so each cell is the average of
 			// itself and its neighbours (for water: of those that are water too).
-			const bool bWater = bWet[Y * CellWidth + X];
+			const bool bWater = bWet[Y * PicW + X];
 			FLinearColor Sum(0.f, 0.f, 0.f, 0.f);
 			int32 Samples = 0;
 			for (int32 J = Y - 1; J <= Y + 1; ++J)
 			{
 				for (int32 I = X - 1; I <= X + 1; ++I)
 				{
-					if (I < 0 || J < 0 || I >= CellWidth || J >= CellHeight)
+					if (I < 0 || J < 0 || I >= PicW || J >= PicH)
 					{
 						continue;
 					}
-					const int32 n = J * CellWidth + I;
+					const int32 n = J * PicW + I;
 					if (bWater && !bWet[n])
 					{
 						continue;
@@ -206,15 +213,15 @@ UTexture2D* GenRadar::BuildTerrainTexture(const FGenMapData& Map, const UGenTerr
 					++Samples;
 				}
 			}
-			const FLinearColor C = bBridge[Y * CellWidth + X] ? Land[Y * CellWidth + X] : Sum / float(FMath::Max(Samples, 1));
+			const FLinearColor C = bBridge[Y * PicW + X] ? Land[Y * PicW + X] : Sum / float(FMath::Max(Samples, 1));
 			// North is up on the radar: the top row of the picture is the map's far edge.
-			uint8* P = Dst + ((CellHeight - 1 - Y) * CellWidth + X) * 4;
+			uint8* P = Dst + ((PicH - 1 - Y) * PicW + X) * 4;
 			P[0] = uint8(FMath::Clamp(C.B, 0.f, 1.f) * 255.f);
 			P[1] = uint8(FMath::Clamp(C.G, 0.f, 1.f) * 255.f);
 			P[2] = uint8(FMath::Clamp(C.R, 0.f, 1.f) * 255.f);
 			P[3] = 255;
 		}
-	}
+	});
 	Platform->Mips[0].BulkData.Unlock();
 	Texture->UpdateResource();
 	return Texture;

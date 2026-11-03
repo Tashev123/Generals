@@ -139,6 +139,45 @@ namespace
 		return L;
 	}
 
+	/** Where a mesh's second texture comes from: stage 1 of the pass that shows, or its additive pass after that. */
+	struct FGenDetailSource
+	{
+		const FGenW3DTextureStage* Stage = nullptr;
+		const FGenW3DMaterialPass* ExtraPass = nullptr;
+	};
+
+	FGenDetailSource GetDetailSource(const FGenW3DMesh& M)
+	{
+		FGenDetailSource D;
+		const FGenPassLayout Layout = GetPassLayout(M);
+		if (!M.Passes.IsValidIndex(Layout.Base))
+		{
+			return D;
+		}
+		const FGenW3DMaterialPass& Pass = M.Passes[Layout.Base];
+		if (Pass.Stages.Num() >= 2 && Pass.Stages[1].TextureIds.Num() > 0)
+		{
+			D.Stage = &Pass.Stages[1];
+		}
+		else if (Layout.Under == INDEX_NONE && M.Passes.IsValidIndex(Layout.Base + 1))
+		{
+			const FGenW3DMaterialPass& Next = M.Passes[Layout.Base + 1];
+			if (PassBlendIs(M, Next, EGenW3DBlend::Additive) && PassIsTextured(M, Next) && !PassIsEnvironmentMapped(M, Next))
+			{
+				D.Stage = &Next.Stages[0];
+				D.ExtraPass = &Next;
+			}
+		}
+		return D;
+	}
+
+	/** The second texture's coordinates (a stage without any of its own uses the base stage's). */
+	const TArray<FVector2f>* GetDetailUVs(const FGenW3DMesh& M)
+	{
+		const FGenDetailSource D = GetDetailSource(M);
+		return D.Stage && D.Stage->TexCoords.Num() == M.Vertices.Num() ? &D.Stage->TexCoords : nullptr;
+	}
+
 	/** Base-pass UVs (stage 0) and per-vertex diffuse colors, when present for every vertex. */
 	void GetVertexStreams(const FGenW3DMesh& M, const TArray<FVector2f>*& OutUVs, const TArray<FColor>*& OutColors)
 	{
@@ -177,6 +216,7 @@ namespace
 		const FGenW3DTextureStage* Stage = Pass && Pass->Stages.Num() > 0 ? &Pass->Stages[0] : nullptr;
 		const FGenW3DMaterialPass* Under = M.Passes.IsValidIndex(Layout.Under) ? &M.Passes[Layout.Under] : nullptr;
 		const FGenW3DTextureStage* UnderStage = Under && Under->Stages.Num() > 0 ? &Under->Stages[0] : nullptr;
+		const FGenDetailSource Detail = GetDetailSource(M);
 		auto PickId = [](const TArray<uint32>& Ids, int32 Index) -> int32
 		{
 			if (Ids.Num() == 0) { return INDEX_NONE; }
@@ -193,7 +233,12 @@ namespace
 			const int32 UnderShaderId = Under ? PickId(Under->ShaderIds, t) : INDEX_NONE;
 			const int32 UnderTexId = UnderStage ? PickId(UnderStage->TextureIds, t) : INDEX_NONE;
 			const int32 UnderVMatId = Under ? PickId(Under->VertexMaterialIds, M.Triangles[t].X) : INDEX_NONE;
-			const TPair<FIntVector, FIntVector> SKey(FIntVector(ShaderId, TexId, VMatId), FIntVector(UnderShaderId, UnderTexId, UnderVMatId));
+			const int32 DetailTexId = Detail.Stage ? PickId(Detail.Stage->TextureIds, t) : INDEX_NONE;
+			const FGenW3DMaterialPass* DetailPass = Detail.ExtraPass ? Detail.ExtraPass : Pass;
+			const int32 DetailShaderId = DetailPass ? PickId(DetailPass->ShaderIds, t) : INDEX_NONE;
+			const int32 DetailVMatId = DetailPass ? PickId(DetailPass->VertexMaterialIds, M.Triangles[t].X) : INDEX_NONE;
+			const TPair<FIntVector, FIntVector> SKey(FIntVector(ShaderId, TexId, VMatId), Under ? FIntVector(UnderShaderId, UnderTexId, UnderVMatId)
+				: FIntVector(DetailShaderId, DetailTexId, Detail.ExtraPass ? DetailVMatId : INDEX_NONE));
 			int32* Existing = SectionOf.Find(SKey);
 			if (!Existing)
 			{
@@ -216,6 +261,7 @@ namespace
 						const TMap<FString, float> Args = ParseMapperArgs(VM.MapperArgs0);
 						auto Arg = [&Args](const TCHAR* Key, float Default) { const float* V = Args.Find(Key); return V ? *V : Default; };
 						S.UVScale = FVector2f(Arg(TEXT("uscale"), 1.f), Arg(TEXT("vscale"), 1.f));
+						// (Mode 5 below is the grid; here a texture that slides or rolls.)
 						if (M.Name.StartsWith(TEXT("TREADS"), ESearchCase::IgnoreCase))
 						{
 							// W3DTankDraw::updateTreadObjects: "check next character after 'TREADS'".
@@ -227,6 +273,41 @@ namespace
 							S.ScrollMode = 1;
 							S.UVPerSec = FVector2f(Arg(TEXT("upersec"), 0.f), Arg(TEXT("vpersec"), 0.f));
 							S.UVStart = FVector2f(Arg(TEXT("uoffset"), 0.f), Arg(TEXT("voffset"), 0.f));
+						}
+					}
+				}
+				if (M.VertexMaterials.IsValidIndex(VMatId) && M.VertexMaterials[VMatId].Stage0Mapping() == GenW3D::MappingGrid)
+				{
+					// GridTextureMapperClass ("FPS", "Log2Width", "Last", "Offset"): the frames take turns (the EMP's sphere).
+					const TMap<FString, float> Args = ParseMapperArgs(M.VertexMaterials[VMatId].MapperArgs0);
+					auto Arg = [&Args](const TCHAR* Key, float Default) { const float* V = Args.Find(Key); return V ? *V : Default; };
+					const float Width = float(1 << FMath::Clamp(FMath::RoundToInt32(Arg(TEXT("log2width"), 1.f)), 0, 8));
+					const float Last = Arg(TEXT("last"), 0.f);
+					S.ScrollMode = 5;
+					S.UVPerSec = FVector2f(Arg(TEXT("fps"), 1.f), Width);
+					S.UVStart = FVector2f(Last > 0.f ? Last : Width * Width, Arg(TEXT("offset"), 0.f));
+				}
+				if (Detail.Stage && M.Textures.IsValidIndex(DetailTexId))
+				{
+					const FGenW3DShader DetailShader = M.Shaders.IsValidIndex(DetailShaderId) ? M.Shaders[DetailShaderId] : FGenW3DShader();
+					const FGenW3DVertexMaterial* DetailVM = DetailPass && M.VertexMaterials.IsValidIndex(DetailVMatId) ? &M.VertexMaterials[DetailVMatId] : nullptr;
+					if (Detail.ExtraPass ? DetailShader.Texturing != 0 : (DetailShader.DetailColorFunc != 0 || DetailShader.DetailAlphaFunc != 0))
+					{
+						S.DetailTexture = M.Textures[DetailTexId].Name;
+						S.DetailMode = Detail.ExtraPass ? 9 : DetailShader.DetailColorFunc;
+						S.DetailAlphaMode = Detail.ExtraPass ? 0 : DetailShader.DetailAlphaFunc;
+						if (Detail.ExtraPass && DetailVM)
+						{
+							S.DetailTint = ToLinear(DetailVM->Diffuse) + ToLinear(DetailVM->Emissive);
+						}
+						const uint32 Mapping = !DetailVM ? 0u : (Detail.ExtraPass ? DetailVM->Stage0Mapping() : DetailVM->Stage1Mapping());
+						if (Mapping == GenW3D::MappingLinearOffset)
+						{
+							const TMap<FString, float> Args = ParseMapperArgs(Detail.ExtraPass ? DetailVM->MapperArgs0 : DetailVM->MapperArgs1);
+							auto Arg = [&Args](const TCHAR* Key, float Default) { const float* V = Args.Find(Key); return V ? *V : Default; };
+							S.DetailUVPerSec = FVector2f(Arg(TEXT("upersec"), 0.f), Arg(TEXT("vpersec"), 0.f));
+							S.DetailUVStart = FVector2f(Arg(TEXT("uoffset"), 0.f), Arg(TEXT("voffset"), 0.f));
+							S.DetailUVScale = FVector2f(Arg(TEXT("uscale"), 1.f), Arg(TEXT("vscale"), 1.f));
 						}
 					}
 				}
@@ -679,6 +760,11 @@ UMaterialInterface* UGenAssetSubsystem::GetSectionMaterial(const FGenSectionMate
 	{
 		Key += FString::Printf(TEXT("|scroll:%d|%s|%s|%s"), S.ScrollMode, *S.UVPerSec.ToString(), *S.UVStart.ToString(), *S.UVScale.ToString());
 	}
+	if (!S.DetailTexture.IsEmpty())
+	{
+		Key += FString::Printf(TEXT("|detail:%s|%d|%d|%s|%s|%s|%s"), *S.DetailTexture.ToLower(), S.DetailMode, S.DetailAlphaMode, *S.DetailTint.ToString(),
+			*S.DetailUVPerSec.ToString(), *S.DetailUVStart.ToString(), *S.DetailUVScale.ToString());
+	}
 	if (TObjectPtr<UMaterialInstanceDynamic>* Found = Materials.Find(Key))
 	{
 		return *Found;
@@ -711,6 +797,18 @@ UMaterialInterface* UGenAssetSubsystem::GetSectionMaterial(const FGenSectionMate
 		MID->SetScalarParameterValue(TEXT("ScrollMode"), float(S.ScrollMode));
 		MID->SetVectorParameterValue(TEXT("UVScroll"), FLinearColor(S.UVPerSec.X, S.UVPerSec.Y, S.UVStart.X, S.UVStart.Y));
 		MID->SetVectorParameterValue(TEXT("UVScale"), FLinearColor(S.UVScale.X, S.UVScale.Y, 0.f, 0.f));
+	}
+	if (!S.DetailTexture.IsEmpty())
+	{
+		if (UTexture2D* Detail = GetTexture(S.DetailTexture))
+		{
+			MID->SetTextureParameterValue(TEXT("DetailTexture"), Detail);
+			MID->SetScalarParameterValue(TEXT("DetailMode"), float(S.DetailMode));
+			MID->SetScalarParameterValue(TEXT("DetailAlphaMode"), float(S.DetailAlphaMode));
+			MID->SetVectorParameterValue(TEXT("DetailTint"), S.DetailTint);
+			MID->SetVectorParameterValue(TEXT("DetailScroll"), FLinearColor(S.DetailUVPerSec.X, S.DetailUVPerSec.Y, S.DetailUVStart.X, S.DetailUVStart.Y));
+			MID->SetVectorParameterValue(TEXT("DetailScale"), FLinearColor(S.DetailUVScale.X, S.DetailUVScale.Y, 0.f, 0.f));
+		}
 	}
 	if (S.bUnderlay)
 	{
@@ -1250,7 +1348,13 @@ bool UGenAssetSubsystem::GetMergedMesh(const FString& FileName, const FGenW3DFil
 	TVertexInstanceAttributesRef<FVector2f> VUV = Attr.GetVertexInstanceUVs();
 	TVertexInstanceAttributesRef<FVector4f> VCol = Attr.GetVertexInstanceColors();
 	TPolygonGroupAttributesRef<FName> GroupNames = Attr.GetPolygonGroupMaterialSlotNames();
-	VUV.SetNumChannels(1);
+	bool bAnyDetail = false;
+	for (const FGenModelPlan::FPart& Part : Parts)
+	{
+		const FGenW3DMesh* MeshPtr = Subs.IsValidIndex(Part.SubIndex) ? File.FindMesh(Subs[Part.SubIndex].Name) : nullptr;
+		bAnyDetail |= MeshPtr && GetDetailSource(*MeshPtr).Stage != nullptr;
+	}
+	VUV.SetNumChannels(bAnyDetail ? 2 : 1);
 
 	TMap<FString, int32> SectionOfKey;
 	TArray<FPolygonGroupID> Groups;
@@ -1268,6 +1372,7 @@ bool UGenAssetSubsystem::GetMergedMesh(const FString& FileName, const FGenW3DFil
 		const TArray<FVector2f>* UVs = nullptr;
 		const TArray<FColor>* Colors = nullptr;
 		GetVertexStreams(M, UVs, Colors);
+		const TArray<FVector2f>* DetailUVs = GetDetailUVs(M);
 		TArray<FGenSectionMaterial> Sections;
 		TArray<int32> TriSection;
 		BuildSections(M, Sections, TriSection);
@@ -1304,6 +1409,11 @@ bool UGenAssetSubsystem::GetMergedMesh(const FString& FileName, const FGenW3DFil
 			VTan[IID] = AnyPerpendicular(N);
 			VSign[IID] = 1.f;
 			VUV.Set(IID, 0, UVs ? FVector2f((*UVs)[v].X, 1.f - (*UVs)[v].Y) : FVector2f::ZeroVector);
+			if (bAnyDetail)
+			{
+				const TArray<FVector2f>* U1 = DetailUVs ? DetailUVs : UVs;
+				VUV.Set(IID, 1, U1 ? FVector2f((*U1)[v].X, 1.f - (*U1)[v].Y) : FVector2f::ZeroVector);
+			}
 			VCol[IID] = Colors ? FVector4f(ToLinear((*Colors)[v])) : FVector4f(1.f, 1.f, 1.f, 1.f);
 			Instances[v] = IID;
 		}
@@ -1400,7 +1510,9 @@ const FGenBuiltMesh* UGenAssetSubsystem::GetBuiltMesh(const FString& FileName, c
 	TVertexInstanceAttributesRef<FVector2f> VUV = Attr.GetVertexInstanceUVs();
 	TVertexInstanceAttributesRef<FVector4f> VCol = Attr.GetVertexInstanceColors();
 	TPolygonGroupAttributesRef<FName> GroupNames = Attr.GetPolygonGroupMaterialSlotNames();
-	VUV.SetNumChannels(1);
+	const bool bHasDetail = GetDetailSource(M).Stage != nullptr;
+	const TArray<FVector2f>* DetailUVs = bHasDetail ? GetDetailUVs(M) : nullptr;
+	VUV.SetNumChannels(bHasDetail ? 2 : 1);
 
 	MD.ReserveNewVertices(NumVerts);
 	MD.ReserveNewVertexInstances(NumVerts);
@@ -1419,6 +1531,11 @@ const FGenBuiltMesh* UGenAssetSubsystem::GetBuiltMesh(const FString& FileName, c
 		VSign[IID] = 1.f;
 		// The original loader flips V (meshmdlio.cpp: 1 - v); Unreal uses the same top-left origin as D3D.
 		VUV.Set(IID, 0, UVs ? FVector2f((*UVs)[v].X, 1.f - (*UVs)[v].Y) : FVector2f::ZeroVector);
+		if (bHasDetail)
+		{
+			const TArray<FVector2f>* U1 = DetailUVs ? DetailUVs : UVs;
+			VUV.Set(IID, 1, U1 ? FVector2f((*U1)[v].X, 1.f - (*U1)[v].Y) : FVector2f::ZeroVector);
+		}
 		VCol[IID] = Colors ? FVector4f(ToLinear((*Colors)[v])) : FVector4f(1.f, 1.f, 1.f, 1.f);
 		Instances[v] = IID;
 	}

@@ -189,7 +189,7 @@ void FGenObject::OnMineCollide(FGenObject& Other, uint32 Frame)
 	{
 		return;
 	}
-	const EGenRelationship R = Logic->GetRelationship(Owner, Other.Owner);
+	const EGenRelationship R = Logic->GetRelationship(*this, Other);
 	const uint8 Need = R == EGenRelationship::Enemies ? 1 : R == EGenRelationship::Allies ? 2 : 4;
 	if ((D.DetonatedByMask & Need) == 0)
 	{
@@ -304,7 +304,11 @@ FGenObject* FGenObject::FindContinueTarget(const FVector3f& Around, float Range,
 	float BestSq = Range * Range;
 	Logic->GetPartition().ForEachInRange(FVector2f(Around.X, Around.Y), Range, [&](FGenObject& O)
 	{
-		if (&O == this || !(bIgnoreStealth ? O.IsTargetable() : O.IsAttackable()) || Logic->GetRelationship(Owner, O.Owner) != EGenRelationship::Enemies
+		// (WeaponSet::getAbleToAttackSpecificObject: "victim is a non-allied Mine" will do. A mission's booby trapped derricks
+		// are a neutral side's.)
+		const EGenRelationship Relation = Logic->GetRelationship(*this, O);
+		if (&O == this || !(bIgnoreStealth ? O.IsTargetable() : O.IsAttackable())
+			|| (Relation != EGenRelationship::Enemies && !(O.IsKindOf(TEXT("MINE")) && Relation != EGenRelationship::Allies))
 			|| (VictimOwner != INDEX_NONE && O.Owner != VictimOwner) || ChooseWeapon(O) == INDEX_NONE)
 		{
 			return;

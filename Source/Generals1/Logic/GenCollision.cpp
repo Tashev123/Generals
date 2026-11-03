@@ -37,7 +37,7 @@ bool FGenObject::CanCrushOrSquish(const FGenObject& Other) const
 {
 	// Object::canCrushOrSquish: friends don't crush friends; infantry (SquishCollide) is squished by any
 	// crusher, vehicles only by a crusher above their crushable level.
-	if (Template->CrusherLevel <= 0 || Logic->GetRelationship(Owner, Other.Owner) == EGenRelationship::Allies)
+	if (Template->CrusherLevel <= 0 || Logic->GetRelationship(*this, Other) == EGenRelationship::Allies)
 	{
 		return false;
 	}
@@ -173,9 +173,18 @@ bool FGenObject::BlockedBy(const FGenObject& Other) const
 	const FVector2f OurDir = GetDirection2D(), TheirDir = Other.GetDirection2D();
 	const float DirDot = FVector2f::DotProduct(OurDir, TheirDir);
 
-	if (IsKindOf(TEXT("INFANTRY")) && Other.IsKindOf(TEXT("INFANTRY")) && DirDot <= 0.25f)
+	if (IsKindOf(TEXT("INFANTRY")) && Other.IsKindOf(TEXT("INFANTRY")))
 	{
-		return false; // infantry crossing other infantry just passes through
+		if (DirDot <= 0.25f)
+		{
+			return false; // infantry crossing other infantry just passes through
+		}
+		// Beyond the original: so does one coming up behind a soldier who has stopped. (Each held at his pace, a
+		// bunch of them stuck on each other for good: only one who is walking is followed.)
+		if (UsesSteering() && FVector2f(Other.Velocity.X, Other.Velocity.Y).SizeSquared() < FMath::Square(0.05f))
+		{
+			return false;
+		}
 	}
 	if (DistSqr < CellSize * CellSize * 0.0001f)
 	{
@@ -445,6 +454,11 @@ void UGenGameLogic::UpdateCollisions()
 		{
 			return;
 		}
+		// (A soldier let through because he got nowhere walks through the vehicle: it stays where it is.)
+		if (bAInfantry != bBInfantry && (bAInfantry ? A : B).IgnoreCollisionsUntil > Frame)
+		{
+			return;
+		}
 		const bool bAPushable = A.CanBePushed(), bBPushable = B.CanBePushed();
 		FVector2f PushA;
 		if ((!bAPushable && !bBPushable) || !A.GeometryPenetration(B, PushA))
@@ -535,6 +549,7 @@ void UGenGameLogic::UpdateCollisions()
 			O.Position.X = To.X;
 			O.Position.Y = To.Y;
 			O.Position.Z = O.GetSurfaceHeight();
+			O.LastPushedFrame = Frame;
 		}
 	}
 }

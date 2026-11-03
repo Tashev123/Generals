@@ -40,7 +40,9 @@ param(
     [int]$Seed = 0,
     [int]$PauseFrame = 0,
     [string]$Faction = "",
-    [string]$Extra = ""
+    [string]$Extra = "",
+    # (Saved\Logs: two sessions testing in turn each keep their own log.)
+    [string]$LogName = "GenTest.log"
 )
 
 $ErrorActionPreference = "Stop"
@@ -49,7 +51,7 @@ $ErrorActionPreference = "Stop"
 $ue = Get-GenEngine
 Enter-GenLock
 $proj = Join-Path $PSScriptRoot "..\Generals1.uproject" | Resolve-Path
-$log = Join-Path $PSScriptRoot "..\Saved\Logs\GenTest.log"
+$log = Join-Path $PSScriptRoot "..\Saved\Logs\$LogName"
 
 if ($Build) {
     $ErrorActionPreference = "Continue"
@@ -62,7 +64,7 @@ if ($Build) {
 }
 
 $args = @("`"$proj`"", "/Game/Generals/Maps/Skirmish", "-game", "-windowed", "-ResX=$ResX", "-ResY=$ResY",
-          "-GenMap=`"$Map`"", "-log=GenTest.log", "-unattended", "-nosplash")
+          "-GenMap=`"$Map`"", "-log=$LogName", "-unattended", "-nosplash")
 # -Window: in a real window on the desktop instead of offscreen (what needs the platform itself: the mouse cursors).
 if (-not $Window) { $args += "-RenderOffscreen" }
 if ($Cam) { $args += "-GenCam=$Cam" }

@@ -70,7 +70,12 @@ FGenObject::FGenObject(FGenObjectID InID, const FGenThingTemplate* InTemplate, i
 	if (Template->bHasLifetime)
 	{
 		// LifetimeUpdate: dies after a random time in [Min, Max], at least one frame from now.
-		const int32 Delay = Logic->GetRandom().RandRange(Template->MinLifetime, FMath::Max(Template->MinLifetime, Template->MaxLifetime));
+		int32 Delay = Logic->GetRandom().RandRange(Template->MinLifetime, FMath::Max(Template->MinLifetime, Template->MaxLifetime));
+		// LifetimeUpdate: "isKindOf( KINDOF_HULK ) && getHulkMaxLifetimeOverride() != -1"
+		if (const FGenMapScripts* Scripts = Logic->GetMapScripts(); Scripts && Scripts->GetHulkLifetimeOverride() != -1 && Template->IsKindOf(TEXT("HULK")))
+		{
+			Delay = Scripts->GetHulkLifetimeOverride();
+		}
 		LifetimeDieFrame = Logic->GetFrame() + uint32(FMath::Max(1, Delay));
 	}
 	InitCombat();
@@ -102,9 +107,52 @@ FGenObject::FGenObject(FGenObjectID InID, const FGenThingTemplate* InTemplate, i
 	}
 }
 
+void FGenObject::CommandExit()
+{
+	const FGenObject* Container = ContainedBy != GenInvalidObjectID ? Logic->FindObject(ContainedBy) : nullptr;
+	if (Container && Container->IsSubdued() && !Container->IsDead())
+	{
+		return;
+	}
+	bWantsExit = ContainedBy != GenInvalidObjectID;
+}
+
+void FGenObject::ExtendRods(bool bExtend)
+{
+	// PowerPlantUpdate::extendRods
+	static const int32 Upgrading = GenConditions::Index(TEXT("POWER_PLANT_UPGRADING")), Upgraded = GenConditions::Index(TEXT("POWER_PLANT_UPGRADED"));
+	if (bExtend)
+	{
+		if (RodsDoneFrame == 0 && !ModelConditions.Test(Upgraded))
+		{
+			SetModelCondition(Upgrading, true);
+			RodsDoneFrame = Logic->GetFrame() + uint32(FMath::Max(Template->RodsExtendFrames, 1));
+			SetDrawAnimDuration(Template->RodsExtendFrames);
+			UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [rods f%u] #%u %s rods going out"), Logic->GetFrame(), ID, *Template->Name);
+		}
+	}
+	else
+	{
+		// "they de-extend instantly."
+		SetModelCondition(Upgrading, false);
+		SetModelCondition(Upgraded, false);
+		RodsDoneFrame = 0;
+	}
+}
+
+float FGenObject::Template_SubdualCap() const
+{
+	return Template->SubdualDamageCap;
+}
+
+bool FGenObject::ShowsDisabledIcon() const
+{
+	return IsSubdued() || bUnderpowered || Logic->GetFrame() < FMath::Max(DisabledUntilFrame, HackedUntilFrame);
+}
+
 bool FGenObject::IsDisabled() const
 {
-	return bUnderpowered || bUnmanned || bScriptHeld || Logic->GetFrame() < FMath::Max(DisabledUntilFrame, HackedUntilFrame);
+	return IsSubdued() || bUnderpowered || bUnmanned || bScriptHeld || bScriptDisabled || Logic->GetFrame() < FMath::Max(DisabledUntilFrame, HackedUntilFrame);
 }
 
 bool FGenObject::ShouldAnimate(bool bConsiderPower) const
@@ -162,6 +210,14 @@ void FGenObject::CommandMoveTo(const FVector3f& InGoal)
 		{
 			return;
 		}
+	}
+	if (Template->bChinookAI && Contain && ChinookFlight != EGenChinookFlight::Flying && ChinookFlight != EGenChinookFlight::CombatDrop)
+	{
+		// ChinookAIUpdate::aiDoCommand: "have to wait for takeoff or landing (or rappel) to complete, just store
+		// the sucker" - and on the ground: "gotta take off first!"
+		bChinookPendingMove = true;
+		ChinookPendingGoal = InGoal;
+		return;
 	}
 	bMovingOutOfWay = false;
 	bHasResumeGoal = false;
@@ -236,9 +292,19 @@ bool FGenObject::StartPath(const FVector3f& InGoal, bool bAroundUnits, const TFu
 		// Aircraft need no path: they fly straight there (Pathfinder::findPath for an AIR-only locomotor set),
 		// ending where no other aircraft hovers or is headed.
 		FVector2f Spot(InGoal.X, InGoal.Y);
-		Logic->AdjustAirDestination(*this, Spot);
+		// (A point on the way is nobody's to keep, and the way goes on beyond it: no slowing down for it.)
+		const float KeepExtraDistance = PathExtraDistance;
+		if (!bWaypoint)
+		{
+			Logic->AdjustAirDestination(*this, Spot);
+		}
 		StartDirectMove(FVector3f(Spot.X, Spot.Y, InGoal.Z));
 		RequestedGoal = InGoal;
+		if (bWaypoint)
+		{
+			PathExtraDistance = KeepExtraDistance;
+			bWaypointLeg = true;
+		}
 		return true;
 	}
 	// Pathfinder::queueForPath: the frame's pathfinding is spent (or others are waiting their turn) -
@@ -277,20 +343,75 @@ bool FGenObject::StartPath(const FVector3f& InGoal, bool bAroundUnits, const TFu
 
 	// (Pathfinder::queueForPath takes the id we are allowed to cross with the request: "setIgnoreObstacleID(
 	// getIgnoredObstacleID() )" - the object we are going into, or the airfield it is parked on.)
+	// Who is parked in our way (Pathfinder::checkForMovement: enemies close the cell, allies cost extra and are moved
+	// aside afterwards): 1, an idle ally that will make way for us if the way round is long; 2, anything else that
+	// won't move - a vehicle for a soldier, a unit busy fighting, an enemy.
+	auto ParkedKind = [this](FGenObjectID U) -> int32
+	{
+		const FGenObject* O = Logic->FindObject(U);
+		if (!O || O == this || !IsObstacleKind(*O) || !O->IsGroundUnit())
+		{
+			return 0;
+		}
+		return O->CanMakeWay() && !Template->bKindInfantry && Logic->GetRelationship(Owner, O->Owner) == EGenRelationship::Allies ? 1 : 2;
+	};
+	auto IsParkedObstacle = [&ParkedKind](FGenObjectID U) { return ParkedKind(U) != 0; };
+	auto FindRound = [&](TArray<FVector2f>& OutPath, TArray<uint8>& OutLayers)
+	{
+		PF.FindPathAroundUnits(ID, Footprint, From, Dest, GetPathSurfaces(), OutPath, Layer, WantLayer, &OutLayers, IgnoreObstacle, IsParkedObstacle);
+		return OutPath.Num() > 0 && FVector2f::DistSquared(OutPath.Last(), Dest) <= Sqr(2.f * CellSize); // (a way that gets there)
+	};
+	auto LengthOf = [&From](const TArray<FVector2f>& P)
+	{
+		float Length = 0.f;
+		FVector2f Prev = From;
+		for (const FVector2f& Point : P)
+		{
+			Length += FVector2f::Distance(Prev, Point);
+			Prev = Point;
+		}
+		return Length;
+	};
 	TArray<FVector2f> NewPath;
 	TArray<uint8> NewLayers;
-	if (bAroundUnits)
+	bool bThroughParked = false;
+	if (bAroundUnits && !FindRound(NewPath, NewLayers))
 	{
-		PF.FindPathAroundUnits(ID, Footprint, From, Dest, GetPathSurfaces(), NewPath, Layer, WantLayer, &NewLayers, IgnoreObstacle);
+		NewPath.Reset();
+		NewLayers.Reset();
 	}
 	if (NewPath.Num() == 0)
 	{
 		PF.FindPath(From, Dest, GetPathSurfaces(), NewPath, Layer, WantLayer, &NewLayers, IgnoreObstacle);
+		const int32 Parked = NewPath.Num() > 0 ? PF.WorstParkedOnPath(ID, Footprint, From, NewPath, NewLayers, IgnoreObstacle, ParkedKind) : 0;
+		if (Parked != 0)
+		{
+			// Beyond the original, whose search takes them in: the search over the ground alone is the quick one, and
+			// mostly all that is needed. Only when somebody is parked on its way is there a second one, round him.
+			TArray<FVector2f> RoundPath;
+			TArray<uint8> RoundLayers;
+			bool bRound = !bAroundUnits && FindRound(RoundPath, RoundLayers);
+			if (bRound && Parked == 1)
+			{
+				const float Plain = LengthOf(NewPath);
+				bRound = LengthOf(RoundPath) <= FMath::Min(3.f * Plain, Plain + 40.f * CellSize);
+			}
+			if (bRound)
+			{
+				NewPath = MoveTemp(RoundPath);
+				NewLayers = MoveTemp(RoundLayers);
+			}
+			else
+			{
+				bThroughParked = true;
+			}
+		}
 	}
 	if (NewPath.Num() == 0)
 	{
 		return false;
 	}
+	bPathThroughParked = bThroughParked;
 	Path = MoveTemp(NewPath);
 	PathLayers = MoveTemp(NewLayers);
 	PathIndex = 0;
@@ -459,7 +580,24 @@ void FGenObject::Update(uint32 Frame)
 	}
 	// Object::setDisabledUntil / clearDisabled: a building or vehicle that loses its power (a power cut, an EMP,
 	// a hacker) is heard going down - unless it already was for another of those reasons - and coming back.
-	const bool bPowerDown = bUnderpowered || Frame < FMath::Max(EMPUntilFrame, HackedUntilFrame);
+	// SubdualDamageHelper::update: what is left of it wears off.
+	if (CurrentSubdual > 0.f && Frame >= SubdualHealFrame)
+	{
+		SubdualHealFrame = Frame + uint32(FMath::Max(Template->SubdualDamageHealRate, 1));
+		const bool bWas = IsSubdued();
+		CurrentSubdual = FMath::Max(0.f, CurrentSubdual - Template->SubdualDamageHealAmount);
+		UE_CLOG(bWas && !IsSubdued() && Logic->IsTracing(), LogGenerals, Log, TEXT("  [subdue f%u] #%u %s comes back"), Frame, ID, *Template->Name);
+	}
+	if (RodsDoneFrame != 0 && Frame >= RodsDoneFrame)
+	{
+		// PowerPlantUpdate::update
+		static const int32 Upgrading = GenConditions::Index(TEXT("POWER_PLANT_UPGRADING")), Upgraded = GenConditions::Index(TEXT("POWER_PLANT_UPGRADED"));
+		RodsDoneFrame = 0;
+		SetModelCondition(Upgrading, false);
+		SetModelCondition(Upgraded, true);
+		UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [rods f%u] #%u %s rods are out"), Frame, ID, *Template->Name);
+	}
+	const bool bPowerDown = IsSubdued() || bUnderpowered || Frame < FMath::Max(EMPUntilFrame, HackedUntilFrame);
 	if (bPowerDown != bPowerDownHeard)
 	{
 		bPowerDownHeard = bPowerDown;
@@ -547,6 +685,10 @@ void FGenObject::Update(uint32 Frame)
 	{
 		Kill();
 		return;
+	}
+	if (Template->Firestorm.bValid)
+	{
+		UpdateFirestorm(Frame);
 	}
 	if (ToppleState == EToppleState::Falling || TreeSinkFramesLeft > 0)
 	{
@@ -663,6 +805,11 @@ void FGenObject::Update(uint32 Frame)
 	{
 		UpdateAutoHeal(Frame);
 	}
+	if (bVeterancyAutoHealActive && Frame >= NextVeterancyAutoHealFrame)
+	{
+		NextVeterancyAutoHealFrame = Frame + uint32(Template->VeterancyAutoHeal.Delay);
+		PulseAutoHeal(Template->VeterancyAutoHeal, Frame);
+	}
 	if (PoisonStopFrame != 0)
 	{
 		UpdatePoison(Frame);
@@ -670,6 +817,10 @@ void FGenObject::Update(uint32 Frame)
 		{
 			return;
 		}
+	}
+	if (Template->WhenDamaged.bValid)
+	{
+		UpdateWhenDamagedWeapon(Frame);
 	}
 	if (Template->bBaseRegenerate && Frame >= BaseRegenFrame)
 	{
@@ -924,6 +1075,12 @@ void FGenObject::Update(uint32 Frame)
 			bHasExitRally = false;
 			CommandMoveTo(ExitRally);
 		}
+		if (bEvacuateOnArrival && !bMoving)
+		{
+			// AIMoveAndEvacuateState: there, everybody out.
+			bEvacuateOnArrival = false;
+			Logic->EvacuateContainer(*this);
+		}
 		if (BuildTarget != GenInvalidObjectID || RepairTarget != GenInvalidObjectID)
 		{
 			UpdateDozer(Frame);
@@ -940,12 +1097,30 @@ void FGenObject::Update(uint32 Frame)
 		{
 			UpdateDocking(Frame);
 		}
-		if (!bJetDriving && !bPackingUp)
+		if (!bJetDriving && !bPackingUp && !bStunned)
 		{
 			UpdateAI(Frame);
 		}
 		// (An aircraft on the ground at its airfield rolls on its taxi locomotor, like a ground unit.)
-		if (IsUsingAirLoco())
+		if (bStunned)
+		{
+			// ("Skip moveTowardsPosition if physics say you're stunned.") Thrown by a shock wave, until it is down and still.
+			UpdateFreePhysics(Frame);
+			if (bDead || bPendingDestroy)
+			{
+				return;
+			}
+			if (Position.Z <= GroundHeightAt(Position.X, Position.Y) && Accel.Z <= 0.f && FMath::Abs(Velocity.Z) < 0.5f)
+			{
+				bStunned = false;
+				bAllowBounce = Template->bAllowBouncing;
+				YawRate = PitchRate = RollRate = 0.f;
+				SetOrientation(GetYawFromRotation());
+				NextRepathFrame = 0;
+				UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [shock f%u] #%u %s is down at (%.0f, %.0f)"), Frame, ID, *Template->Name, Position.X, Position.Y);
+			}
+		}
+		else if (IsUsingAirLoco())
 		{
 			UpdateFlightPhysics(Frame);
 		}
@@ -953,9 +1128,14 @@ void FGenObject::Update(uint32 Frame)
 		{
 			UpdatePhysics(Frame);
 		}
-		// A unit held up behind another one stops its move animation after a quarter second.
-		SetModelCondition(GenConditions::Moving(), bMoving && !bPackingUp && BlockedFrames <= uint32(GenLogic::GetLogicFPS() / 4)
-			&& !(Path.Num() == 0 && IsWaitingForPath()) && !IsDeployBusy());
+		// A unit held up behind another one stops its move animation after a quarter second - if it really has
+		// stopped: one keeping to the pace of the unit ahead is walking, and a soldier the collision pass moves over
+		// walks too (no sliding about on the spot in a standing pose, no running on the spot either).
+		const uint32 FPS = uint32(GenLogic::GetLogicFPS());
+		const bool bGoing = FVector2f(Velocity.X, Velocity.Y).SizeSquared() > Sqr(0.02f);
+		const bool bPushed = Template->bKindInfantry && LastPushedFrame != 0 && Frame <= LastPushedFrame + 1 && TargetID == GenInvalidObjectID;
+		SetModelCondition(GenConditions::Moving(), bPushed || (bMoving && !bPackingUp && (bGoing || (BlockedFrames <= FPS / 4 && StuckFrames + WaitFrames <= FPS / 2))
+			&& !(Path.Num() == 0 && IsWaitingForPath()) && !IsDeployBusy()));
 		if (Template->AnimationSteeringFrames >= 0)
 		{
 			UpdateAnimationSteering(Frame);
@@ -1038,8 +1218,10 @@ void FGenObject::UpdateAI(uint32 Frame)
 
 	// AIInternalMoveToState: blocked by a unit that isn't going anywhere, or blocked for two seconds:
 	// find a new path that goes around the parked units.
+	// (Beyond the original: or getting nowhere for a second, whatever the reason.)
 	const uint32 FPS = uint32(GenLogic::GetLogicFPS());
-	if ((bStuck || BlockedFrames > 2 * FPS) && Frame >= NextBlockedRepathFrame)
+	const bool bNoProgress = UsesSteering() && StuckFrames + WaitFrames > FPS;
+	if ((bStuck || BlockedFrames > 2 * FPS || bNoProgress) && Frame >= NextBlockedRepathFrame)
 	{
 		NextBlockedRepathFrame = Frame + FPS;
 		const FVector3f Dest = RequestedGoal;
@@ -1047,7 +1229,7 @@ void FGenObject::UpdateAI(uint32 Frame)
 		const FVector2f KeepProgressPos = ProgressPos;
 		const float KeepProgressAngle = ProgressAngle;
 		UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [steer f%u] #%u %s paths round parked units (%s, blocked %u)"), Frame, ID, *Template->Name,
-			bStuck ? TEXT("held up by a parked unit") : TEXT("held up too long"), BlockedFrames);
+			bStuck ? TEXT("held up by a parked unit") : bNoProgress ? TEXT("getting nowhere") : TEXT("held up too long"), BlockedFrames);
 		if (StartPath(Dest, true, nullptr, false, bWaypointLeg))
 		{
 			// Re-pathing is not progress, and we are still being held up: keep the counters running
@@ -1084,8 +1266,9 @@ void FGenObject::UpdateAI(uint32 Frame)
 	const FVector2f Target = Path[PathIndex];
 	const float CloseEnough = FMath::Max(Locomotor->CloseEnoughDist, 1.f);
 
-	// Arrived: AIUpdate's move state ends when within CloseEnoughDist and stopped (or nearly).
-	if (PathIndex == Path.Num() - 1 && DistToGoal <= CloseEnough)
+	// Arrived: AIUpdate's move state ends when within CloseEnoughDist and stopped (or nearly). (Beyond the original:
+	// or getting no nearer, right beside it: the room left among the units parked there is taken up, this is as far as it goes.)
+	if (PathIndex == Path.Num() - 1 && (DistToGoal <= CloseEnough || (bNoProgress && DistToGoal < 4.f * CellSize)))
 	{
 		if (bOnRoute && !bPlane && AIMode == EGenAIMode::FollowPath && TargetID == GenInvalidObjectID)
 		{
@@ -1188,6 +1371,18 @@ void FGenObject::UpdateAI(uint32 Frame)
 		UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [steer f%u] #%u p%d %s gives up its move at (%.0f, %.0f): %s"), Frame, ID, Owner, *Template->Name,
 			Position.X, Position.Y, StuckFrames > 6 * FPS ? TEXT("caught on the ground") : TEXT("waited 20 s on other units"));
 		CommandStop();
+	}
+	else if (UsesSteering() && StuckFrames + WaitFrames >= 3 * FPS && (StuckFrames + WaitFrames) % FPS == 0 && IgnoreCollisionsUntil <= Frame)
+	{
+		// Three seconds of new ways and still here: as the original lets a soldier stepping aside, and two vehicles
+		// wedged together, it goes through what holds it for a moment. (Not a vehicle through an enemy standing its ground.)
+		const FGenObject* Blocker = Logic->FindObject(SteerBlocker);
+		if (Template->bKindInfantry || !Blocker || Logic->GetRelationship(Owner, Blocker->Owner) == EGenRelationship::Allies)
+		{
+			IgnoreCollisionsUntil = Frame + FPS + FPS / 2;
+			UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [steer f%u] #%u p%d %s goes through at (%.0f, %.0f): getting nowhere for %u frames"), Frame, ID, Owner, *Template->Name,
+				Position.X, Position.Y, StuckFrames + WaitFrames);
+		}
 	}
 }
 
@@ -1714,9 +1909,9 @@ void FGenObject::UpdatePhysics(uint32 Frame)
 		Position.Y += Velocity.Y;
 	}
 
-	// Ground units stay on the terrain - or on the bridge they are crossing.
+	// Ground units stay on the terrain - or on the bridge they are crossing, or on the deck they are parked on.
 	UpdateLayer();
-	Position.Z = GetSurfaceHeight();
+	Position.Z = GroundHeightAt(Position.X, Position.Y);
 }
 
 uint32 FGenObject::GetFlashNow() const
@@ -1782,8 +1977,31 @@ void FGenObject::ChooseGoodLocomotorFromCurrentSet()
 
 float FGenObject::GetSurfaceHeight() const
 {
-	const float Ground = Logic->GetGroundHeight(Position.X, Position.Y);
-	return Layer != 0 ? Logic->GetPathfinder().GetLayerHeight(Position.X, Position.Y, Layer, Ground) : Ground;
+	return GetSurfaceHeightAt(Position.X, Position.Y);
+}
+
+float FGenObject::GroundHeightAt(float X, float Y) const
+{
+	// PhysicsUpdate's ground clamp: an aircraft parked on a ship's deck has that deck under its feet, not the
+	// water the ship floats on, so the deck's height is the height it is held at.
+	const float Surface = GetSurfaceHeightAt(X, Y);
+	return Surface + GetCarrierDeckHeight();
+}
+
+float FGenObject::GetSurfaceHeightAt(float X, float Y) const
+{
+	const float Ground = Logic->GetGroundHeight(X, Y);
+	return Layer != 0 ? Logic->GetPathfinder().GetLayerHeight(X, Y, Layer, Ground) : Ground;
+}
+
+float FGenObject::GetCarrierDeckHeight() const
+{
+	if (!bStatusDeckHeightOffset)
+	{
+		return 0.f;
+	}
+	const FGenObject* BuiltOn = Logic->FindObject(GetProducer());
+	return BuiltOn && BuiltOn->Parking ? BuiltOn->Parking->GetLandingDeckHeightOffset() : 0.f;
 }
 
 void FGenObject::UpdateLayer()
@@ -1831,7 +2049,7 @@ void FGenObject::UpdateFreePhysics(uint32 Frame)
 	constexpr float SignificantlyAboveTerrain = 9.f;  // SIGNIFICANTLY_ABOVE_TERRAIN_THRESHOLD
 	const FGenGameData& GD = FGenGameData::Get();
 	const float RateScale = 30.f / float(GenLogic::GetLogicFPS());
-	float GroundZ = Logic->GetGroundHeight(Position.X, Position.Y);
+	float GroundZ = GroundHeightAt(Position.X, Position.Y);
 	auto DampSpin = [this](float F) { YawRate *= F; PitchRate *= F; RollRate *= F; };
 
 	// applyGravitationalForces
@@ -1879,7 +2097,7 @@ void FGenObject::UpdateFreePhysics(uint32 Frame)
 	}
 
 	// handleBounce
-	GroundZ = Logic->GetGroundHeight(Position.X, Position.Y);
+	GroundZ = GroundHeightAt(Position.X, Position.Y);
 	float BounceAccel = 0.f;
 	if (bAllowBounce && Position.Z <= GroundZ)
 	{
@@ -1914,6 +2132,14 @@ void FGenObject::UpdateFreePhysics(uint32 Frame)
 
 	if (BounceAccel > 0.f)
 	{
+		if (bStunned)
+		{
+			TestStunnedUnitForDestruction(); // (handleBounce)
+			if (bDead)
+			{
+				return;
+			}
+		}
 		// The object is righted on impact (pitch and roll may have been anything), then bounces back up.
 		SetOrientation(GetYawFromRotation());
 		Accel.Z += BounceAccel;

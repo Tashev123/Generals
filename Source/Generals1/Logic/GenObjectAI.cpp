@@ -62,6 +62,25 @@ void FGenObject::CommandGuard(const FVector2f& Pos, float Radius, const FGenPoly
 	StartPath(FVector3f(Pos.X, Pos.Y, Position.Z), false);
 }
 
+void FGenObject::CommandAttackArea(const FGenPolygonTrigger* Area)
+{
+	// AIUpdateInterface::privateAttackArea: an area is hunted, not held. Nothing is ordered for what cannot
+	// move or for a projectile (a shell in the air has no AI to give an order).
+	if (bDead || !CanMove())
+	{
+		return;
+	}
+	if (IsKindOf(TEXT("PROJECTILE")))
+	{
+		return;
+	}
+	StopDocking();
+	AIMode = EGenAIMode::AttackArea;
+	GuardArea = Area;
+	NextAIModeFrame = 0; // it looks at once, then once a second
+	ClearAttack();
+}
+
 void FGenObject::CommandGuardPosition(const FVector2f& Pos, EGenGuardMode Mode, FGenObjectID InGuardObject)
 {
 	// AIGuardMachine with the human player's radii: the unit's vision range times GuardInnerModifierHuman
@@ -103,7 +122,7 @@ void FGenObject::CommandAttackMove(const FVector3f& InGoal)
 	StartPath(InGoal, false);
 }
 
-void FGenObject::CommandFollowPath(const TArray<FVector2f>& Points)
+void FGenObject::CommandFollowPath(const TArray<FVector2f>& Points, int32 LoopBackTo)
 {
 	if (bDead || !CanMove())
 	{
@@ -123,6 +142,7 @@ void FGenObject::CommandFollowPath(const TArray<FVector2f>& Points)
 	AIMode = EGenAIMode::FollowPath;
 	RoutePoints = Points;
 	RouteIndex = 0;
+	RouteLoopBackTo = LoopBackTo;
 	ClearAttack();
 	CommandStop();
 }
@@ -149,11 +169,18 @@ bool FGenObject::StartNextRouteLeg()
 	}
 	if (!RoutePoints.IsValidIndex(RouteIndex))
 	{
-		PathExtraDistance = 0.f;
-		return false; // "reached the end of the path"
+		if (RouteLoopBackTo < 0)
+		{
+			PathExtraDistance = 0.f;
+			return false; // "reached the end of the path"
+		}
+		// AIFollowWaypointPathState has no end for a path that comes back into itself: go round it again.
+		RouteIndex = RouteLoopBackTo;
 	}
 	const FVector2f P = RoutePoints[RouteIndex++];
-	const bool bLast = !RoutePoints.IsValidIndex(RouteIndex);
+	// (Round a closed circuit the point after the last is the one it comes back to.)
+	const int32 NextPoint = RoutePoints.IsValidIndex(RouteIndex) ? RouteIndex : RouteLoopBackTo;
+	const bool bLast = !RoutePoints.IsValidIndex(NextPoint);
 	if (bLast)
 	{
 		PathExtraDistance = 0.f;
@@ -162,21 +189,100 @@ bool FGenObject::StartNextRouteLeg()
 	{
 		// "We are in the middle of a path, so don't set the final goal location yet": the way goes on for
 		// as far as the next point is, and then some if there is one after that.
-		PathExtraDistance = FVector2f::Distance(RoutePoints[RouteIndex], P) + (RoutePoints.IsValidIndex(RouteIndex + 1) ? 4.f * GenLogic::PathfindCellSize : 0.f);
+		PathExtraDistance = FVector2f::Distance(RoutePoints[NextPoint], P) + (RoutePoints.IsValidIndex(NextPoint + 1) || RouteLoopBackTo >= 0 ? 4.f * GenLogic::PathfindCellSize : 0.f);
 	}
+	UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [route f%u] #%u %s: leg to (%.0f, %.0f), point %d of %d, %.0f beyond it"), Logic->GetFrame(), ID, *Template->Name, P.X, P.Y, RouteIndex, RoutePoints.Num(), PathExtraDistance);
 	return StartPath(FVector3f(P.X, P.Y, Logic->GetGroundHeight(P.X, P.Y)), false, nullptr, false, !bLast);
+}
+
+int32 FGenObject::GetAttackPriorityOf(const FGenObject& Other) const
+{
+	int32 Priority = AttackInfo->GetPriority(Other.Template->Canonical());
+	// "check for garrisoned buildings/vehicles & see if a higher priority unit is inside."
+	if (Priority != 0 && Other.Contain)
+	{
+		for (const FGenObjectID Id : Logic->GetRiders(Other))
+		{
+			if (const FGenObject* Rider = Logic->FindObject(Id))
+			{
+				Priority = FMath::Max(Priority, AttackInfo->GetPriority(Rider->Template->Canonical()));
+			}
+		}
+	}
+	return Priority;
+}
+
+FGenObject* FGenObject::FindEnemyByPriority(float Range, const FGenPolygonTrigger* Area) const
+{
+	GEN_PERF_SCOPE("Obj.FindEnemyByPriority");
+	const float Modifier = FMath::Max(FGenAIData::Get().AttackPriorityDistanceModifier, 1.f);
+	const FVector2f Self(Position.X, Position.Y);
+	const float SelfRadius = Template->GetBoundingCircleRadius();
+	FGenObject* Best = nullptr;
+	int32 BestEffective = 0, BestActual = 0;
+	float BestDist = FLT_MAX;
+	auto Consider = [&](FGenObject& Other)
+	{
+		FGenObject* O = &Other;
+		if (O == this || !O->IsAttackable() || Logic->GetRelationship(*this, *O) != EGenRelationship::Enemies)
+		{
+			return;
+		}
+		const float Dist = FMath::Max(0.f, FVector2f::Distance(Self, FVector2f(O->Position.X, O->Position.Y)) - SelfRadius - O->Template->GetBoundingCircleRadius());
+		if (Range >= 0.f && Dist > Range)
+		{
+			return;
+		}
+		if (Area && !Area->Contains(O->Position.X, O->Position.Y))
+		{
+			return;
+		}
+		const int32 Priority = GetAttackPriorityOf(*O);
+		if (Priority == 0) // "don't attack 0 priority targets."
+		{
+			return;
+		}
+		const int32 Effective = FMath::Max(1, Priority - int32(Dist / Modifier));
+		// (Near to far with the first of equals winning, in the original; here the order of looking doesn't matter.)
+		const bool bBetter = Effective > BestEffective || (Effective == BestEffective && (Priority > BestActual
+			|| (Priority == BestActual && (Dist < BestDist || (Dist == BestDist && Best && O->ID < Best->ID)))));
+		if (!bBetter || O->Template->IsKindOf(TEXT("HULK")) || IgnoresAsAutoTarget(*O) || ChooseWeapon(*O) == INDEX_NONE)
+		{
+			return;
+		}
+		Best = O;
+		BestEffective = Effective;
+		BestActual = Priority;
+		BestDist = Dist;
+	};
+	// Outward, until what is further off couldn't do better even at the set's best priority.
+	Logic->GetPartition().ForEachByRings(Self, Range, Consider, [&](float SeenRadius)
+	{
+		if (!Best)
+		{
+			return false;
+		}
+		const int32 BestPossible = AttackInfo->MaxPriority - int32(FMath::Max(0.f, SeenRadius - SelfRadius) / Modifier);
+		return BestPossible < BestEffective || (BestPossible == BestEffective && BestActual >= AttackInfo->MaxPriority);
+	});
+	return Best;
 }
 
 FGenObject* FGenObject::FindEnemyNear(const FVector2f& Center, float Radius, const FGenPolygonTrigger* Area) const
 {
 	GEN_PERF_SCOPE("Obj.FindEnemyNear");
+	// AI::findClosestEnemy: "if (info == NULL ...) No additional attack info, so just return the closest one."
+	if (AttackInfo && Radius < 0.f)
+	{
+		return FindEnemyByPriority(-1.f, Area);
+	}
 	FGenObject* Best = nullptr;
 	float BestDistSq = FLT_MAX;
 	const FVector2f Self(Position.X, Position.Y);
 	auto Consider = [&](FGenObject& Other)
 	{
 		FGenObject* O = &Other;
-		if (O == this || !O->IsAttackable() || Logic->GetRelationship(Owner, O->Owner) != EGenRelationship::Enemies)
+		if (O == this || !O->IsAttackable() || Logic->GetRelationship(*this, *O) != EGenRelationship::Enemies)
 		{
 			return;
 		}
@@ -233,6 +339,51 @@ void FGenObject::UpdateAIMode(uint32 Frame)
 			}
 		}
 		break;
+
+	case EGenAIMode::AttackArea:
+	{
+		// AIAttackAreaState: once a second (ENEMY_SCAN_RATE) look for the closest enemy inside the area,
+		// with no line-of-sight check, and go after it - "look around for better victims every so often".
+		// With nothing inside the area, or with no weapon that can be used, the state ends and the unit is
+		// idle: a script that wants the team to keep hunting re-orders the area (mission 2's attack teams
+		// do that every 10 s).
+		if (Frame < NextAIModeFrame)
+		{
+			break;
+		}
+		NextAIModeFrame = Frame + FPS + (ID % 11);
+		if (GuardArea == nullptr)
+		{
+			CommandIdle();
+			break;
+		}
+		bool bCanFire = false;
+		for (int32 s = 0; s < 3; ++s)
+		{
+			if (Weapons[s].Template && !IsWeaponOutOfAmmo(s))
+			{
+				bCanFire = true;
+				break;
+			}
+		}
+		if (!bCanFire && !IsKindOf(TEXT("PROJECTILE")))
+		{
+			CommandIdle(); // "this can happen for units which never auto-reload, like the Raptor"
+			break;
+		}
+		const FGenObject* Enemy = HasWeapons() ? FindEnemyNear(FVector2f(Position.X, Position.Y), -1.f, GuardArea) : nullptr;
+		if (Enemy)
+		{
+			TargetID = Enemy->ID;
+			bExplicitAttack = true;
+			NextRepathFrame = 0;
+		}
+		else
+		{
+			CommandIdle();
+		}
+		break;
+	}
 
 	case EGenAIMode::Guard:
 	{

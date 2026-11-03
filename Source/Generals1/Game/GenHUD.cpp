@@ -8,6 +8,7 @@
 #include "Logic/GenCommandData.h"
 #include "Logic/GenGameData.h"
 #include "Logic/GenGameLogic.h"
+#include "Logic/GenMapScripts.h"
 #include "Logic/GenUpgrades.h"
 #include "Map/GenMapActor.h"
 #include "Map/GenMapData.h"
@@ -16,8 +17,12 @@
 #include "Engine/Texture2D.h"
 #include "Game/GenCameraPawn.h"
 #include "Game/GenCursors.h"
+#include "Game/GenHudStyle.h"
 #include "Game/GenControlBarScheme.h"
 #include "Core/GenWnd.h"
+#include "W3D/GenTextureLoader.h"
+#include "Generals1.h"
+#include "Misc/ScopeExit.h"
 #include "CanvasItem.h"
 #include "CanvasTypes.h"
 
@@ -83,6 +88,12 @@ void AGenHUD::DrawHUD()
 		EndShell();
 		return;
 	}
+	if (GM && GM->IsResumingSave())
+	{
+		DrawResumeScreen(GM);
+		EndShell();
+		return;
+	}
 	if (!Logic->IsRunning())
 	{
 		EndShell();
@@ -92,14 +103,18 @@ void AGenHUD::DrawHUD()
 	// Drawable::drawHealthBar: "only draw health for selected drawables and drawables that have been moused
 	// over by the cursor". (Nothing is drawn on the ground round a selected thing: the original has no such ring.)
 	TArray<FGenObjectID, TInlineAllocator<64>> Shown;
-	Shown.Append(PC->GetSelection());
+	// (None of it in a cinematic, or while the scripts have the icons off: OPTIONS_SET_DRAWICON_UI_MODE.)
+	const bool bCinematic = Cine.bLetterbox || (Logic->GetMapScripts() && !Logic->GetMapScripts()->ShouldDrawIconUI());
+	if (!bCinematic)
+	{
+		Shown.Append(PC->GetSelection());
+	}
 	const int32 NumSelected = Shown.Num();
-	if (PC->GetMousedOver() != GenInvalidObjectID)
+	if (!bCinematic && PC->GetMousedOver() != GenInvalidObjectID)
 	{
 		Shown.AddUnique(PC->GetMousedOver());
 	}
-	const float BarScale = FMath::Max(1.f, FMath::RoundToFloat(Canvas->SizeY / 768.f));
-	const FVector CameraRight = PC->PlayerCameraManager ? FRotationMatrix(PC->PlayerCameraManager->GetCameraRotation()).GetScaledAxis(EAxis::Y) : FVector::RightVector;
+	const float BarScale = GetIconScale();
 	for (int32 ShownIndex = 0; ShownIndex < Shown.Num(); ++ShownIndex)
 	{
 		const FGenObjectID Id = Shown[ShownIndex];
@@ -164,24 +179,16 @@ void AGenHUD::DrawHUD()
 			}
 		}
 
-		// The health bar: Object::getHealthBoxPosition ("max height above position + 10") and
-		// getHealthBoxDimensions ("just add the major and minor axes"), computeHealthRegion. The original
-		// sizes it in pixels over the zoom, which at the height it looks from is about a world unit a
-		// pixel: here it is that wide in the world, whatever the screen and however far the view is pulled back.
 		if (T->IsKindOf(TEXT("FORCEATTACKABLE")) || T->IsKindOf(TEXT("IGNORED_IN_GUI")) || O->GetMaxHealth() <= 0.f || O->GetHealth() <= 0.f)
 		{
 			continue;
 		}
-		// (The angry mob's nexus: over the middle of its mob, and "pos.z += 20;// dear God, I confess my kluge, and repent.")
-		const FVector3f& BoxOffset = O->GetHealthBoxOffset();
-		const float MobLift = T->IsKindOf(TEXT("MOB_NEXUS")) ? 20.f : 0.f;
-		const FVector BarWorld = GenCoords::ToUE(P.X + BoxOffset.X, P.Y + BoxOffset.Y, P.Z + BoxOffset.Z + T->GeometryHeight + 10.f + MobLift);
-		const float Size = FMath::Clamp(T->GeometryMajorRadius + (T->IsBox() ? T->GeometryMinorRadius : T->GeometryMajorRadius), 20.f, 150.f);
-		FVector2D Top, Side;
-		if (PC->ProjectWorldLocationToScreen(BarWorld, Top) && PC->ProjectWorldLocationToScreen(BarWorld + CameraRight * double(Size) * GenCoords::UnitsToCm, Side))
+		FBox2D HealthRegion;
+		if (GetHealthRegion(PC, Logic, *O, HealthRegion))
 		{
-			const float W = FMath::Max(20.f * BarScale, float(FMath::Abs(Side.X - Top.X)));
-			const float H = 3.f * BarScale;
+			const float W = float(HealthRegion.GetSize().X);
+			const float H = float(HealthRegion.GetSize().Y);
+			FVector2D Top;
 			const float Frac = FMath::Clamp(O->GetHealth() / O->GetMaxHealth(), 0.f, 1.f);
 			FLinearColor Fill, Outline;
 			if (O->IsUnderConstruction() || O->IsDisabled())
@@ -210,7 +217,7 @@ void AGenHUD::DrawHUD()
 			// (The colours are the original's 0..255 values: as they are on the screen, not as light.)
 			Fill = FLinearColor::FromSRGBColor(Fill.ToFColor(false));
 			Outline = FLinearColor::FromSRGBColor(Outline.ToFColor(false));
-			const float X0 = FMath::RoundToFloat(float(Top.X) - W * 0.45f), Y0 = FMath::RoundToFloat(float(Top.Y) - H * 0.5f);
+			const float X0 = float(HealthRegion.Min.X), Y0 = float(HealthRegion.Min.Y);
 			const float Line = BarScale;
 			DrawRect(Outline, X0, Y0, W, Line);
 			DrawRect(Outline, X0, Y0 + H - Line, W, Line);
@@ -219,6 +226,11 @@ void AGenHUD::DrawHUD()
 			DrawRect(Fill, X0 + Line, Y0 + Line, (W - 2.f * Line) * Frac, H - 2.f * Line);
 			Top.X = X0 + W * 0.5f;
 			Top.Y = Y0;
+			// ("isSelected() || getMousedOverDrawableID() == getID()", and its controlling player the local one.)
+			if (bOwn)
+			{
+				DrawPips(Logic, *O, HealthRegion);
+			}
 			if (!bSelected)
 			{
 				continue;
@@ -248,24 +260,6 @@ void AGenHUD::DrawHUD()
 			else if (T->bIsSupplyTruck && O->GetBoxes() > 0)
 			{
 				Supplies = FString::Printf(TEXT("%d / %d"), O->GetBoxes(), T->MaxBoxes);
-			}
-			else if (O->GetContain() && Logic->ShowsContainPips(*O))
-			{
-				// How full a transport, a garrisoned building or the tunnel network is (the original's pips).
-				Supplies = FString::Printf(TEXT("%d / %d"), Logic->GetContainCount(*O), Logic->GetContainMax(*O));
-			}
-			else if (T->bJetAI)
-			{
-				// Ammunition that is only replaced at the airfield (ShowsAmmoPips).
-				for (int32 s = 0; s < 3; ++s)
-				{
-					const FGenWeaponInstance& WI = O->GetWeapon(s);
-					if (WI.Template && WI.Template->ClipSize > 0 && WI.Template->ReloadType == EGenReloadType::ReturnToBase)
-					{
-						Supplies = FString::Printf(TEXT("%d / %d"), WI.AmmoInClip, WI.Template->ClipSize);
-						break;
-					}
-				}
 			}
 			if (!Supplies.IsEmpty())
 			{
@@ -314,13 +308,24 @@ void AGenHUD::DrawHUD()
 		DrawRect(FLinearColor(0.2f, 1.f, 0.2f, 0.08f), FMath::Min(A.X, B.X), FMath::Min(A.Y, B.Y), FMath::Abs(B.X - A.X), FMath::Abs(B.Y - A.Y));
 	}
 
-	DrawVeterancy(PC, Logic);
-	DrawPlacement(PC, Logic);
-	DrawTargeting(PC, Logic);
-	DrawAnnouncements(Logic);
-	DrawSuperweaponTimers(Logic);
-	DrawControlBar(PC, Logic); // (the radar too: it lies in the bar's frame)
-	DrawGenerals(PC, Logic);
+	DrawScriptFade(Logic);
+	if (!bCinematic)
+	{
+		DrawStatusIcons(PC, Logic);
+		DrawBombIcons(PC, Logic);
+	}
+	if (!Cine.bLetterbox)
+	{
+		DrawPlacement(PC, Logic);
+		DrawTargeting(PC, Logic);
+		DrawAnnouncements(Logic);
+		DrawSuperweaponTimers(Logic);
+		DrawControlBar(PC, Logic); // (the radar too: it has a section of the bar)
+		DrawGenerals(PC, Logic);
+	}
+	DrawLetterbox();
+	DrawMilitaryCaption(Logic);
+	DrawIntroSkip(GM);
 	if (Logic->IsNetworkGame())
 	{
 		DrawNetOverlay(GM, Logic);
@@ -447,36 +452,248 @@ void AGenHUD::DrawTestCursor(const FVector2D& Pos)
 		0.f, 0.f, 1.f, 1.f, FLinearColor::White, BLEND_Translucent);
 }
 
-void AGenHUD::DrawVeterancy(AGenPlayerController* PC, UGenGameLogic* Logic)
+float AGenHUD::GetIconScale() const
 {
-	// The rank chevrons over veteran, elite and heroic units (one, two, three), everybody's.
-	const float Scale = FMath::Clamp(Canvas->SizeY / 1080.f, 0.75f, 2.f);
+	// (The original's icons and bars are so many pixels, on a screen of about 1024 x 768. Whole pixels of them, here too.)
+	return FMath::Max(1.f, FMath::RoundToFloat(Canvas->SizeY / 768.f));
+}
+
+bool AGenHUD::GetHealthRegion(AGenPlayerController* PC, UGenGameLogic* Logic, const FGenObject& O, FBox2D& Out) const
+{
+	// Object::getHealthBoxPosition ("max height above position + 10") and getHealthBoxDimensions ("just add the major and
+	// minor axes"), computeHealthRegion. The original sizes it in pixels over the zoom, which at the height it looks from is
+	// about a world unit a pixel: here it is that wide in the world, whatever the screen and however far the view is pulled back.
+	const FGenThingTemplate* T = O.GetTemplate();
+	const FVector3f P = Logic->GetRenderPosition(O);
+	// (The angry mob's nexus: over the middle of its mob, and "pos.z += 20;// dear God, I confess my kluge, and repent.")
+	const FVector3f& BoxOffset = O.GetHealthBoxOffset();
+	const float MobLift = T->IsKindOf(TEXT("MOB_NEXUS")) ? 20.f : 0.f;
+	const FVector BarWorld = GenCoords::ToUE(P.X + BoxOffset.X, P.Y + BoxOffset.Y, P.Z + BoxOffset.Z + T->GeometryHeight + 10.f + MobLift);
+	const float Size = FMath::Clamp(T->GeometryMajorRadius + (T->IsBox() ? T->GeometryMinorRadius : T->GeometryMajorRadius), 20.f, 150.f);
+	const FVector CameraRight = PC->PlayerCameraManager ? FRotationMatrix(PC->PlayerCameraManager->GetCameraRotation()).GetScaledAxis(EAxis::Y) : FVector::RightVector;
+	FVector2D Top, Side;
+	if (!PC->ProjectWorldLocationToScreen(BarWorld, Top) || !PC->ProjectWorldLocationToScreen(BarWorld + CameraRight * double(Size) * GenCoords::UnitsToCm, Side))
+	{
+		return false;
+	}
+	const float BarScale = GetIconScale();
+	const float W = FMath::Max(20.f * BarScale, float(FMath::Abs(Side.X - Top.X)));
+	const float H = 3.f * BarScale;
+	const FVector2D Min(FMath::RoundToFloat(float(Top.X) - W * 0.45f), FMath::RoundToFloat(float(Top.Y) - H * 0.5f));
+	Out = FBox2D(Min, Min + FVector2D(W, H));
+	return true;
+}
+
+namespace
+{
+	/** Where an animation is (Anim2D::tryNextFrame). Beyond the original: also the image after this one and how far
+	 *  on towards it - faded in over this one, it makes the few images of an icon move smoothly. */
+	struct FAnimAt
+	{
+		int32 Image = 0, Next = 0;
+		float Blend = 0.f;
+	};
+
+	/** With so many milliseconds to an image, and how far on it started. */
+	FAnimAt GetAnimAt(double NowFrames, int32 DelayMS, int32 NumImages, bool bPingPong, int32 Start)
+	{
+		const int32 FramesPerImage = FMath::Max(1, FMath::CeilToInt32(float(DelayMS) * float(GenLogic::GetLogicFPS()) / 1000.f)); // (parseDurationUnsignedShort)
+		const int32 Period = bPingPong ? 2 * NumImages - 2 : NumImages;
+		const double Steps = NowFrames / double(FramesPerImage);
+		const int32 Whole = int32(Steps);
+		auto ImageAt = [&](int32 Step)
+		{
+			Step = (Step + Start) % Period;
+			return Step < NumImages ? Step : Period - Step;
+		};
+		return FAnimAt{ ImageAt(Whole), ImageAt(Whole + 1), float(Steps - double(Whole)) };
+	}
+}
+
+void AGenHUD::DrawStatusIcons(AGenPlayerController* PC, UGenGameLogic* Logic)
+{
+	const float Scale = GetIconScale();
+	// (The user, 2026-11-02: the original's sizes are too big here. Sized by the screen, about 40 and 27 pixels on 1440 lines.)
+	const float AnimScale = float(Canvas->SizeY) / 1440.f;
+	constexpr float WrenchSize = 0.7f, CrossSize = 0.85f;
+	const double Now = Logic->GetRenderFrameTime();
+	const uint32 Frame = Logic->GetFrame();
+	const uint32 HealingDisplayFrames = uint32(GenLogic::GetLogicFPS()) * 3; // HEALING_ICON_DISPLAY_TIME
+	const FGenCommandData& Images = FGenCommandData::Get();
+	// An image, its top left corner given by how far along the bar and how far over it, in shares of its size.
+	auto PlaceImage = [&](const FString& Name, float X, float Y, float ShareX, float ShareY, float ImageScale, FBox2D& OutBox)
+	{
+		const FGenMappedImage* Image = Images.FindImage(Name);
+		if (!Image)
+		{
+			return false;
+		}
+		const FVector2D Size(Image->Size.X * ImageScale, Image->Size.Y * ImageScale);
+		const FVector2D Min(X - Size.X * ShareX, Y - Size.Y * ShareY);
+		OutBox = FBox2D(Min, Min + Size);
+		return true;
+	};
+	auto DrawImage = [&](const FString& Name, float X, float Y, float ShareX, float ShareY, float ImageScale)
+	{
+		FBox2D Box;
+		if (PlaceImage(Name, X, Y, ShareX, ShareY, ImageScale, Box))
+		{
+			DrawMappedImage(Name, Box);
+		}
+	};
+	// One of an animation's images, and the next one fading in over it.
+	auto DrawAnim = [&](const TCHAR* Base, int32 First, const FAnimAt& At, float X, float Y, float ShareX, float ShareY, float ImageScale)
+	{
+		const FString Name = FString::Printf(TEXT("%s%03d"), Base, First + At.Image);
+		FBox2D Box;
+		if (PlaceImage(Name, X, Y, ShareX, ShareY, ImageScale, Box))
+		{
+			DrawMappedImage(Name, Box);
+			if (At.Next != At.Image)
+			{
+				DrawMappedImage(FString::Printf(TEXT("%s%03d"), Base, First + At.Next), Box, FLinearColor(1.f, 1.f, 1.f, At.Blend));
+			}
+		}
+	};
 	for (FGenObjectID Id : Logic->GetObjectIDs())
 	{
 		const FGenObject* O = Logic->FindObject(Id);
-		if (!O || O->GetVeterancyLevel() <= 0 || O->IsDead() || O->IsHidden() || O->IsProjectile()
+		if (!O || O->IsDead() || O->IsHidden() || O->IsProjectile() || O->GetTemplate()->IsKindOf(TEXT("IGNORED_IN_GUI")))
+		{
+			continue;
+		}
+		const FGenThingTemplate* T = O->GetTemplate();
+		// drawHealing: "see if healing has been done to us recently", "because so many things init health early in game".
+		const bool bHealing = Frame > HealingDisplayFrames && Frame - O->GetLastHealingFrame() <= HealingDisplayFrames
+			&& O->GetHealth() != O->GetMaxHealth() && !O->IsBeingSold() && !T->IsKindOf(TEXT("NO_HEAL_ICON"));
+		const bool bEnthusiastic = O->HasBonusCondition(TEXT("ENTHUSIASTIC"));
+		const bool bDisabled = O->ShowsDisabledIcon();
+		const int32 Rank = O->GetVeterancyLevel();
+		if ((!bHealing && !bEnthusiastic && !bDisabled && Rank <= 0)
 			|| (Logic->IsShroudOn() && O->GetLocalShroud() > EGenObjectShroud::PartialClear)
 			|| Logic->GetStealthLook(*O) == EGenStealthLook::Invisible)
 		{
 			continue; // (W3DView: no icons over what the fog of war covers, or over what is stealthed)
 		}
-		const FVector3f P = Logic->GetRenderPosition(*O);
-		FVector2D S;
-		if (!PC->ProjectWorldLocationToScreen(GenCoords::ToUE(P.X, P.Y, P.Z + FMath::Max(O->GetTemplate()->GeometryHeight, 8.f) + 4.f), S)
-			|| S.X < -20.0 || S.Y < -20.0 || S.X > Canvas->SizeX + 20.0 || S.Y > Canvas->SizeY + 20.0)
+		FBox2D Bar;
+		if (!GetHealthRegion(PC, Logic, *O, Bar) || Bar.Max.X < -64.0 || Bar.Max.Y < -64.0 || Bar.Min.X > Canvas->SizeX + 64.0 || Bar.Min.Y > Canvas->SizeY + 64.0)
 		{
 			continue;
 		}
-		const FLinearColor Color = O->GetVeterancyLevel() >= 3 ? FLinearColor(1.f, 0.35f, 0.2f) : FLinearColor(1.f, 0.85f, 0.2f);
-		const float W = 5.f * Scale, H = 3.f * Scale;
-		const float X = float(S.X) + 14.f * Scale, Y = float(S.Y) - 2.f * Scale;
-		for (int32 i = 0; i < O->GetVeterancyLevel(); ++i)
+		const float Left = float(Bar.Min.X), Top = float(Bar.Min.Y), Bottom = float(Bar.Max.Y), BarWidth = float(Bar.GetSize().X);
+		const int32 RandomStart = int32(Id * 2654435761u >> 16); // ("RandomizeStartFrame", of a thing that is drawn anew every frame)
+		if (bHealing)
 		{
-			const float CY = Y - i * (H + 1.5f * Scale);
-			DrawLine(X - W, CY + H, X, CY, FLinearColor::Black, 3.f * Scale);
-			DrawLine(X, CY, X + W, CY + H, FLinearColor::Black, 3.f * Scale);
-			DrawLine(X - W, CY + H, X, CY, Color, 1.5f * Scale);
-			DrawLine(X, CY, X + W, CY + H, Color, 1.5f * Scale);
+			// Standing on the bar, three quarters along. A wrench for what is mended; for the rest, a red cross.
+			if (T->IsKindOf(TEXT("STRUCTURE")) || T->IsKindOf(TEXT("VEHICLE")))
+			{
+				DrawAnim(TEXT("SCPWrench"), 0, GetAnimAt(Now, 60, 10, true, RandomStart), Left + BarWidth * 0.75f, Top, 0.5f, 1.f, AnimScale * WrenchSize);
+			}
+			else
+			{
+				DrawAnim(TEXT("SCPCross"), 0, GetAnimAt(Now, 30, 16, false, RandomStart), Left + BarWidth * 0.75f, Top, 0.5f, 1.f, AnimScale * CrossSize);
+			}
+		}
+		if (bEnthusiastic)
+		{
+			// drawEnthusiastic: under the bar, a quarter along; "Subliminal" for what has the gold border.
+			const float ImageScale = T->IsKindOf(TEXT("STRUCTURE")) || T->IsKindOf(TEXT("HUGE_VEHICLE")) ? 1.f : (T->IsKindOf(TEXT("VEHICLE")) ? 0.75f : 0.5f);
+			DrawAnim(O->HasBonusCondition(TEXT("SUBLIMINAL")) ? TEXT("SCPCrossB") : TEXT("SCPCross"), 3, GetAnimAt(Now, 100, 9, true, RandomStart),
+				Left + BarWidth * 0.25f, Bottom, 0.5f, -0.25f, AnimScale * CrossSize * ImageScale);
+		}
+		if (bDisabled)
+		{
+			// drawDisabled: the lightning, over the left end of the bar.
+			DrawAnim(TEXT("SCPLightning"), 0, GetAnimAt(Now, 66, 16, false, 0), Left, Bottom - float(Bar.GetSize().Y), 0.f, 1.f, AnimScale * CrossSize);
+		}
+		if (Rank > 0)
+		{
+			// drawVeterancy: off the right of the health box ("healthBoxWidth * scale * 0.5f", 1.3 over the zoom), everybody's.
+			const float CenterX = Left + BarWidth * 0.45f, CenterY = (Top + Bottom) * 0.5f;
+			DrawImage(FString::Printf(TEXT("SCVeter%d"), FMath::Min(Rank, 3)), CenterX + BarWidth * 0.65f + Scale, CenterY + Scale, 0.f, 0.f, Scale);
+		}
+	}
+}
+
+void AGenHUD::DrawPips(UGenGameLogic* Logic, const FGenObject& O, const FBox2D& HealthRegion)
+{
+	const FGenCommandData& Images = FGenCommandData::Get();
+	const float Scale = GetIconScale();
+	const float Left = float(HealthRegion.Min.X), Y = float(HealthRegion.GetCenter().Y);
+	// "Left justify with health bar min": a row of them, a pixel apart, from where the bar is down.
+	auto DrawRow = [&](int32 NumTotal, int32 NumFull, const TCHAR* Full, const TCHAR* Empty, float FullY, const FLinearColor& FirstColor, const FLinearColor& OtherColor, int32 NumFirst)
+	{
+		const FGenMappedImage* Image = Images.FindImage(Empty);
+		if (!Image)
+		{
+			return;
+		}
+		const FVector2D Size(Image->Size.X * Scale, Image->Size.Y * Scale);
+		for (int32 i = 0; i < NumTotal; ++i)
+		{
+			const FVector2D Min(Left + i * (Size.X + Scale), i < NumFull ? FullY : Y + Scale);
+			DrawMappedImage(i < NumFull ? Full : Empty, FBox2D(Min, Min + Size), i < NumFull ? (i < NumFirst ? FirstColor : OtherColor) : FLinearColor::White);
+		}
+	};
+	// (WeaponSet::findAmmoPipShowingWeapon)
+	for (int32 s = 0; s < 3; ++s)
+	{
+		const FGenWeaponInstance& WI = O.GetWeapon(s);
+		if (WI.Template && WI.Template->bShowsAmmoPips)
+		{
+			DrawRow(WI.Template->ClipSize, WI.AmmoInClip, TEXT("SCPAmmoFull"), TEXT("SCPAmmoEmpty"), Y + Scale, FLinearColor::White, FLinearColor::White, 0);
+			break;
+		}
+	}
+	if (O.GetContain() && Logic->ShowsContainPips(O))
+	{
+		// How full a transport, a garrisoned building or the tunnel network is: green for infantry, blue for the rest. "If empty, don't show nothin'."
+		const int32 NumFull = Logic->GetContainCount(O);
+		if (NumFull > 0)
+		{
+			int32 NumInfantry = 0;
+			for (FGenObjectID Rider : Logic->GetRiders(O))
+			{
+				const FGenObject* R = Logic->FindObject(Rider);
+				NumInfantry += R && R->IsKindOf(TEXT("INFANTRY")) ? 1 : 0;
+			}
+			DrawRow(Logic->GetContainMax(O), NumFull, TEXT("SCPPipFull"), TEXT("SCPPipEmpty"), Y, FLinearColor(0.f, 1.f, 0.f), FLinearColor(0.f, 0.f, 1.f), NumInfantry);
+		}
+	}
+}
+
+void AGenHUD::DrawBombIcons(AGenPlayerController* PC, UGenGameLogic* Logic)
+{
+	// Drawable::drawBombed. A charge has no model ("No drawable because it's invisible"), and is stealthed from the enemy:
+	// this is what shows it - the BombRemote animation over where it sits, and on a timed one BombTimed counting down on
+	// top of that. (A bar's worth of the health box, 20 wide at the least, on an 800 x 600 screen.)
+	const float ScreenScale = Canvas->SizeY / 600.f;
+	const float Size = 13.f * ScreenScale;
+	const double FramesPerSecond = double(GenLogic::GetLogicFPS());
+	const double Now = Logic->GetRenderFrameTime();
+	for (FGenObjectID Id : Logic->GetObjectIDs())
+	{
+		const FGenObject* O = Logic->FindObject(Id);
+		if (!O || !O->GetTemplate()->StickyBomb.bValid || O->IsDead() || O->GetStickyTarget() == GenInvalidObjectID
+			|| (Logic->IsShroudOn() && O->GetLocalShroud() > EGenObjectShroud::PartialClear)
+			|| Logic->GetStealthLook(*O) == EGenStealthLook::Invisible)
+		{
+			continue;
+		}
+		const FVector3f P = Logic->GetRenderPosition(*O);
+		FVector2D S;
+		if (!PC->ProjectWorldLocationToScreen(GenCoords::ToUE(P.X, P.Y, P.Z + O->GetTemplate()->GetMaxHeightAbovePosition() + 10.f), S))
+		{
+			continue;
+		}
+		const FVector2D Min(S.X - Size * 0.5f, S.Y + 5.f * ScreenScale); // BOMB_ICON_EXTRA_OFFSET
+		const FBox2D R(Min, Min + FVector2D(Size, Size));
+		DrawMappedImage(int32(Now / FramesPerSecond) % 2 == 0 ? TEXT("SCPClock000") : TEXT("SCPClock001"), R);
+		if (const uint32 Die = O->GetLifetimeDieFrame())
+		{
+			// ("this anim goes from N seconds down to zero": SCPClock043 is 20 seconds, SCPClock063 none.)
+			const int32 SecondsLeft = FMath::Clamp(FMath::CeilToInt32((double(Die) - Now) / FramesPerSecond), 0, 20);
+			DrawMappedImage(FString::Printf(TEXT("SCPClock%03d"), 63 - SecondsLeft), R);
 		}
 	}
 }
@@ -485,7 +702,7 @@ void AGenHUD::DrawGameOver(UGenGameLogic* Logic)
 {
 	// The game is decided: say so, large, in the middle of the screen (the original goes to the score screen).
 	const bool bLost = Logic->IsPlayerDefeated(Logic->GetLocalPlayer());
-	if (!Logic->IsGameOver() && !bLost)
+	if (Logic->IsGameOver() ? !Logic->IsGameOverAnnounced() : !bLost)
 	{
 		return;
 	}
@@ -561,7 +778,8 @@ void AGenHUD::DrawSuperweaponTimers(UGenGameLogic* Logic)
 		TArray<FEntry> Entries;
 		for (const FGenObject* O : Logic->GetObjectsOf(P.Index))
 		{
-			if (!O || O->IsDead() || O->IsUnderConstruction() || !O->IsKindOf(TEXT("STRUCTURE")))
+			if (!O || O->IsDead() || O->IsUnderConstruction() || !O->IsKindOf(TEXT("STRUCTURE"))
+				|| (Logic->GetMapScripts() && Logic->GetMapScripts()->IsPowerDisplayHidden(O->GetID())))
 			{
 				continue;
 			}
@@ -624,6 +842,25 @@ void AGenHUD::DrawSuperweaponTimers(UGenGameLogic* Logic)
 			DrawText(Time, FLinearColor::Black, Column + 1.f, Y + 1.f, nullptr, TextScale);
 			DrawText(Time, Color, Column, Y, nullptr, TextScale);
 			Y += FMath::Max(H, 12.f);
+		}
+	}
+	// InGameUI::drawNamedTimers (InGameUI.ini: NamedTimerCountdownPosition X 0.90 Y 0.666): what a script shows.
+	if (const FGenMapScripts* Scripts = Logic->GetMapScripts(); Scripts && Scripts->AreNamedTimersShown())
+	{
+		float TimerY = Canvas->SizeY * 0.666f;
+		for (const TPair<FString, FString>& Timer : Scripts->GetNamedTimers())
+		{
+			const int32 Secs = FMath::Max(0, Scripts->GetCounterValue(Timer.Key)) / GenLogic::GetLogicFPS();
+			const FString Name = CD.GetText(Timer.Value) + TEXT(" ");
+			// (A counter is a number: isCountdown is what makes it a time.)
+			const FString Time = Scripts->IsNamedCounter(Timer.Key) ? FString::FromInt(Scripts->GetCounterValue(Timer.Key)) : FString::Printf(TEXT("%d:%02d"), Secs / 60, Secs % 60);
+			float W = 0.f, H = 0.f;
+			GetTextSize(Name, W, H, nullptr, TextScale);
+			DrawText(Name, FLinearColor::Black, Column - W + 1.f, TimerY + 1.f, nullptr, TextScale);
+			DrawText(Name, FLinearColor::White, Column - W, TimerY, nullptr, TextScale);
+			DrawText(Time, FLinearColor::Black, Column + 1.f, TimerY + 1.f, nullptr, TextScale);
+			DrawText(Time, FLinearColor::White, Column, TimerY, nullptr, TextScale);
+			TimerY += FMath::Max(H, 12.f);
 		}
 	}
 	for (auto It = SuperweaponEvaPlayed.CreateIterator(); It; ++It)
@@ -701,7 +938,171 @@ bool AGenHUD::DrawMappedImage(const FString& Name, const FBox2D& R, const FLinea
 		return false;
 	}
 	const FVector2D Size = R.GetSize();
-	DrawTexture(Tex, R.Min.X, R.Min.Y, Size.X, Size.Y, Img->UV0.X, Img->UV0.Y, Img->UV1.X - Img->UV0.X, Img->UV1.Y - Img->UV0.Y, Tint);
+	DrawTexture(Tex, FMath::RoundToFloat(R.Min.X), FMath::RoundToFloat(R.Min.Y), FMath::RoundToFloat(Size.X), FMath::RoundToFloat(Size.Y), Img->UV0.X, Img->UV0.Y, Img->UV1.X - Img->UV0.X, Img->UV1.Y - Img->UV0.Y, Tint);
+	return true;
+}
+
+bool AGenHUD::DrawCameo(const FString& Name, const FBox2D& R, const FLinearColor& Tint, bool bGrey)
+{
+	// W3DGadgetPushButtonImageDraw: "'grayscale' disabled buttons using original color artwork".
+	UTexture2D* Grey = bGrey ? GetGreyCameo(Name) : nullptr;
+	if (Grey)
+	{
+		const FVector2D Size = R.GetSize();
+		DrawTexture(Grey, FMath::RoundToFloat(R.Min.X), FMath::RoundToFloat(R.Min.Y), FMath::RoundToFloat(Size.X), FMath::RoundToFloat(Size.Y), 0.f, 0.f, 1.f, 1.f);
+	}
+	else if (!DrawMappedImage(Name, R, Tint))
+	{
+		return false;
+	}
+	const int32 Corner = BarNow && BarNow->Style ? FMath::RoundToInt32(BarNow->Style->GetCameoCorner() * BarNow->Scale) : 0;
+	if (Corner > 0)
+	{
+		DrawBarPart(EGenHudPart::CellCorners, Corner, R);
+	}
+	return true;
+}
+
+UTexture2D* AGenHUD::GetGreyCameo(const FString& Name)
+{
+	if (const TObjectPtr<UTexture2D>* Found = GreyCameos.Find(Name))
+	{
+		return *Found;
+	}
+	if (GreyCameoFrame != GFrameCounter)
+	{
+		GreyCameoFrame = GFrameCounter;
+		GreyCameoSpent = 0.0;
+	}
+	if (GreyCameoSpent > 0.002)
+	{
+		return nullptr;
+	}
+	const double Start = FPlatformTime::Seconds();
+	UTexture2D* Tex = nullptr;
+	const FGenMappedImage* Img = FGenCommandData::Get().FindImage(Name);
+	const FGenImage* Sheet = Img ? GenTextureLoader::LoadGameImage(Img->Texture) : nullptr;
+	if (Sheet)
+	{
+		const int32 X0 = FMath::RoundToInt32(Img->UV0.X * Sheet->Width), Y0 = FMath::RoundToInt32(Img->UV0.Y * Sheet->Height);
+		const int32 X1 = FMath::RoundToInt32(Img->UV1.X * Sheet->Width), Y1 = FMath::RoundToInt32(Img->UV1.Y * Sheet->Height);
+		FGenImage Pixels;
+		Pixels.Width = X1 - X0;
+		Pixels.Height = Y1 - Y0;
+		if (Pixels.Width > 0 && Pixels.Height > 0 && X0 >= 0 && Y0 >= 0 && X1 <= Sheet->Width && Y1 <= Sheet->Height)
+		{
+			Pixels.Pixels.SetNumUninitialized(Pixels.Width * Pixels.Height);
+			for (int32 Y = 0; Y < Pixels.Height; ++Y)
+			{
+				for (int32 X = 0; X < Pixels.Width; ++X)
+				{
+					// (A little darker than the original's: it lies on black glass, and is not to be what is looked at.)
+					const FColor& C = Sheet->At(X0 + X, Y0 + Y);
+					const uint8 V = uint8(FMath::Clamp((C.R * 0.3f + C.G * 0.59f + C.B * 0.11f) * 0.62f, 0.f, 255.f));
+					Pixels.At(X, Y) = FColor(V, V, V, C.A);
+				}
+			}
+			Tex = GenTextureLoader::CreateFromImage(Pixels, Name, true, false);
+		}
+	}
+	GreyCameos.Add(Name, Tex);
+	GreyCameoSpent += FPlatformTime::Seconds() - Start;
+	return Tex;
+}
+
+UTexture2D* AGenHUD::GetBarPart(EGenHudPart Part, int32 Variant, const FIntPoint& Size)
+{
+	if (!BarNow || !BarNow->Style || !BarNow->Shape || Size.X <= 0 || Size.Y <= 0)
+	{
+		return nullptr;
+	}
+	const uint64 Key = (uint64(Part) << 56) | (uint64(uint32(Variant) & 0xFFFF) << 40) | (uint64(uint32(Size.X) & 0xFFFFF) << 20) | uint64(uint32(Size.Y) & 0xFFFFF);
+	if (UTexture2D** Found = BarParts.Find(Key))
+	{
+		return *Found;
+	}
+	FGenImage Pixels;
+	UTexture2D* Tex = BarNow->Style->BuildPart(*BarNow->Shape, Part, Variant, Size.X, Size.Y, BarNow->Scale, Pixels) ? GenTextureLoader::CreateFromImage(Pixels, TEXT("GenBarPart"), true, false) : nullptr;
+	if (Tex)
+	{
+		BarPartTextures.Add(Tex);
+	}
+	BarParts.Add(Key, Tex);
+	return Tex;
+}
+
+bool AGenHUD::DrawBarPart(EGenHudPart Part, int32 Variant, const FBox2D& R, const FLinearColor& Tint)
+{
+	if (!R.bIsValid)
+	{
+		return false;
+	}
+	const FIntPoint Pixels(FMath::RoundToInt32(R.GetSize().X), FMath::RoundToInt32(R.GetSize().Y));
+	UTexture2D* Tex = GetBarPart(Part, Variant, Pixels);
+	if (!Tex)
+	{
+		return false;
+	}
+	DrawTexture(Tex, FMath::RoundToFloat(R.Min.X), FMath::RoundToFloat(R.Min.Y), Pixels.X, Pixels.Y, 0.f, 0.f, 1.f, 1.f, Tint);
+	return true;
+}
+
+void AGenHUD::DrawCapsule(UTexture2D* Texture, const FBox2D& Whole, double Done, bool bUpwards)
+{
+	const float X = FMath::RoundToFloat(Whole.Min.X), Y = FMath::RoundToFloat(Whole.Min.Y);
+	const float W = FMath::RoundToFloat(Whole.GetSize().X), H = FMath::RoundToFloat(Whole.GetSize().Y);
+	const float Length = bUpwards ? H : W, Cap = (bUpwards ? W : H) * 0.5f;
+	const float Fill = FMath::Clamp(FMath::RoundToFloat(float(Done)), 0.f, Length);
+	if (Fill <= 0.f)
+	{
+		return;
+	}
+	// (The stretch from the start, then the far end's cap brought back to where it has got to.)
+	const float Body = FMath::Max(Fill - Cap, 0.f), Head = Fill - Body;
+	if (bUpwards)
+	{
+		DrawTexture(Texture, X, Y + H - Body, W, Body, 0.f, (H - Body) / H, 1.f, Body / H);
+		DrawTexture(Texture, X, Y + H - Fill, W, Head, 0.f, 0.f, 1.f, Head / H);
+	}
+	else
+	{
+		DrawTexture(Texture, X, Y, Body, H, 0.f, 0.f, Body / W, 1.f);
+		DrawTexture(Texture, X + Body, Y, Head, H, (W - Head) / W, 0.f, Head / W, 1.f);
+	}
+}
+
+bool AGenHUD::DrawBarPods(const FGenControlBar& Bar)
+{
+	if (!Bar.Shape || !Bar.Style)
+	{
+		return false;
+	}
+	if (BarPodsStyle != Bar.Style || BarPodsShape != Bar.Shape || BarPodsScale != Bar.Scale)
+	{
+		// (Another style, side, map shape or screen: nothing made so far fits it.)
+		const double Start = FPlatformTime::Seconds();
+		BarParts.Reset();
+		BarPartTextures.Reset();
+		BarPodsStyle = Bar.Style;
+		BarPodsShape = Bar.Shape;
+		BarPodsScale = Bar.Scale;
+		BarPods.Reset();
+		for (int32 Pod = 0; Pod < BarPodCount; ++Pod)
+		{
+			FGenImage Image;
+			BarPods.Add(Bar.Style->BuildPod(*Bar.Shape, Pod, Bar.Scale, Image) ? GenTextureLoader::CreateFromImage(Image, TEXT("GenBarPod"), true, false) : nullptr);
+		}
+		UE_LOG(LogGenerals, Log, TEXT("Control bar sections: style %s, side %d, %.3f pixels to the unit, made in %.0f ms"), *Bar.Style->Id, int32(Bar.Shape->Side), Bar.Scale, (FPlatformTime::Seconds() - Start) * 1000.0);
+	}
+	const float Pad = FMath::RoundToFloat(GenBarLayout::ShadowPad * Bar.Scale);
+	for (int32 Pod = 0; Pod < BarPods.Num(); ++Pod)
+	{
+		if (!BarPods[Pod])
+		{
+			return false;
+		}
+		DrawTexture(BarPods[Pod], float(Bar.PodOrigin[Pod].X) - Pad, float(Bar.PodOrigin[Pod].Y) - Pad, BarPods[Pod]->GetSizeX(), BarPods[Pod]->GetSizeY(), 0.f, 0.f, 1.f, 1.f);
+	}
 	return true;
 }
 
@@ -753,18 +1154,14 @@ void AGenHUD::DrawRemainingClock(const FBox2D& R, float Done, const FLinearColor
 
 void AGenHUD::DrawBarText(const FString& Text, const FBox2D& R, const FLinearColor& Color, float PixelSize, bool bCenter)
 {
-	// (The engine's font, scaled to the window's font size; its line is about 16 pixels at scale 1.)
 	if (Text.IsEmpty() || !R.bIsValid)
 	{
 		return;
 	}
-	const float TextScale = FMath::Max(PixelSize, 6.f) / 16.f;
-	float W = 0.f, H = 0.f;
-	GetTextSize(Text, W, H, nullptr, TextScale);
-	const float X = bCenter ? float(R.GetCenter().X) - W * 0.5f : float(R.Min.X);
-	const float Y = float(R.GetCenter().Y) - H * 0.5f;
-	DrawText(Text, FLinearColor(0.f, 0.f, 0.f, Color.A), X + 1.f, Y + 1.f, nullptr, TextScale);
-	DrawText(Text, Color, X, Y, nullptr, TextScale);
+	const float Pixels = FMath::Max(PixelSize, 6.f);
+	const FVector2D Size = BarTextSize(Text, Pixels, false);
+	const float X = bCenter ? float(R.GetCenter().X - Size.X * 0.5) : float(R.Min.X);
+	DrawBarLine(Text, X, float(R.GetCenter().Y - Size.Y * 0.5), Color, Pixels, false);
 }
 
 void AGenHUD::DrawBarButton(const FGenBarButton& B, bool bHovered, float Scale, UGenGameLogic* Logic, const FGenControlBarScheme* Scheme)
@@ -778,10 +1175,12 @@ void AGenHUD::DrawBarButton(const FGenBarButton& B, bool bHovered, float Scale, 
 	{
 		Image = B.Button->ButtonImage;
 	}
-	// (What is already researched or acquired stays bright: it is done, not unavailable.)
-	const FLinearColor Tint = B.bEnabled ? (bHovered ? FLinearColor(1.25f, 1.25f, 1.25f) : FLinearColor::White)
-		: (B.bOwned ? FLinearColor(0.85f, 0.95f, 0.85f) : FLinearColor(0.35f, 0.35f, 0.35f));
-	if (!DrawMappedImage(Image, B.Rect, Tint) && B.Button)
+	// (What is already researched or acquired stays bright: it is done, not unavailable. "If the button isn't 'ready' ...
+	// we want to show the button in color with just the clock overlay".)
+	const bool bCharging = !B.bEnabled && B.Recharge > 0.f;
+	const FLinearColor Tint = B.bEnabled ? (bHovered ? FLinearColor(1.12f, 1.12f, 1.12f) : FLinearColor::White)
+		: (B.bOwned ? FLinearColor(0.85f, 0.95f, 0.85f) : bCharging ? FLinearColor::White : FLinearColor(0.35f, 0.35f, 0.35f));
+	if (!DrawCameo(Image, B.Rect, Tint, !B.bEnabled && !B.bOwned && !bCharging) && B.Button)
 	{
 		// No icon: fall back to the button's name.
 		DrawRect(FLinearColor(0.02f, 0.03f, 0.05f, 0.9f), Min.X, Min.Y, Size.X, Size.Y);
@@ -809,43 +1208,44 @@ void AGenHUD::DrawBarButton(const FGenBarButton& B, bool bHovered, float Scale, 
 	{
 		Edge = FLinearColor(1.f, 0.9f, 0.4f);
 	}
+	// (On whole pixels, as the picture is.)
+	const float PX = FMath::RoundToFloat(float(Min.X)), PY = FMath::RoundToFloat(float(Min.Y));
+	const float PW = FMath::RoundToFloat(float(Size.X)), PH = FMath::RoundToFloat(float(Size.Y));
+	const int32 Corner = BarNow && BarNow->Style ? FMath::RoundToInt32(BarNow->Style->GetCameoCorner() * BarNow->Scale) : 0;
 	if (Edge.A > 0.f)
 	{
-		const float T = FMath::Max(1.f, Scale);
-		DrawLine(Min.X, Min.Y, Min.X + Size.X, Min.Y, Edge, T);
-		DrawLine(Min.X + Size.X, Min.Y, Min.X + Size.X, Min.Y + Size.Y, Edge, T);
-		DrawLine(Min.X + Size.X, Min.Y + Size.Y, Min.X, Min.Y + Size.Y, Edge, T);
-		DrawLine(Min.X, Min.Y + Size.Y, Min.X, Min.Y, Edge, T);
+		DrawBarPart(EGenHudPart::CellRing, Corner, B.Rect, FLinearColor(Edge.R, Edge.G, Edge.B, 0.85f));
 	}
 	if (B.Hotkey.IsValid())
 	{
 		// Its key (GenBarHotkeys.cpp), small in the top left corner on a dark tab - dimmer while it can't be used.
 		const FString Key = B.Hotkey.GetShortText();
-		const float TextScale = FMath::Max(0.45f, 0.72f * Scale);
-		float TW = 0.f, TH = 0.f;
-		GetTextSize(Key, TW, TH, nullptr, TextScale);
+		const float Pixels = FMath::Max(9.f, 13.f * Scale);
+		const FVector2D KeySize = BarTextSize(Key, Pixels, true);
 		const float Pad = FMath::Max(1.f, 2.f * Scale);
-		const float X = float(Min.X) + 1.f, Y = float(Min.Y) + 1.f;
-		DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.62f), X, Y, TW + Pad * 2.f, TH);
-		DrawText(Key, B.bEnabled ? FLinearColor(1.f, 0.93f, 0.62f) : FLinearColor(0.62f, 0.6f, 0.52f), X + Pad, Y, nullptr, TextScale);
+		const float Inset = FMath::Max(1.f, FMath::RoundToFloat(Scale * 1.5f));
+		const FVector2D TabMin(PX + Inset, PY + Inset);
+		const FBox2D Tab(TabMin, TabMin + FVector2D(FMath::Max(KeySize.X + Pad * 2.0, KeySize.Y), KeySize.Y));
+		DrawBarPart(EGenHudPart::CellFill, FMath::RoundToInt32(KeySize.Y * 0.28), Tab, FLinearColor(0.004f, 0.005f, 0.007f, 0.66f));
+		DrawBarLine(Key, float(Tab.GetCenter().X - KeySize.X * 0.5), PY + Inset, FLinearColor(1.f, 1.f, 1.f, B.bEnabled ? 0.95f : 0.5f), Pixels, true);
 	}
 }
 
 void AGenHUD::DrawControlBar(AGenPlayerController* PC, UGenGameLogic* Logic)
 {
 	const FGenControlBar& Bar = PC->GetControlBar();
+	BarNow = &Bar;
 	const FGenControlBarScheme* Scheme = Bar.Scheme;
-	const FGenCommandData& CD = FGenCommandData::Get();
 	const float UIScale = Bar.Scale * (600.f / 1080.f); // (the old interface's size: one at 1080 lines)
 	const FVector2D Mouse = PC->GetMousePos();
 	const FGenBarButton* Hovered = Bar.HitTest(Mouse);
 	const int32 Local = Logic->GetLocalPlayer();
 	const TArray<FGenPlayer>& Players = Logic->GetPlayers();
 
-	// The special power shortcut tray, down the right edge.
-	for (const FBox2D& Back : Bar.ShortcutTrays)
+	// The special power shortcuts' rail, on the screen's right edge.
+	if (Bar.ShortcutRail.bIsValid)
 	{
-		DrawMappedImage(Bar.ShortcutTrayImage, Back);
+		DrawBarPart(EGenHudPart::ShortcutRail, Bar.Shortcuts.Num(), Bar.ShortcutRail.ExpandBy(double(FMath::RoundToFloat(GenBarLayout::ShadowPad * Bar.Scale))));
 	}
 	for (const FGenBarButton& B : Bar.Shortcuts)
 	{
@@ -856,30 +1256,44 @@ void AGenHUD::DrawControlBar(AGenPlayerController* PC, UGenGameLogic* Logic)
 		return;
 	}
 
-	// ControlBarScheme::drawBackground: the frame's layers 5..3 under the windows.
-	auto DrawLayers = [this, &Bar, Scheme](int32 From, int32 To)
+	if (!DrawBarPods(Bar))
 	{
-		for (int32 Layer = From; Layer >= To; --Layer)
+		return;
+	}
+	DrawRadar(PC, Logic); // (LeftHUD, in its section's glass)
+
+	// ControlBar::updateRadarAttackGlow: for 150 frames after the alarm the light goes on and off every 15 (it is the
+	// window's disabled image that is lit, and the alarm disables it).
+	{
+		const uint32 FPS = uint32(GenLogic::GetLogicFPS());
+		const uint32 Since = Logic->GetFrame() - Logic->GetLastUnderAttackFrame();
+		const bool bLit = Logic->HasUnderAttackGlow() && Since < 150u * FPS / 30u && (Since / FMath::Max(15u * FPS / 30u, 1u)) % 2u == 0u;
+		const int32 Glow = FMath::RoundToInt32(8.f * Bar.Scale);
+		if (bLit)
 		{
-			for (const FGenControlBarImagePart& P : Scheme->ImageParts)
-			{
-				if (P.Layer == Layer)
-				{
-					DrawMappedImage(P.Image, Bar.ToScreen(FBox2D(P.Position, P.Position + P.Size)));
-				}
-			}
+			DrawBarPart(EGenHudPart::LampOn, Glow, Bar.LampRect.ExpandBy(double(Glow)));
 		}
-	};
-	DrawLayers(5, 3);
-	DrawRadar(PC, Logic); // (LeftHUD, over the frame's back)
+		else
+		{
+			DrawBarPart(EGenHudPart::LampOff, 0, Bar.LampRect);
+		}
+	}
 
 	// Money (MoneyDisplay) and power (W3DPowerDraw).
 	if (Players.IsValidIndex(Local))
 	{
-		FString Format = CD.GetText(TEXT("GUI:ControlBarMoneyDisplay"));
-		const FString Money = Format.Contains(TEXT("%d")) ? Format.Replace(TEXT("%d"), *FString::FromInt(Logic->GetMoney(Local))) : FString::Printf(TEXT("$ %d"), Logic->GetMoney(Local));
-		const FGenWndWindow* MoneyWnd = Bar.Wnd ? Bar.Wnd->Find(TEXT("MoneyDisplay")) : nullptr;
-		DrawBarText(Money, Bar.MoneyRect, MoneyWnd ? FLinearColor(MoneyWnd->TextColor) : FLinearColor(1.f, 0.9f, 0.3f), float(MoneyWnd ? FMath::Max(MoneyWnd->FontSize, 12) : 14) * Bar.Scale, true);
+		FString Amount = FString::FromInt(Logic->GetMoney(Local));
+		for (int32 i = Amount.Len() - 3; i > 0; i -= 3)
+		{
+			Amount.InsertAt(i, TEXT(','));
+		}
+		const float Pixels = 10.5f * Bar.Scale;
+		const FString Sign = TEXT("$");
+		const FVector2D SignSize = BarTextSize(Sign, Pixels, false), AmountSize = BarTextSize(Amount, Pixels, true);
+		const float Gap = 1.6f * Bar.Scale, Whole = float(SignSize.X + AmountSize.X) + Gap;
+		const float X = float(Bar.MoneyRect.GetCenter().X) - Whole * 0.5f, Y = float(Bar.MoneyRect.GetCenter().Y - AmountSize.Y * 0.5);
+		DrawBarLine(Sign, X, Y, FLinearColor(1.f, 1.f, 1.f, 0.45f), Pixels, false);
+		DrawBarLine(Amount, X + float(SignSize.X) + Gap, Y, FLinearColor(0.84f, 0.86f, 0.88f), Pixels, true);
 		DrawPowerBar(Bar, Logic);
 		DrawExpBar(Bar, Logic);
 	}
@@ -893,10 +1307,14 @@ void AGenHUD::DrawControlBar(AGenPlayerController* PC, UGenGameLogic* Logic)
 		}
 		if (Bar.Progress >= 0.f && Bar.ProgressRect.bIsValid)
 		{
-			// (GadgetProgressBar: the share done, filled from the left.)
-			const FVector2D Min = Bar.ProgressRect.Min, Size = Bar.ProgressRect.GetSize();
-			DrawRect(FLinearColor(0.02f, 0.03f, 0.05f, 0.85f), Min.X, Min.Y, Size.X, Size.Y);
-			DrawRect(FLinearColor(0.85f, 0.75f, 0.2f, 0.9f), Min.X + 1.0, Min.Y + 1.0, FMath::Max(0.0, (Size.X - 2.0) * double(Bar.Progress)), FMath::Max(0.0, Size.Y - 2.0));
+			// (GadgetProgressBar: the share done, filled from the left: a line of light under the text, as the power bar is.)
+			const double Line = FMath::RoundToDouble(5.0 * Bar.Scale);
+			const FBox2D Track(FVector2D(Bar.ProgressRect.Min.X, Bar.ProgressRect.Max.Y - Line), Bar.ProgressRect.Max);
+			DrawBarPart(EGenHudPart::CellFill, FMath::RoundToInt32(Line * 0.5), Track, FLinearColor(1.f, 1.f, 1.f, 0.07f));
+			if (UTexture2D* Capsule = GetBarPart(EGenHudPart::ExpFill, 0, FIntPoint(FMath::RoundToInt32(Track.GetSize().X), FMath::RoundToInt32(Line))))
+			{
+				DrawCapsule(Capsule, Track, Track.GetSize().X * double(Bar.Progress), false);
+			}
 		}
 		if (!Bar.Status.IsEmpty())
 		{
@@ -912,7 +1330,9 @@ void AGenHUD::DrawControlBar(AGenPlayerController* PC, UGenGameLogic* Logic)
 		{
 			if (!Bar.Queue.IsValidIndex(i))
 			{
-				DrawMappedImage(Scheme->QueueButtonImage, Bar.QueueSlots[i], FLinearColor(0.6f, 0.6f, 0.6f)); // (an empty cell)
+				// (An empty cell. The scheme's QueueButtonImage isn't in the game's data: a faint outline.)
+				const int32 Corner = Bar.Style ? FMath::RoundToInt32(Bar.Style->GetCameoCorner() * Bar.Scale) : 0;
+				DrawBarPart(EGenHudPart::CellRing, Corner, Bar.QueueSlots[i], FLinearColor(1.f, 1.f, 1.f, 0.07f));
 			}
 		}
 		for (const FGenBarButton& Q : Bar.Queue)
@@ -929,10 +1349,10 @@ void AGenHUD::DrawControlBar(AGenPlayerController* PC, UGenGameLogic* Logic)
 	}
 	else if (!Bar.Portrait.IsEmpty())
 	{
-		DrawMappedImage(Bar.Portrait, Bar.PortraitRect);
+		DrawCameo(Bar.Portrait, Bar.PortraitRect, FLinearColor::White);
 		for (const FGenBarButton& U : Bar.UnitUpgrades)
 		{
-			DrawMappedImage(U.Image, U.Rect, U.bOwned ? FLinearColor::White : FLinearColor(0.3f, 0.3f, 0.3f));
+			DrawCameo(U.Image, U.Rect, U.bOwned ? FLinearColor::White : FLinearColor(0.3f, 0.3f, 0.3f), !U.bOwned);
 		}
 	}
 	else if (!Bar.bVisible)
@@ -944,33 +1364,19 @@ void AGenHUD::DrawControlBar(AGenPlayerController* PC, UGenGameLogic* Logic)
 	const bool bFlash = FMath::Fmod(GetWorld()->GetRealTimeSeconds(), 1.0) < 0.5;
 	for (const FGenBarButton& B : Bar.SystemButtons)
 	{
-		const FGenControlBarButtonImages* Images = B.System == EGenBarSystem::Options ? &Scheme->Options
-			: B.System == EGenBarSystem::IdleWorker ? &Scheme->IdleWorker : B.System == EGenBarSystem::Beacon ? &Scheme->Beacon
-			: B.System == EGenBarSystem::Chat ? &Scheme->Buddy : B.System == EGenBarSystem::MinMax ? &Scheme->ToggleDown : nullptr;
-		FString Image = B.Image;
-		if (Images && B.bEnabled && &B == Hovered && !Images->Highlighted.IsEmpty())
-		{
-			Image = Images->Highlighted;
-		}
-		DrawMappedImage(Image, B.Rect);
+		const int32 State = !B.bEnabled ? HudKeyDisabled : &B == Hovered ? HudKeyHover : HudKeyNormal;
+		DrawBarPart(B.System == EGenBarSystem::Options ? EGenHudPart::OptionsKey : EGenHudPart::WorkerKey, State, B.Rect);
 	}
 	if (Bar.bHasGenerals && Players.IsValidIndex(Local))
 	{
-		const bool bPoints = Players[Local].SciencePurchasePoints > 0;
 		const bool bLit = Hovered == &Bar.GeneralsButton || Bar.bGeneralsOpen || (Bar.bGenStarFlash && bFlash);
-		if (!DrawMappedImage(bLit ? Scheme->General.Highlighted : Scheme->General.Enable, Bar.GeneralsButton.Rect))
-		{
-			DrawBarText(TEXT("General"), Bar.GeneralsButton.Rect, bPoints ? FLinearColor(1.f, 0.9f, 0.3f) : FLinearColor::White, 12.f * Bar.Scale, true);
-		}
+		DrawBarPart(EGenHudPart::GeneralKey, bLit ? HudKeyHover : HudKeyNormal, Bar.GeneralsButton.Rect);
 	}
 
-	// ControlBarScheme::drawForeground: layers 2..0 over everything.
-	DrawLayers(2, 0);
-
-	// (The promotions panel draws its own tooltips, on top of itself.)
+	// (The promotions panel draws its own tooltips, on top of itself. Tooltips keep their size whatever the bar's: one at 1080 lines.)
 	if (Hovered && !Hovered->bGeneralsToggle && Hovered->Science.IsEmpty() && Hovered->System == EGenBarSystem::None)
 	{
-		DrawTooltip(*Hovered, Mouse, UIScale, Logic);
+		DrawTooltip(*Hovered, Mouse, Canvas->SizeY / 1080.f, Logic);
 	}
 }
 
@@ -987,44 +1393,29 @@ void AGenHUD::DrawPowerBar(const FGenControlBar& Bar, UGenGameLogic* Logic)
 	Logic->GetEnergy(Logic->GetLocalPlayer(), Production, Consumption);
 	constexpr double Base = 7.0, Intervals = 3.0;
 	constexpr int32 YellowRange = 5;
-	const FString Center = (Consumption > Production - YellowRange && Consumption <= Production) ? TEXT("PowerPointY")
-		: Consumption > Production ? TEXT("PowerPointR") : TEXT("PowerPointG");
+	const EGenHudPart FillPart = (Consumption > Production - YellowRange && Consumption <= Production) ? EGenHudPart::PowerFillTight
+		: Consumption > Production ? EGenHudPart::PowerFillShort : EGenHudPart::PowerFillGood;
 	const FVector2D Size = R.GetSize();
 	auto Range = [&Size](double Value) { return Value > 0.0 ? FMath::Min(Size.X, FMath::LogX(Base, Value) * (Size.X / Intervals)) : 0.0; };
 	const double Fill = Range(double(Production));
-	const FGenMappedImage* Piece = FGenCommandData::Get().FindImage(Center);
-	if (Fill > 0.0 && Piece)
+	if (UTexture2D* Capsule = GetBarPart(FillPart, 0, FIntPoint(FMath::RoundToInt32(Size.X), FMath::RoundToInt32(Size.Y))))
 	{
-		// Tiled pieces of the image across, the last one cut off.
-		const double PieceW = FMath::Max(1.0, double(Piece->Size.X) * Bar.Scale);
-		for (double X = 0.0; X < Fill; X += PieceW)
+		// (A line of light, and a thin needle where the consumption is. "Log(1) == 0, but we need to show something for 1 power used.")
+		DrawCapsule(Capsule, R, Fill, false);
+		if (Fill > 0.0)
 		{
-			const double W = FMath::Min(PieceW, Fill - X);
-			const FBox2D Cell(R.Min + FVector2D(X, 0.0), R.Min + FVector2D(X + W, Size.Y));
-			UTexture2D* Tex = UGenAssetSubsystem::Get()->GetTexture(Piece->Texture);
-			if (Tex)
-			{
-				const float UW = (Piece->UV1.X - Piece->UV0.X) * float(W / PieceW);
-				DrawTexture(Tex, Cell.Min.X, Cell.Min.Y, W, Size.Y, Piece->UV0.X, Piece->UV0.Y, UW, Piece->UV1.Y - Piece->UV0.Y);
-			}
+			const double Needle = Range(Consumption == 1 ? 1.5 : double(Consumption));
+			const float NeedleW = FMath::Max(2.f, FMath::RoundToFloat(1.2f * Bar.Scale));
+			const float Over = 1.5f * Bar.Scale;
+			DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.6f), FMath::RoundToFloat(float(R.Min.X + Needle)) - NeedleW * 0.5f - 1.f, float(R.Min.Y) - Over, NeedleW + 2.f, float(Size.Y) + Over * 2.f);
+			DrawRect(FLinearColor(0.72f, 0.75f, 0.78f), FMath::RoundToFloat(float(R.Min.X + Needle)) - NeedleW * 0.5f, float(R.Min.Y) - Over, NeedleW, float(Size.Y) + Over * 2.f);
 		}
-	}
-	// ("Log(1) == 0, but we need to show something for 1 power used.")
-	const double Needle = Range(Consumption == 1 ? 1.5 : double(Consumption));
-	const FGenMappedImage* Slider = FGenCommandData::Get().FindImage(TEXT("PowerBarSlider"));
-	if (Slider && (Fill > 0.0 || Needle > 0.0))
-	{
-		const double SW = double(Slider->Size.X) * Bar.Scale, SH = double(Slider->Size.Y) * Bar.Scale;
-		double X0 = Needle >= Size.X ? R.Max.X - SW : R.Min.X + Needle - SW * 0.5;
-		X0 = FMath::Max(X0, R.Min.X);
-		DrawMappedImage(TEXT("PowerBarSlider"), FBox2D(FVector2D(X0, R.Max.Y - SH), FVector2D(X0 + SW, R.Max.Y)));
 	}
 }
 
 void AGenHUD::DrawExpBar(const FGenControlBar& Bar, UGenGameLogic* Logic)
 {
-	// W3DCommandBarGenExpDraw: the general's experience towards the next rank, filling GeneralsExp from the
-	// bottom (GenExpBarBottom1, GenExpBar1 pieces, GenExpBarTop1); ExpBarForeground's picture over it.
+	// W3DCommandBarGenExpDraw: the general's experience towards the next rank, filling GeneralsExp from the bottom.
 	const TArray<FGenPlayer>& Players = Logic->GetPlayers();
 	const int32 Local = Logic->GetLocalPlayer();
 	const TArray<FGenRank>& Ranks = FGenUpgradeData::Get().GetRanks();
@@ -1037,17 +1428,11 @@ void AGenHUD::DrawExpBar(const FGenControlBar& Bar, UGenGameLogic* Logic)
 		if (Progress > 0.f)
 		{
 			const FVector2D Size = R.GetSize();
-			const double Filled = Size.Y * Progress;
-			const FBox2D Fill(FVector2D(R.Min.X, R.Max.Y - Filled), R.Max);
-			if (!DrawMappedImage(TEXT("GenExpBar1"), Fill))
+			if (UTexture2D* Capsule = GetBarPart(EGenHudPart::ExpFill, 0, FIntPoint(FMath::RoundToInt32(Size.X), FMath::RoundToInt32(Size.Y))))
 			{
-				DrawRect(FLinearColor(0.95f, 0.75f, 0.2f), Fill.Min.X, Fill.Min.Y, Size.X, Filled);
+				DrawCapsule(Capsule, R, Size.Y * Progress, true);
 			}
 		}
-	}
-	if (Bar.Scheme)
-	{
-		DrawMappedImage(Bar.Scheme->ExpBarForegroundImage, Bar.ExpForegroundRect);
 	}
 }
 
@@ -1056,6 +1441,7 @@ void AGenHUD::DrawGenerals(AGenPlayerController* PC, UGenGameLogic* Logic)
 	// GeneralsExpPoints.wnd: the side's picture, its texts, the experience bar, the promotions to buy and the
 	// close button.
 	const FGenControlBar& Bar = PC->GetControlBar();
+	BarNow = &Bar;
 	const TArray<FGenPlayer>& Players = Logic->GetPlayers();
 	const int32 Local = Logic->GetLocalPlayer();
 	if (!Bar.bHasGenerals || !Bar.bGeneralsOpen || !Players.IsValidIndex(Local))
@@ -1099,7 +1485,7 @@ void AGenHUD::DrawGenerals(AGenPlayerController* PC, UGenGameLogic* Logic)
 	}
 	if (Hovered && !Hovered->Science.IsEmpty())
 	{
-		DrawTooltip(*Hovered, Mouse, UIScale, Logic);
+		DrawTooltip(*Hovered, Mouse, Canvas->SizeY / 1080.f, Logic);
 	}
 }
 
@@ -1188,27 +1574,39 @@ void AGenHUD::DrawTooltip(const FGenBarButton& B, const FVector2D& Mouse, float 
 		MaxLen = FMath::Max(MaxLen, Title.Len() + KeyText.Len() + 2);
 	}
 	const float LineH = 19.f * Scale;
-	const float TW = MaxLen * 8.2f * Scale + 16.f;
+	const float TitlePixels = 17.5f * Scale, LinePixels = 15.f * Scale;
+	float TextW = float(BarTextSize(KeyText.IsEmpty() ? Title : Title + TEXT("  ") + KeyText, TitlePixels, true).X);
+	for (const FString& L : Lines)
+	{
+		TextW = FMath::Max(TextW, float(BarTextSize(L, LinePixels, false).X));
+	}
+	const float TW = TextW + 16.f;
 	const float TH = 28.f * Scale + Lines.Num() * LineH;
 	const float TX = FMath::Clamp(float(Mouse.X) - TW * 0.5f, 4.f, FMath::Max(4.f, Canvas->SizeX - TW - 4.f));
-	// Above the button, or below it when there is no room.
-	float TY = float(B.Rect.Min.Y) - TH - 6.f;
+	// Above the button and the section it is on (not over the money and the power), or below it when there is no room.
+	float TipBottom = float(B.Rect.Min.Y);
+	for (int32 Pod = 0; BarNow && BarNow->Shape && Pod < BarPodCount; ++Pod)
+	{
+		if (BarNow->ToPod(Pod, FBox2D(FVector2D::ZeroVector, BarNow->Shape->PodSize[Pod])).IsInside(B.Rect.GetCenter()))
+		{
+			TipBottom = float(BarNow->PodOrigin[Pod].Y);
+		}
+	}
+	float TY = TipBottom - TH - 6.f;
 	if (TY < 4.f)
 	{
 		TY = float(B.Rect.Max.Y) + 6.f;
 	}
 	DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.9f), TX, TY, TW, TH);
-	DrawText(Title, FLinearColor(1.f, 0.95f, 0.6f), TX + 8.f, TY + 4.f, nullptr, 1.1f * Scale);
+	DrawBarLine(Title, TX + 8.f, TY + 4.f, FLinearColor(1.f, 0.95f, 0.6f), TitlePixels, true);
 	if (!KeyText.IsEmpty())
 	{
-		float TitleW = 0.f, TitleH = 0.f;
-		GetTextSize(Title + TEXT("  "), TitleW, TitleH, nullptr, 1.1f * Scale);
-		DrawText(KeyText, FLinearColor(0.62f, 0.78f, 1.f), TX + 8.f + TitleW, TY + 4.f, nullptr, 1.1f * Scale);
+		DrawBarLine(KeyText, TX + 8.f + float(BarTextSize(Title + TEXT("  "), TitlePixels, true).X), TY + 4.f, FLinearColor(0.62f, 0.78f, 1.f), TitlePixels, true);
 	}
 	for (int32 i = 0; i < Lines.Num(); ++i)
 	{
 		const FLinearColor Color = i < NumStatusLines ? (bWarn ? FLinearColor(1.f, 0.5f, 0.4f) : FLinearColor::White) : FLinearColor(0.75f, 0.8f, 0.85f);
-		DrawText(Lines[i], Color, TX + 8.f, TY + 4.f + 22.f * Scale + i * LineH, nullptr, 0.95f * Scale);
+		DrawBarLine(Lines[i], TX + 8.f, TY + 4.f + 22.f * Scale + i * LineH, Color, LinePixels, false);
 	}
 }
 
@@ -1225,7 +1623,15 @@ void AGenHUD::DrawRadar(AGenPlayerController* PC, UGenGameLogic* Logic)
 	const FBox2D Window = Bar.Radar;
 	const FVector2D WMin = Window.Min, WSize = Window.GetSize();
 	const float Scale = Bar.Scale * (600.f / 1080.f);
-	// (In LeftHUD: the bar's frame is round it.)
+	// (Its corners, when the style rounds them: over everything else on it.)
+	ON_SCOPE_EXIT
+	{
+		if (Bar.Shape && Bar.Shape->RadarCorner > 0.f)
+		{
+			DrawBarPart(EGenHudPart::CellCorners, FMath::RoundToInt32(Bar.Shape->RadarCorner * Bar.Scale), Window);
+		}
+	};
+	// (In LeftHUD: the glass of its section is round it.)
 	DrawRect(FLinearColor::Black, WMin.X, WMin.Y, WSize.X, WSize.Y);
 	auto DrawFrame = [this, &WMin, &WSize](const FLinearColor& Color)
 	{
@@ -1236,12 +1642,13 @@ void AGenHUD::DrawRadar(AGenPlayerController* PC, UGenGameLogic* Logic)
 	};
 
 	const int32 Local = Logic->GetLocalPlayer();
-	if (!Logic->HasRadar(Local))
+	const FGenMapScripts* Scripts = Logic->GetMapScripts();
+	if (!Logic->HasRadar(Local) && !(Scripts && Scripts->IsRadarForced()))
 	{
-		// "if( !player->hasRadar() && !TheRadar->isRadarForced() ) return": nothing to see without one.
-		const FString Text = TEXT("NO RADAR");
-		DrawText(Text, FLinearColor(0.35f, 0.4f, 0.45f), WMin.X + WSize.X * 0.5f - Text.Len() * 4.2f * Scale, WMin.Y + WSize.Y * 0.5f - 9.f * Scale, nullptr, 1.1f * Scale);
-		DrawFrame(FLinearColor(0.35f, 0.4f, 0.5f));
+		// "if( !player->hasRadar() && !TheRadar->isRadarForced() ) return": nothing to see without one. A mission
+		// can force the radar on with RADAR_FORCE_ENABLE.
+		DrawBarText(TEXT("NO RADAR"), Window, FLinearColor(0.35f, 0.4f, 0.45f), 18.f * Scale, true);
+		DrawFrame(FLinearColor(0.f, 0.f, 0.f, 0.8f));
 		return;
 	}
 
@@ -1419,5 +1826,5 @@ void AGenHUD::DrawRadar(AGenPlayerController* PC, UGenGameLogic* Logic)
 			}
 		}
 	}
-	DrawFrame(FLinearColor(0.35f, 0.4f, 0.5f));
+	DrawFrame(FLinearColor(0.f, 0.f, 0.f, 0.8f));
 }

@@ -29,11 +29,10 @@ namespace
 }
 
 FGenSkirmishAI::FGenSkirmishAI(UGenGameLogic* InLogic, int32 InPlayer, EGenDifficulty InDifficulty)
-	: Logic(InLogic), Player(InPlayer), Difficulty(InDifficulty)
+	: Logic(InLogic), Player(InPlayer), Difficulty(InDifficulty), bCampaign(InLogic->IsCampaign()), TF(InLogic->GetTeamFactory())
 {
-	// The default team: everything of ours that belongs to no other team.
-	Teams.Add(MakeUnique<FGenTeam>());
-	Teams[0]->bActive = true;
+	// Player::setDefaultTeam: everything of ours that belongs to no other team.
+	TF.EnsureDefaultTeam(Player);
 }
 
 int32 FGenSkirmishAI::GetMoney() const
@@ -45,12 +44,66 @@ int32 FGenSkirmishAI::GetMoney() const
 
 void FGenSkirmishAI::NewMap()
 {
-	// AISkirmishPlayer::newMap: take the side's base layout from AIData.ini, move it to where we start.
-	const FGenAIData& AI = FGenAIData::Get();
+	Frame = Logic->GetFrame();
 	const TArray<FGenPlayer>& Players = Logic->GetPlayers();
 	Side = Players[Player].Template ? Players[Player].Template->Side : FString();
-	Frame = Logic->GetFrame();
 
+	if (bCampaign)
+	{
+		// AIPlayer::newMap in a mission: the base is the map's own side build list, at the places the mission put
+		// it - nothing is moved or turned - plus whatever the map already placed for this player.
+		if (const FGenMapData* Map = Logic->GetMap())
+		{
+			if (Map->Sides.IsValidIndex(Player))
+			{
+				for (const FGenMapSide::FBuild& B : Map->Sides[Player].BuildList)
+				{
+					FGenBuildListInfo& Info = BuildList.AddDefaulted_GetRef();
+					Info.Template = FGenGameData::Get().FindTemplate(B.TemplateName);
+					Info.Location = B.Location;
+					Info.Angle = B.Angle;
+					Info.NumRebuilds = B.NumRebuilds;
+					Info.bInitiallyBuilt = B.bInitiallyBuilt;
+					Info.bAutomaticBuild = true; // BuildListInfo's default; a map's list has no such flag
+				}
+			}
+		}
+		// Player::addToBuildList prepends, so the buildings found by the scan come before the map's own entries.
+		int32 Placed = 0;
+		for (FGenObject* O : Logic->GetObjectsOf(Player))
+		{
+			if (IsAlive(O) && O->GetTemplate() && O->GetTemplate()->bHasProduction)
+			{
+				AddToBuildList(*O);
+				++Placed;
+			}
+		}
+		ComputeCenterAndRadiusOfBase();
+		// What is built now is the list the game handed the player, in its own order; the buildings the map had
+		// already placed are on the list as themselves and never get built again.
+		for (int32 i = Placed; i < BuildList.Num(); ++i)
+		{
+			if (!BuildList[i].Template)
+			{
+				continue;
+			}
+			if (BuildList[i].bInitiallyBuilt)
+			{
+				BuildStructureNow(BuildList[i]);
+			}
+			else
+			{
+				++BuildList[i].NumRebuilds; // the first build uses up a rebuild
+			}
+		}
+		// (No script engine of its own: the map's runs this player's scripts.)
+		UE_LOG(LogGenerals, Log, TEXT("AI player %d (%s): %d build list entries, %d teams, base center (%.0f, %.0f) radius %.0f"), Player, *Side,
+			BuildList.Num(), Protos.Num(), BaseCenter.X, BaseCenter.Y, BaseRadius);
+		return;
+	}
+
+	// AISkirmishPlayer::newMap: take the side's base layout from AIData.ini, move it to where we start.
+	const FGenAIData& AI = FGenAIData::Get();
 	if (const TArray<FGenAIBuildListEntry>* List = AI.BuildLists.Find(Side))
 	{
 		for (const FGenAIBuildListEntry& E : *List)
@@ -88,6 +141,18 @@ void FGenSkirmishAI::NewMap()
 	InitScripts();
 	UE_LOG(LogGenerals, Log, TEXT("AI player %d (%s): %d build list entries, %d teams, base center (%.0f, %.0f) radius %.0f"), Player, *Side,
 		BuildList.Num(), Protos.Num(), BaseCenter.X, BaseCenter.Y, BaseRadius);
+}
+
+void FGenSkirmishAI::AddToBuildList(FGenObject& Building)
+{
+	// Player::addToBuildList: a building the game already placed is an entry of its own, and cannot be rebuilt.
+	FGenBuildListInfo Info;
+	Info.Template = Building.GetTemplate();
+	Info.Location = FVector3f(Building.GetPosition().X, Building.GetPosition().Y, 0.f);
+	Info.Angle = Building.GetOrientation();
+	Info.NumRebuilds = 0;
+	Info.Object = Building.GetID();
+	BuildList.Insert(Info, 0);
 }
 
 void FGenSkirmishAI::AdjustBuildList()
@@ -185,8 +250,11 @@ void FGenSkirmishAI::Update(uint32 InFrame)
 	Frame = InFrame;
 	PurgeDeadMembers();
 
-	// ScriptEngine::update
-	UpdateScripts();
+	// ScriptEngine::update. In a mission the map's own engine runs this player's scripts, so here it only builds.
+	if (!bCampaign)
+	{
+		UpdateScripts();
+	}
 	Logic->SimYield(TEXT("a computer player's team states"));
 
 	// AIPlayer::update
@@ -198,15 +266,20 @@ void FGenSkirmishAI::Update(uint32 InFrame)
 	DoTeamBuilding();
 	Logic->SimYield(TEXT("a computer player's team building"));
 
-	// Player::update: teams run their generic scripts.
-	UpdateGenericScripts();
+	// Player::update, which is the only thing that runs a team's generic script hooks - and in the shipped game
+	// nothing calls Player::update at all (PlayerList::update has no caller), so a mission never runs them. They
+	// are kept here for a skirmish, where this player's own copy of the scripts is the one that owns them.
+	if (!bCampaign)
+	{
+		UpdateGenericScripts();
+	}
 }
 
 // ---- base building ------------------------------------------------------------------------------
 
 void FGenSkirmishAI::DoBaseBuilding()
 {
-	if (!bCanBuildBase)
+	if (!Logic->CanBuildBase(Player))
 	{
 		return;
 	}
@@ -300,6 +373,12 @@ void FGenSkirmishAI::ProcessBaseBuilding()
 		}
 		if (Bldg)
 		{
+			// AIPlayer::update: a supply centre the mission placed before the game started is taken up here, not
+			// when it is produced. Only the first time, so the count of its gatherers is not reset every frame.
+			if (!Info.bSupplyBuilding)
+			{
+				CheckForSupplyCenter(Info, *Bldg);
+			}
 			continue; // already built
 		}
 		if (!IsLocationSafe(Info.Location, *Info.Template))
@@ -577,6 +656,30 @@ bool FGenSkirmishAI::IsSupplySourceSafe(int32 MinSupplies)
 	return !Warehouse || IsLocationSafe(Warehouse->GetPosition(), *Warehouse->GetTemplate());
 }
 
+void FGenSkirmishAI::ScriptGuardSupplyCenter(FGenTeam& Team, int32 MinSupplies)
+{
+	// AIPlayer::guardSupplyCenter: a little in front of the warehouse, towards the enemy.
+	const FGenObject* Warehouse = FindSupplyCenter(MinSupplies);
+	if (!Warehouse)
+	{
+		return;
+	}
+	FVector2f Location(Warehouse->GetPosition().X, Warehouse->GetPosition().Y);
+	const int32 Enemy = GetEnemy();
+	if (Logic->GetPlayers().IsValidIndex(Enemy))
+	{
+		FBox2f Bounds;
+		GetPlayerStructureBounds(Enemy, Bounds);
+		Location -= (Location - Bounds.GetCenter()).GetSafeNormal() * Warehouse->GetTemplate()->GeometryMajorRadius * 0.8f;
+	}
+	TArray<FGenObject*> Members;
+	TF.GetTeamMembers(Team, Members);
+	for (FGenObject* O : Members)
+	{
+		O->CommandGuardPosition(Location, EGenGuardMode::Normal);
+	}
+}
+
 void FGenSkirmishAI::BuildBySupplies(int32 MinimumCash, const FString& ThingName)
 {
 	// AIPlayer::buildBySupplies: a supply center goes on the base side of the pile, anything else
@@ -810,7 +913,7 @@ void FGenSkirmishAI::QueueDozer()
 	FGenTeamInQueue TQ;
 	TQ.bPriorityBuild = true;
 	TQ.FrameStarted = Frame;
-	TQ.Team = 0;
+	TQ.Team = DefaultTeamId();
 	FGenWorkOrder& Order = TQ.Orders.AddDefaulted_GetRef();
 	Order.Thing = Dozer;
 	Order.bRequired = true;
@@ -970,7 +1073,7 @@ void FGenSkirmishAI::QueueSupplyTruck()
 		FGenTeamInQueue TQ;
 		TQ.bPriorityBuild = true;
 		TQ.FrameStarted = Frame;
-		TQ.Team = 0;
+		TQ.Team = DefaultTeamId();
 		FGenWorkOrder& Order = TQ.Orders.AddDefaulted_GetRef();
 		Order.Thing = Truck;
 		Order.bRequired = true;
@@ -1049,7 +1152,7 @@ void FGenSkirmishAI::OnUnitProduced(const FGenObject& Factory, FGenObject& Unit)
 
 void FGenSkirmishAI::DoTeamBuilding()
 {
-	if (!bCanBuildUnits)
+	if (!Logic->CanBuildUnits(Player))
 	{
 		return;
 	}
@@ -1147,7 +1250,7 @@ bool FGenSkirmishAI::IsPossibleToBuildTeam(const FGenTeamProto& Proto, bool bReq
 bool FGenSkirmishAI::IsAGoodIdeaToBuildTeam(int32 ProtoIndex)
 {
 	FGenTeamProto& Proto = Protos[ProtoIndex];
-	if (Proto.Units.Num() == 0 || !EvaluateProductionCondition(Proto) || CountTeamInstances(ProtoIndex) >= Proto.MaxInstances)
+	if (Proto.Units.Num() == 0 || !EvaluateProductionCondition(ProtoIndex) || CountTeamInstances(ProtoIndex) >= Proto.MaxInstances)
 	{
 		return false;
 	}
@@ -1172,7 +1275,7 @@ bool FGenSkirmishAI::SelectTeamToReinforce(int32 MinPriority)
 	for (const TUniquePtr<FGenTeam>& TeamPtr : Teams)
 	{
 		FGenTeam& Team = *TeamPtr;
-		if (!Protos.IsValidIndex(Team.Proto) || Team.Id == 0)
+		if (!Owns(Team) || !Protos.IsValidIndex(Team.Proto) || Team.bPlayerDefault)
 		{
 			continue;
 		}
@@ -1233,7 +1336,7 @@ bool FGenSkirmishAI::SelectTeamToBuild()
 	TArray<int32, TInlineAllocator<32>> Candidates;
 	for (int32 i = 0; i < Protos.Num(); ++i)
 	{
-		if (IsAGoodIdeaToBuildTeam(i))
+		if (Owns(i) && IsAGoodIdeaToBuildTeam(i))
 		{
 			Candidates.Add(i);
 			HiPri = FMath::Max(HiPri, Protos[i].ProductionPriority);
@@ -1253,7 +1356,7 @@ bool FGenSkirmishAI::SelectTeamToBuild()
 
 	const FGenAIData& AI = FGenAIData::Get();
 	bReadyToBuildTeam = false;
-	float Timer = AI.TeamSeconds * float(GenLogic::GetLogicFPS());
+	float Timer = (ScriptTeamSeconds >= 0 ? float(ScriptTeamSeconds) : AI.TeamSeconds) * float(GenLogic::GetLogicFPS());
 	if (GetMoney() < AI.Poor) { Timer /= FMath::Max(AI.TeamsPoorRate, 0.01f); }
 	else if (GetMoney() > AI.Wealthy) { Timer /= FMath::Max(AI.TeamsWealthyRate, 0.01f); }
 	TeamTimer = FMath::RoundToInt32(Timer);
@@ -1263,7 +1366,7 @@ bool FGenSkirmishAI::SelectTeamToBuild()
 void FGenSkirmishAI::BuildSpecificTeam(int32 ProtoIndex, bool bPriorityBuild)
 {
 	// AIPlayer::buildSpecificAITeam: an (inactive) team instance plus the work orders that fill it.
-	if (!Protos.IsValidIndex(ProtoIndex) || !bCanBuildUnits)
+	if (!Protos.IsValidIndex(ProtoIndex) || !Logic->CanBuildUnits(Player))
 	{
 		return;
 	}
@@ -1272,7 +1375,7 @@ void FGenSkirmishAI::BuildSpecificTeam(int32 ProtoIndex, bool bPriorityBuild)
 	{
 		for (const TUniquePtr<FGenTeam>& T : Teams)
 		{
-			if (T->Proto == ProtoIndex && TeamHasUnits(*T))
+			if (T->Proto == ProtoIndex && Owns(*T) && TeamHasUnits(*T))
 			{
 				return;
 			}
@@ -1433,7 +1536,7 @@ void FGenSkirmishAI::CheckQueuedTeams()
 		{
 			const FGenTeamInQueue Moved = TQ;
 			TeamBuildQueue.RemoveAt(i);
-			if (Moved.Team == 0)
+			if (const FGenTeam* Queued = FindTeam(Moved.Team); Queued && Queued->bPlayerDefault)
 			{
 				continue; // dozers and gatherers on the default team: nothing to activate
 			}
@@ -1448,7 +1551,7 @@ void FGenSkirmishAI::CheckQueuedTeams()
 			{
 				for (FGenObjectID Id : TArray<FGenObjectID>(Team->Members))
 				{
-					SetObjectTeam(Id, 0);
+					SetObjectTeam(Id, DefaultTeamId());
 				}
 				if (!Protos.IsValidIndex(Team->Proto) || !Protos[Team->Proto].bSingleton)
 				{
@@ -1815,7 +1918,8 @@ int32 FGenSkirmishAI::GetEnemy()
 		const TArray<FGenPlayer>& Players = Logic->GetPlayers();
 		for (int32 i = 0; i < Players.Num(); ++i)
 		{
-			if (Players[i].bHuman)
+			// ("In generals challenge, ThePlayer is a dummy player.")
+			if (Players[i].bHuman && (!Logic->IsChallenge() || i == Logic->GetLocalPlayer()))
 			{
 				return i;
 			}
@@ -1826,67 +1930,28 @@ int32 FGenSkirmishAI::GetEnemy()
 
 // ---- teams --------------------------------------------------------------------------------------
 
-FGenTeam* FGenSkirmishAI::FindTeam(int32 TeamId)
-{
-	for (const TUniquePtr<FGenTeam>& T : Teams)
-	{
-		if (T->Id == TeamId)
-		{
-			return T.Get();
-		}
-	}
-	return nullptr;
-}
-
-int32 FGenSkirmishAI::FindProto(const FString& Name) const
-{
-	return Protos.IndexOfByPredicate([&Name](const FGenTeamProto& P) { return P.Name == Name; });
-}
-
-int32 FGenSkirmishAI::CountTeamInstances(int32 ProtoIndex) const
-{
-	int32 Count = 0;
-	for (const TUniquePtr<FGenTeam>& T : Teams)
-	{
-		Count += T->Proto == ProtoIndex ? 1 : 0;
-	}
-	return Count;
-}
-
 FGenTeam& FGenSkirmishAI::CreateTeam(int32 ProtoIndex)
 {
 	// TeamFactory::createInactiveTeam
-	const FGenTeamProto& Proto = Protos[ProtoIndex];
-	FGenTeam* Team = nullptr;
-	if (Proto.bSingleton)
+	FGenTeam& Team = TF.CreateTeam(ProtoIndex, Player);
+	Team.bAssembling = !Team.bActive;
+	if (Protos.IsValidIndex(ProtoIndex))
 	{
-		for (const TUniquePtr<FGenTeam>& T : Teams)
+		const FGenTeamProto& Proto = Protos[ProtoIndex];
+		if (Proto.bExecuteActions)
 		{
-			if (T->Proto == ProtoIndex)
+			if (const FGenScript* Script = FindScript(Proto.ProductionCondition))
 			{
-				Team = T.Get();
-				break;
+				ExecuteActionsForTeam(Script->Actions, nullptr);
 			}
 		}
 	}
-	if (!Team)
-	{
-		Team = Teams.Add_GetRef(MakeUnique<FGenTeam>()).Get();
-		Team->Id = NextTeamId++;
-		Team->Proto = ProtoIndex;
-	}
-	if (Proto.bExecuteActions)
-	{
-		if (const FGenScript* Script = FindScript(Proto.ProductionCondition))
-		{
-			ExecuteActionsForTeam(Script->Actions, nullptr);
-		}
-	}
-	return *Team;
+	return Team;
 }
 
 void FGenSkirmishAI::SetTeamActive(FGenTeam& Team)
 {
+	Team.bAssembling = false;
 	if (!Team.bActive)
 	{
 		Team.bActive = true;
@@ -1896,51 +1961,31 @@ void FGenSkirmishAI::SetTeamActive(FGenTeam& Team)
 
 void FGenSkirmishAI::DeleteTeam(int32 TeamId)
 {
-	if (TeamId == 0)
+	const FGenTeam* Team = TF.FindTeam(TeamId);
+	if (!Team || !Owns(*Team))
 	{
 		return;
 	}
-	for (int32 i = 0; i < Teams.Num(); ++i)
-	{
-		if (Teams[i]->Id != TeamId)
-		{
-			continue;
-		}
-		// AIPlayer::aiPreTeamDestroy / ScriptEngine::notifyOfTeamDestruction
-		TeamBuildQueue.RemoveAll([TeamId](const FGenTeamInQueue& TQ) { return TQ.Team == TeamId; });
-		TeamReadyQueue.RemoveAll([TeamId](const FGenTeamInQueue& TQ) { return TQ.Team == TeamId; });
-		RemoveSequentialScripts(TeamId);
-		if (CallingTeam == Teams[i].Get()) { CallingTeam = nullptr; }
-		if (ConditionTeam == Teams[i].Get()) { ConditionTeam = nullptr; }
-		for (FGenObjectID Id : Teams[i]->Members)
-		{
-			ObjectTeams.Remove(Id);
-		}
-		Teams.RemoveAt(i);
-		return;
-	}
-}
-
-int32 FGenSkirmishAI::GetObjectTeam(FGenObjectID Object) const
-{
-	const int32* Found = ObjectTeams.Find(Object);
-	return Found ? *Found : 0;
+	// AIPlayer::aiPreTeamDestroy / ScriptEngine::notifyOfTeamDestruction
+	TeamBuildQueue.RemoveAll([TeamId](const FGenTeamInQueue& TQ) { return TQ.Team == TeamId; });
+	TeamReadyQueue.RemoveAll([TeamId](const FGenTeamInQueue& TQ) { return TQ.Team == TeamId; });
+	RemoveSequentialScripts(TeamId);
+	if (CallingTeam == Team) { CallingTeam = nullptr; }
+	if (ConditionTeam == Team) { ConditionTeam = nullptr; }
+	TF.DeleteTeam(TeamId);
 }
 
 void FGenSkirmishAI::SetObjectTeam(FGenObjectID Object, int32 TeamId)
 {
-	if (FGenTeam* Old = FindTeam(GetObjectTeam(Object)))
+	FGenObject* Obj = Logic->FindObject(Object);
+	if (!Obj)
 	{
-		Old->Members.Remove(Object);
+		return;
 	}
-	ObjectTeams.Remove(Object);
-	if (TeamId != 0)
+	// The player's default team holds whatever it has that is on no other team.
+	if (FGenTeam* New = TF.FindTeam(TeamId); New && Owns(*New))
 	{
-		if (FGenTeam* New = FindTeam(TeamId))
-		{
-			New->Members.AddUnique(Object);
-			ObjectTeams.Add(Object, TeamId);
-		}
+		TF.SetObjectTeam(*Obj, *New);
 	}
 }
 
@@ -1948,6 +1993,10 @@ void FGenSkirmishAI::PurgeDeadMembers()
 {
 	for (const TUniquePtr<FGenTeam>& T : Teams)
 	{
+		if (!Owns(*T))
+		{
+			continue;
+		}
 		for (int32 i = T->Members.Num() - 1; i >= 0; --i)
 		{
 			const FGenObject* O = Logic->FindObject(T->Members[i]);
@@ -1962,27 +2011,8 @@ void FGenSkirmishAI::PurgeDeadMembers()
 
 void FGenSkirmishAI::ForEachMember(const FGenTeam& Team, TFunctionRef<void(FGenObject&)> Fn) const
 {
-	if (Team.Id != 0)
-	{
-		for (FGenObjectID Id : TArray<FGenObjectID>(Team.Members))
-		{
-			FGenObject* O = Logic->FindObject(Id);
-			if (IsAlive(O))
-			{
-				Fn(*O);
-			}
-		}
-		return;
-	}
-	// The default team: everything of ours that is on no other team.
-	for (FGenObjectID Id : TArray<FGenObjectID>(Logic->GetObjectIDs()))
-	{
-		FGenObject* O = Logic->FindObject(Id);
-		if (IsAlive(O) && O->GetOwner() == Player && !O->IsProjectile() && !ObjectTeams.Contains(Id))
-		{
-			Fn(*O);
-		}
-	}
+	// A team's dead members are dropped by PurgeDeadMembers, so the AI works on the living ones only.
+	TF.ForEachMember(Team, [](const FGenObject& O) { return !O.IsDead() && !O.IsProjectile(); }, Fn);
 }
 
 bool FGenSkirmishAI::TeamHasUnits(const FGenTeam& Team) const
@@ -1997,19 +2027,6 @@ bool FGenSkirmishAI::TeamIsIdle(const FGenTeam& Team) const
 	bool bIdle = true;
 	ForEachMember(Team, [&bIdle](FGenObject& O) { bIdle &= !O.CanMove() || O.IsAIIdle(); });
 	return bIdle;
-}
-
-bool FGenSkirmishAI::GetTeamCenter(const FGenTeam& Team, FVector2f& OutCenter) const
-{
-	FVector2f Sum = FVector2f::ZeroVector;
-	int32 Num = 0;
-	ForEachMember(Team, [&Sum, &Num](FGenObject& O) { Sum += FVector2f(O.GetPosition().X, O.GetPosition().Y); ++Num; });
-	if (Num == 0)
-	{
-		return false;
-	}
-	OutCenter = Sum / float(Num);
-	return true;
 }
 
 FGenObject* FGenSkirmishAI::TryToRecruit(const FGenTeam& ForTeam, const FGenThingTemplate& Thing, const FVector3f& Home, float MaxDist)
@@ -2069,73 +2086,14 @@ FGenObject* FGenSkirmishAI::TryToRecruit(const FGenTeam& ForTeam, const FGenThin
 
 void FGenSkirmishAI::UpdateTeamStates()
 {
-	GEN_PERF_SCOPE("AI.Teams");
-	// TeamPrototype::updateState / Team::updateState: on-create, on-destroyed and on-idle scripts;
-	// active teams without members are removed.
-	TArray<int32, TInlineAllocator<32>> TeamIds;
-	for (const TUniquePtr<FGenTeam>& T : Teams)
-	{
-		if (T->bActive && T->Id != 0 && Protos.IsValidIndex(T->Proto))
-		{
-			TeamIds.Add(T->Id);
-		}
-	}
-	for (int32 TeamId : TeamIds)
-	{
-		// (Scripts may disband or delete teams, so the team is looked up again after each one.)
-		FGenTeam* Team = FindTeam(TeamId);
-		if (!Team)
-		{
-			continue;
-		}
-		const FGenTeamProto& Proto = Protos[Team->Proto];
-		int32 Alive = 0;
-		bool bIdle = true;
-		ForEachMember(*Team, [&Alive, &bIdle](FGenObject& O) { ++Alive; bIdle &= !O.CanMove() || O.IsAIIdle(); });
-		if (Team->bCreated)
-		{
-			Team->bCreated = false;
-			if (!Proto.OnDestroyed.IsEmpty())
-			{
-				Team->CurUnits = Alive;
-				Team->DestroyThreshold = FMath::Clamp(Alive - int32(float(Alive) * Proto.DestroyedThreshold), 0, FMath::Max(0, Alive - 1));
-			}
-			if (!Proto.OnCreate.IsEmpty())
-			{
-				RunScript(Proto.OnCreate, Team);
-				Team = FindTeam(TeamId);
-			}
-		}
-		if (Team && !Proto.OnDestroyed.IsEmpty())
-		{
-			const int32 Prev = Team->CurUnits;
-			Team->CurUnits = Alive;
-			if (Alive != Prev && Alive <= Team->DestroyThreshold)
-			{
-				Team->DestroyThreshold = -1; // only once
-				RunScript(Proto.OnDestroyed, Team);
-				Team = FindTeam(TeamId);
-			}
-		}
-		if (Team && !Proto.OnIdle.IsEmpty())
-		{
-			const bool bWasIdle = Team->bWasIdle;
-			Team->bWasIdle = bIdle;
-			if (Alive > 0 && bIdle && bWasIdle)
-			{
-				RunScript(Proto.OnIdle, Team);
-			}
-		}
-	}
-	// Empty teams go away (not singletons, not the default team, not teams still under construction).
-	for (int32 i = Teams.Num() - 1; i >= 1; --i)
-	{
-		const FGenTeam& Team = *Teams[i];
-		if (Team.bActive && Team.Members.Num() == 0 && !(Protos.IsValidIndex(Team.Proto) && Protos[Team.Proto].bSingleton))
-		{
-			DeleteTeam(Team.Id);
-		}
-	}
+	// Team::updateState, through the game's team registry, for this player's teams. In a mission the map's engine
+	// does this for every side, so this is only reached in a skirmish.
+	TF.UpdateTeamStates([this](int32 TeamId, const FString& Name) { RunScript(Name, TF.FindTeam(TeamId)); }, Player);
+}
+
+void FGenSkirmishAI::NotifyTeamOfObjectDeath(FGenObject& Obj)
+{
+	TF.NotifyTeamOfObjectDeath(Obj, [this](int32 TeamId, const FString& Name) { RunScript(Name, TF.FindTeam(TeamId)); });
 }
 
 void FGenSkirmishAI::UpdateGenericScripts()
@@ -2145,7 +2103,7 @@ void FGenSkirmishAI::UpdateGenericScripts()
 	for (int32 t = 0; t < Teams.Num(); ++t)
 	{
 		FGenTeam* Team = Teams[t].Get();
-		if (!Protos.IsValidIndex(Team->Proto))
+		if (!Owns(*Team) || !Protos.IsValidIndex(Team->Proto))
 		{
 			continue;
 		}
@@ -2189,9 +2147,14 @@ FString FGenSkirmishAI::Describe() const
 		Built += IsAlive(Logic->FindObject(Info.Object)) ? 1 : 0;
 		Wanted += Info.bPriorityBuild ? 1 : 0;
 	}
+	int32 OwnTeams = 0;
+	for (const TUniquePtr<FGenTeam>& T : Teams)
+	{
+		OwnTeams += (Owns(*T) && !T->bPlayerDefault) ? 1 : 0;
+	}
 	const FCounter* Escalation = Counters.Find(TEXT("_ESCALATION"));
 	const FCounter* Wave = Counters.Find(TEXT("_ATTACK_WAVE"));
 	return FString::Printf(TEXT("p%d %s money=%d buildings=%d/%d requested teams=%d building=%d ready=%d escalation=%d wave=%d enemy=%d"), Player, *Side,
-		GetMoney(), Built, Wanted, Teams.Num() - 1, TeamBuildQueue.Num(), TeamReadyQueue.Num(), Escalation ? Escalation->Value : 0, Wave ? Wave->Value : 0,
+		GetMoney(), Built, Wanted, OwnTeams, TeamBuildQueue.Num(), TeamReadyQueue.Num(), Escalation ? Escalation->Value : 0, Wave ? Wave->Value : 0,
 		CurrentEnemy);
 }

@@ -41,11 +41,27 @@ MAP_DIR = ROOT + "/Maps"
 # Stage 0 texture coordinates. LinearOffsetTextureMapperClass: u' = u * UScale + offset, the offset sliding by
 # -UPerSec per second from UOffset (wrapped to 0..1); ScrollMode 1. Tank treads (ScrollMode 2..4, left / right /
 # middle): the offset their draw module has rolled them to. The mesh's V was flipped on import (1 - v).
+# Stage 1 / the additive pass's coordinates: LinearOffsetTextureMapperClass, or as they are.
+W3D_DETAIL_UV_HLSL = r"""
+float2 o = frac(-Scroll.xy * Clock + Scroll.zw);
+return float2(UV.x * Scale.x + o.x, 1.0 - ((1.0 - UV.y) * Scale.y + o.y));
+"""
+
 W3D_UV_HLSL = r"""
 float2 o = float2(0.0, 0.0);
 if (ScrollMode > 0.5 && ScrollMode < 1.5)
 {
     o = frac(-UVScroll.xy * Clock + UVScroll.zw);
+}
+else if (ScrollMode > 4.5)
+{
+    // GridTextureMapperClass: UVScroll = (frames a second, cells a side, frames, first frame). The coordinates of a
+    // grid mapped mesh are those of the first cell; a frame's cell is an offset (calculate_uv_offset).
+    float frame = floor(abs(UVScroll.x) * Clock + UVScroll.w);
+    frame = frame - floor(frame / max(UVScroll.z, 1.0)) * max(UVScroll.z, 1.0);
+    if (UVScroll.x < 0.0) { frame = max(UVScroll.z, 1.0) - 1.0 - frame; }
+    float row = floor(frame / UVScroll.y);
+    o = float2((frame - row * UVScroll.y) / UVScroll.y, row / UVScroll.y);
 }
 else if (ScrollMode > 1.5)
 {
@@ -104,6 +120,27 @@ else
 }
 c *= VColorRGB;
 a *= TintA * VColorA;
+// Stage 1 (ShaderClass's detail colour and alpha functions): 1 detail, 2 scale, 3 inverse scale, 4 add, 5 subtract,
+// 6 reverse subtract, 7 blend by stage 0's alpha, 8 blend by the detail's alpha. (9 is an additive pass: see W3DDetailGlow.)
+if (DetailMode > 0.5 && DetailMode < 8.5)
+{
+    float3 d = DetailTex.rgb;
+    if (DetailMode < 1.5)      { c = d; }
+    else if (DetailMode < 2.5) { c = c * d; }
+    else if (DetailMode < 3.5) { c = c + d - c * d; }
+    else if (DetailMode < 4.5) { c = c + d; }
+    else if (DetailMode < 5.5) { c = c - d; }
+    else if (DetailMode < 6.5) { c = d - c; }
+    else if (DetailMode < 7.5) { c = lerp(d, c, a); }
+    else                       { c = lerp(c, d, DetailTex.a); }
+    c = saturate(c);
+}
+if (DetailAlphaMode > 0.5)
+{
+    if (DetailAlphaMode < 1.5)      { a = DetailTex.a; }
+    else if (DetailAlphaMode < 2.5) { a = a * DetailTex.a; }
+    else                            { a = a + DetailTex.a - a * DetailTex.a; }
+}
 if (UnderlayMode > 0.5)
 {
     // Two-pass "W3D Reflectivity" mesh: an opaque first pass (environment map or plain color) with this
@@ -118,8 +155,8 @@ if (IgnoreAlpha > 0.5)
 }
 if (StealthGlow > 0.001)
 {
-    // A stealthed unit that has been detected (the original's heat-vision material pass).
-    c = lerp(c, float3(1.0, 0.22, 0.08), StealthGlow);
+    // A stealthed unit that has been detected (the original's heat-vision material pass: emissive 0.5, 0.2, 0).
+    c = lerp(c, float3(1.0, 0.4, 0.0), StealthGlow);
 }
 if (StealthFade > 0.001)
 {
@@ -321,6 +358,48 @@ def build_w3d_material(name, lit, mpc=None, sway_mpc=None):
     MEL.connect_material_expressions(treads[2], "", uv_node, "TreadM")
     MEL.connect_material_expressions(uv_node, "", tex, "UVs")
 
+    # The second texture: stage 1 of the pass, or a mesh's additive pass.
+    detail_tex = expr(mat, unreal.MaterialExpressionTextureSampleParameter2D, -900, 2000)
+    detail_tex.set_editor_property("parameter_name", "DetailTexture")
+    if white:
+        detail_tex.set_editor_property("texture", white)
+    uv1 = expr(mat, unreal.MaterialExpressionTextureCoordinate, -1500, 2000)
+    uv1.set_editor_property("coordinate_index", 1)
+    detail_scroll = vector_param(mat, "DetailScroll", (0, 0, 0, 0), -1500, 2100)
+    detail_scale = vector_param(mat, "DetailScale", (1, 1, 0, 0), -1500, 2250)
+    detail_uv = expr(mat, unreal.MaterialExpressionCustom, -1150, 2000)
+    detail_uv.set_editor_property("code", W3D_DETAIL_UV_HLSL)
+    detail_uv.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT2)
+    detail_uv.set_editor_property("description", "W3DDetailUV")
+    detail_uv_inputs = []
+    for n in ("UV", "Clock", "Scroll", "Scale"):
+        ci = unreal.CustomInput()
+        ci.set_editor_property("input_name", n)
+        detail_uv_inputs.append(ci)
+    detail_uv.set_editor_property("inputs", detail_uv_inputs)
+    MEL.connect_material_expressions(uv1, "", detail_uv, "UV")
+    MEL.connect_material_expressions(clock, "", detail_uv, "Clock")
+    MEL.connect_material_expressions(detail_scroll, "RGBA", detail_uv, "Scroll")
+    MEL.connect_material_expressions(detail_scale, "RGBA", detail_uv, "Scale")
+    MEL.connect_material_expressions(detail_uv, "", detail_tex, "UVs")
+    detail_mode = scalar_param(mat, "DetailMode", 0.0, -900, 2300)
+    detail_alpha_mode = scalar_param(mat, "DetailAlphaMode", 0.0, -900, 2400)
+    detail_tint = vector_param(mat, "DetailTint", (1, 1, 1, 1), -900, 2500)
+    # An additive second pass is light of its own, whatever falls on the rest of the model.
+    detail_glow = expr(mat, unreal.MaterialExpressionCustom, -500, 2100)
+    detail_glow.set_editor_property("code", "return DetailMode > 8.5 ? DetailTex.rgb * DetailTint : float3(0.0, 0.0, 0.0);")
+    detail_glow.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT3)
+    detail_glow.set_editor_property("description", "W3DDetailGlow")
+    glow_inputs = []
+    for n in ("DetailTex", "DetailMode", "DetailTint"):
+        ci = unreal.CustomInput()
+        ci.set_editor_property("input_name", n)
+        glow_inputs.append(ci)
+    detail_glow.set_editor_property("inputs", glow_inputs)
+    MEL.connect_material_expressions(detail_tex, "RGB", detail_glow, "DetailTex")
+    MEL.connect_material_expressions(detail_mode, "", detail_glow, "DetailMode")
+    MEL.connect_material_expressions(detail_tint, "", detail_glow, "DetailTint")
+
     use_tex = scalar_param(mat, "UseTexture", 1.0, -900, 50)
     tint = vector_param(mat, "Tint", (1, 1, 1, 1), -900, 150)
     house = vector_param(mat, "HouseColor", (1, 1, 1, 1), -900, 350)
@@ -376,7 +455,8 @@ def build_w3d_material(name, lit, mpc=None, sway_mpc=None):
     inputs = []
     for n in ("Tex", "UseTexture", "TintRGB", "TintA", "HouseColor", "HouseColorMode", "HouseColorShape",
               "VColorRGB", "VColorA",
-              "Under", "UnderTint", "UnderlayMode", "IgnoreAlpha", "StealthFade", "StealthGlow"):
+              "Under", "UnderTint", "UnderlayMode", "IgnoreAlpha", "StealthFade", "StealthGlow",
+              "DetailTex", "DetailMode", "DetailAlphaMode"):
         ci = unreal.CustomInput()
         ci.set_editor_property("input_name", n)
         inputs.append(ci)
@@ -396,6 +476,9 @@ def build_w3d_material(name, lit, mpc=None, sway_mpc=None):
     MEL.connect_material_expressions(ignore_alpha, "", custom, "IgnoreAlpha")
     MEL.connect_material_expressions(stealth_fade, "", custom, "StealthFade")
     MEL.connect_material_expressions(stealth_glow, "", custom, "StealthGlow")
+    MEL.connect_material_expressions(detail_tex, "RGBA", custom, "DetailTex")
+    MEL.connect_material_expressions(detail_mode, "", custom, "DetailMode")
+    MEL.connect_material_expressions(detail_alpha_mode, "", custom, "DetailAlphaMode")
 
     rgb = mask(mat, custom, "", (True, True, True, False), -250, 0)
     alpha = mask(mat, custom, "", (False, False, False, True), -250, 150)
@@ -421,7 +504,10 @@ def build_w3d_material(name, lit, mpc=None, sway_mpc=None):
         em = expr(mat, unreal.MaterialExpressionMultiply, -250, 400)
         MEL.connect_material_expressions(add_tint, "", em, "A")
         MEL.connect_material_expressions(rgb, "", em, "B")
-        MEL.connect_material_property(em, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+        em_glow = expr(mat, unreal.MaterialExpressionAdd, -120, 400)
+        MEL.connect_material_expressions(em, "", em_glow, "A")
+        MEL.connect_material_expressions(detail_glow, "", em_glow, "B")
+        MEL.connect_material_property(em_glow, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
         rough = expr(mat, unreal.MaterialExpressionConstant, -250, 550)
         rough.set_editor_property("r", 0.85)
         MEL.connect_material_property(rough, "", unreal.MaterialProperty.MP_ROUGHNESS)
@@ -429,7 +515,10 @@ def build_w3d_material(name, lit, mpc=None, sway_mpc=None):
         spec.set_editor_property("r", 0.25)
         MEL.connect_material_property(spec, "", unreal.MaterialProperty.MP_SPECULAR)
     else:
-        MEL.connect_material_property(rgb, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+        unlit_glow = expr(mat, unreal.MaterialExpressionAdd, -120, 100)
+        MEL.connect_material_expressions(rgb, "", unlit_glow, "A")
+        MEL.connect_material_expressions(detail_glow, "", unlit_glow, "B")
+        MEL.connect_material_property(unlit_glow, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     MEL.connect_material_property(alpha, "", unreal.MaterialProperty.MP_OPACITY)
     MEL.connect_material_property(alpha, "", unreal.MaterialProperty.MP_OPACITY_MASK)
     if sway_mpc:
@@ -644,6 +733,110 @@ def pick_enum(enum, names):
     raise RuntimeError("none of %s in %s: %s" % (names, enum, [n for n in dir(enum) if n.isupper()]))
 
 
+def build_smudge_material():
+    """W3DSmudgeManager: no picture, but a place where the picture behind shimmers (a microwave dish's heat haze).
+    The original copied the frame and drew it again with the quad's middle pushed about."""
+    mat = recreate_material("M_Smudge")
+    mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_TRANSLUCENT)
+    mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
+    mat.set_editor_property("two_sided", True)
+    uv = expr(mat, unreal.MaterialExpressionTextureCoordinate, -900, 0)
+    clock = expr(mat, unreal.MaterialExpressionTime, -900, 150)
+    vcolor = expr(mat, unreal.MaterialExpressionVertexColor, -900, 250)
+    offset = expr(mat, unreal.MaterialExpressionCustom, -600, 0)
+    # W3DParticleSystemManager gives every smudge a random push each frame: each patch boils on its own. (Its colour
+    # keys go up and down with its age, so that each has a phase of its own here, and a new one when it gets older.)
+    offset.set_editor_property("code", """
+float2 d = UV - 0.5;
+float r = saturate(1.0 - length(d) * 2.0);
+float phase = (VColor.r + VColor.b * 0.37) * 40.0;
+return float2(sin(Clock * 31.0 + UV.y * 23.0 + phase), cos(Clock * 27.0 + UV.x * 29.0 + phase * 1.3)) * 0.006 * r;
+""")
+    offset.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT2)
+    offset.set_editor_property("description", "SmudgeOffset")
+    inputs = []
+    for n in ("UV", "Clock", "VColor"):
+        ci = unreal.CustomInput()
+        ci.set_editor_property("input_name", n)
+        inputs.append(ci)
+    offset.set_editor_property("inputs", inputs)
+    MEL.connect_material_expressions(uv, "", offset, "UV")
+    MEL.connect_material_expressions(clock, "", offset, "Clock")
+    MEL.connect_material_expressions(vcolor, "", offset, "VColor")
+    scene = expr(mat, unreal.MaterialExpressionSceneColor, -300, 0)
+    MEL.connect_material_expressions(offset, "", scene, "OffsetFraction")
+    fade = expr(mat, unreal.MaterialExpressionCustom, -600, 300)
+    fade.set_editor_property("code", "return saturate(1.0 - length(UV - 0.5) * 2.0) * VColorA;")
+    fade.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT1)
+    fade.set_editor_property("description", "SmudgeFade")
+    fade_inputs = []
+    for n in ("UV", "VColorA"):
+        ci = unreal.CustomInput()
+        ci.set_editor_property("input_name", n)
+        fade_inputs.append(ci)
+    fade.set_editor_property("inputs", fade_inputs)
+    vcol = expr(mat, unreal.MaterialExpressionVertexColor, -900, 400)
+    MEL.connect_material_expressions(uv, "", fade, "UV")
+    MEL.connect_material_expressions(vcol, "A", fade, "VColorA")
+    MEL.connect_material_property(scene, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    MEL.connect_material_property(fade, "", unreal.MaterialProperty.MP_OPACITY)
+    MEL.recompile_material(mat)
+    EAL.save_loaded_asset(mat)
+    return mat
+
+
+OCCLUDED_HLSL = r"""
+// What is marked (custom stencil: its owner's number) and lies behind what the scene shows there.
+float s = round(Stencil);
+float3 c = Scene;
+if (s > 0.5 && CDepth > Depth + 8.0)
+{
+    float3 p = s < 1.5 ? P1 : s < 2.5 ? P2 : s < 3.5 ? P3 : s < 4.5 ? P4 : s < 5.5 ? P5 : s < 6.5 ? P6 : s < 7.5 ? P7 : s < 8.5 ? P8 : P9;
+    c = pow(max(p, 0.0), 2.2);
+}
+return c;
+"""
+
+
+def build_occluded_material():
+    """RTS3DScene's occluded objects (UseBehindBuildingMarker): what stands behind a building shows in its owner's
+    colour. UGenGameLogic::UpdateOccludedMark marks only models whose line to the camera goes through a structure."""
+    mat = recreate_material("M_Occluded")
+    mat.set_editor_property("material_domain", unreal.MaterialDomain.MD_POST_PROCESS)
+    mat.set_editor_property("blendable_location", pick_enum(
+        unreal.BlendableLocation, ("BL_SCENE_COLOR_AFTER_DOF", "BL_BEFORE_TONEMAPPING")))
+    mat.set_editor_property("blendable_priority", -1)  # (before the fog of war dims the picture)
+    def tex(sid, y):
+        return expr(mat, unreal.MaterialExpressionSceneTexture, -700, y), sid
+    custom = expr(mat, unreal.MaterialExpressionCustom, -300, 0)
+    custom.set_editor_property("code", OCCLUDED_HLSL)
+    custom.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT3)
+    custom.set_editor_property("description", "Occluded")
+    names = ["Scene", "Depth", "CDepth", "Stencil"] + ["P%d" % i for i in range(1, 10)]
+    inputs = []
+    for n in names:
+        ci = unreal.CustomInput()
+        ci.set_editor_property("input_name", n)
+        inputs.append(ci)
+    custom.set_editor_property("inputs", inputs)
+    for n, sid, y in (("Scene", unreal.SceneTextureId.PPI_POST_PROCESS_INPUT0, -300), ("Depth", unreal.SceneTextureId.PPI_SCENE_DEPTH, -100),
+                      ("CDepth", unreal.SceneTextureId.PPI_CUSTOM_DEPTH, 100), ("Stencil", unreal.SceneTextureId.PPI_CUSTOM_STENCIL, 300)):
+        node = expr(mat, unreal.MaterialExpressionSceneTexture, -700, y)
+        node.set_editor_property("scene_texture_id", sid)
+        if n == "Scene":
+            m = mask(mat, node, "Color", (True, True, True, False), -500, y)
+        else:
+            m = mask(mat, node, "Color", (True, False, False, False), -500, y)
+        MEL.connect_material_expressions(m, "", custom, n)
+    for i in range(1, 10):
+        p = vector_param(mat, "Player%d" % i, (1, 1, 1, 1), -700, 300 + i * 140)
+        MEL.connect_material_expressions(p, "", custom, "P%d" % i)
+    MEL.connect_material_property(custom, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    MEL.recompile_material(mat)
+    EAL.save_loaded_asset(mat)
+    return mat
+
+
 def build_shroud_material():
     """Fog of war (W3DShroud): scene color * shroud texture, looked up by the pixel's world position.
 
@@ -685,9 +878,23 @@ def build_shroud_material():
     scene.set_editor_property("scene_texture_id", unreal.SceneTextureId.PPI_POST_PROCESS_INPUT0)
     scene_rgb = mask(mat, scene, "Color", (True, True, True, False), -300, -200)
 
+    # The sky isn't fogged: the original's shroud is a pass of the terrain's and the objects', and a pixel of the sky box
+    # that comes down on a map cell here has nothing to do with that cell.
+    camera = expr(mat, unreal.MaterialExpressionCameraPositionWS, -550, 350)
+    distance = expr(mat, unreal.MaterialExpressionDistance, -350, 350)
+    MEL.connect_material_expressions(wp, "", distance, "A")
+    MEL.connect_material_expressions(camera, "", distance, "B")
+    sky_distance = scalar_param(mat, "SkyDistance", 1.0e9, -350, 500)
+    unfogged = expr(mat, unreal.MaterialExpressionConstant, -350, 600)
+    unfogged.set_editor_property("r", 1.0)
+    level = expr(mat, unreal.MaterialExpressionIf, -150, 300)
+    for source, pin in ((distance, "A"), (sky_distance, "B"), (unfogged, "A > B"), (gamma, "A < B")):
+        if not MEL.connect_material_expressions(source, "", level, pin):
+            raise RuntimeError("M_Shroud: no pin '%s' on the If node" % pin)
+
     out = expr(mat, unreal.MaterialExpressionMultiply, -100, 0)
     MEL.connect_material_expressions(scene_rgb, "", out, "A")
-    MEL.connect_material_expressions(gamma, "", out, "B")
+    MEL.connect_material_expressions(level, "", out, "B")
     MEL.connect_material_property(out, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     MEL.recompile_material(mat)
     EAL.save_loaded_asset(mat)
@@ -948,6 +1155,9 @@ def main():
     # GEN_SETUP_ONLY=shroud rebuilds just that material (the rest takes a while to recompile).
     import os
     only = os.environ.get("GEN_SETUP_ONLY", "")
+    if only == "smudge":
+        build_smudge_material()
+        return
     if only == "shroud":
         build_shroud_material()
         unreal.log("Generals setup complete (shroud material only)")
@@ -992,6 +1202,8 @@ def main():
     make_instance("MI_Particle_Alpha", particle, B.BLEND_TRANSLUCENT, True)
     make_instance("MI_Particle_Masked", particle, B.BLEND_MASKED, True)
     make_instance("MI_Particle_Multiply", particle, B.BLEND_MODULATE, True)
+    build_smudge_material()
+    build_occluded_material()
     if only == "w3d":
         unreal.log("Generals setup complete (model and particle materials only)")
         return

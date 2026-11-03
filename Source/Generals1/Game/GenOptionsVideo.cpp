@@ -14,6 +14,7 @@
 #include "Game/GenHUD.h"
 #include "Game/GenShellStyle.h"
 #include "Game/GenSettings.h"
+#include "Game/GenHudStyle.h"
 #include "Logic/GenGameLogic.h"
 #include "Map/GenMapActor.h"
 #include "Generals1.h"
@@ -595,6 +596,22 @@ void AGenHUD::DrawOptionsVideo(const FBox2D& Body)
 
 	Label(TEXT("Show frame rate"), LeftX, Y, TEXT("A small read-out in the top right corner during a game: frames per second, and the time each frame takes."), true);
 	Check(TEXT("Video.ShowFPS"), LeftX, Y, D.Extras.bShowFPS, TEXT("On"), TEXT("Off"));
+	Y += Step;
+
+	Label(TEXT("HUD style"), LeftX, Y, TEXT("The look of the bar at the bottom of the screen during a game. Faction colours give each side its own metal. Applies right away, in a game too."), true);
+	{
+		TArray<FString> StyleNames;
+		for (const FGenHudStyle* Style : GenHudStyles::All())
+		{
+			StyleNames.Add(Style->Name);
+		}
+		const FGenHudStyle* Chosen = GenHudStyles::Find(D.Extras.HudStyle);
+		const int32 StyleIndex = Chosen ? GenHudStyles::All().Find(Chosen) : 0;
+		if (ShellDropdown(TEXT("Video.HudStyle"), Control(LeftX, Y), StyleNames, NoColors, StyleIndex, Picked))
+		{
+			D.Extras.HudStyle = GenHudStyles::All()[Picked]->Id;
+		}
+	}
 	Y += Step + 16.f;
 
 	// What Apply will do to the display, said before it happens.

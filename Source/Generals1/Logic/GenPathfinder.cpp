@@ -21,7 +21,7 @@ namespace
 	constexpr float LayerZCloseEnough = 10.f;
 }
 
-void FGenPathfinder::Build(const FGenMapData& Map, const TArray<FGenBridgeInfo>& InBridges)
+void FGenPathfinder::Build(const FGenMapData& Map, const TArray<FGenBridgeInfo>& InBridges, bool bCellsOffTheMap)
 {
 	Width = Map.Width - 1;
 	Height = Map.Height - 1;
@@ -117,8 +117,9 @@ void FGenPathfinder::Build(const FGenMapData& Map, const TArray<FGenBridgeInfo>&
 		{
 			const FVector2f Lo((X - Border) * CellSize, (Y - Border) * CellSize);
 			const FVector2f Hi = Lo + FVector2f(CellSize, CellSize);
-			// Units may not leave the playable area.
-			if (Lo.X < Playable.Min.X || Lo.Y < Playable.Min.Y || Hi.X > Playable.Max.X || Hi.Y > Playable.Max.Y)
+			// Units may not leave the playable area. (In a mission: "computer can move off logical map", findClosestPath:
+			// landing craft and reinforcements come from out there; the player can't click out there.)
+			if (!bCellsOffTheMap && (Lo.X < Playable.Min.X || Lo.Y < Playable.Min.Y || Hi.X > Playable.Max.X || Hi.Y > Playable.Max.Y))
 			{
 				Terrain[Y * Width + X] = ECell::Impassable;
 			}
@@ -136,6 +137,30 @@ void FGenPathfinder::Build(const FGenMapData& Map, const TArray<FGenBridgeInfo>&
 	}
 	GoalUnit.Init(GenInvalidObjectID, NumNodes);
 	FixedUnit.Init(GenInvalidObjectID, NumNodes);
+}
+
+void FGenPathfinder::RefreshWater(const FGenMapData& Map, const FBox2f& Area)
+{
+	const int32 X0 = FMath::Clamp(FMath::FloorToInt32(Area.Min.X / CellSize) + Border - 1, 0, Width - 1);
+	const int32 X1 = FMath::Clamp(FMath::CeilToInt32(Area.Max.X / CellSize) + Border + 1, 0, Width - 1);
+	const int32 Y0 = FMath::Clamp(FMath::FloorToInt32(Area.Min.Y / CellSize) + Border - 1, 0, Height - 1);
+	const int32 Y1 = FMath::Clamp(FMath::CeilToInt32(Area.Max.Y / CellSize) + Border + 1, 0, Height - 1);
+	for (int32 Y = Y0; Y <= Y1; ++Y)
+	{
+		for (int32 X = X0; X <= X1; ++X)
+		{
+			ECell& Cell = Terrain[Y * Width + X];
+			if (Cell != ECell::Clear && Cell != ECell::Water)
+			{
+				continue; // (A cliff stays one, and what is outside the map stays out.)
+			}
+			const FVector2f Lo((X - Border) * CellSize, (Y - Border) * CellSize);
+			const FVector2f Hi = Lo + FVector2f(CellSize, CellSize);
+			const bool bWet = Map.IsUnderwater(Lo.X, Lo.Y) || Map.IsUnderwater(Lo.X, Hi.Y) || Map.IsUnderwater(Hi.X, Hi.Y) || Map.IsUnderwater(Hi.X, Lo.Y);
+			Cell = bWet ? ECell::Water : ECell::Clear;
+		}
+	}
+	++ObstacleVersion;
 }
 
 void FGenPathfinder::BuildLayer(const FGenMapData& Map, const FGenBridgeInfo& Bridge)
@@ -416,7 +441,7 @@ bool FGenPathfinder::CanPass(int32 X, int32 Y, uint32 Surfaces, int32 Layer) con
 				for (int32 DX = -AvoidRadius; DX <= AvoidRadius; ++DX)
 				{
 					const int32 Other = NodeIndex(Layer, X + DX, Y + DY);
-					if (Other >= 0 && FixedUnit[Other] != GenInvalidObjectID && FixedUnit[Other] != AvoidSelf) { return false; }
+					if (Other >= 0 && IsAvoidedUnit(FixedUnit[Other])) { return false; }
 				}
 			}
 		}
@@ -436,8 +461,7 @@ bool FGenPathfinder::CanPass(int32 X, int32 Y, uint32 Surfaces, int32 Layer) con
 			{
 				const int32 UX = X + DX, UY = Y + DY;
 				if (UX < 0 || UY < 0 || UX >= Width || UY >= Height) { continue; }
-				const FGenObjectID U = FixedUnit[UY * Width + UX];
-				if (U != GenInvalidObjectID && U != AvoidSelf) { return false; }
+				if (IsAvoidedUnit(FixedUnit[UY * Width + UX])) { return false; }
 			}
 		}
 	}
@@ -1070,13 +1094,62 @@ bool FGenPathfinder::AdjustUnitDestination(FGenObjectID Id, float Radius, uint32
 	return false;
 }
 
+int32 FGenPathfinder::WorstParkedOnPath(FGenObjectID Id, float Radius, const FVector2f& Start, const TArray<FVector2f>& Path, const TArray<uint8>& PathLayers,
+	FGenObjectID IgnoreObstacleID, TFunctionRef<int32(FGenObjectID)> Kind) const
+{
+	if (Width == 0)
+	{
+		return 0;
+	}
+	const int32 R = Radius > CellSize ? 1 : 0; // (as FindPathAroundUnits)
+	const FIntPoint StartCell = WorldToCell(Start);
+	FIntPoint Last(MIN_int32, MIN_int32);
+	FVector2f From = Start;
+	int32 Worst = 0;
+	for (int32 i = 0; i < Path.Num(); ++i)
+	{
+		const int32 L = PathLayers.IsValidIndex(i) ? int32(PathLayers[i]) : 0;
+		const FVector2f D = Path[i] - From;
+		const int32 Steps = FMath::Max(1, FMath::CeilToInt32(D.Size() / (0.5f * CellSize)));
+		for (int32 s = 1; s <= Steps; ++s)
+		{
+			const FIntPoint C = WorldToCell(From + D * (float(s) / float(Steps)));
+			if (C == Last)
+			{
+				continue;
+			}
+			Last = C;
+			// (A unit may stand hard by a parked one: that doesn't make it in the way.)
+			if (FMath::Abs(C.X - StartCell.X) <= R + 1 && FMath::Abs(C.Y - StartCell.Y) <= R + 1)
+			{
+				continue;
+			}
+			for (int32 DY = -R; DY <= R; ++DY)
+			{
+				for (int32 DX = -R; DX <= R; ++DX)
+				{
+					const int32 Node = NodeIndex(L, C.X + DX, C.Y + DY);
+					const FGenObjectID U = Node >= 0 ? FixedUnit[Node] : GenInvalidObjectID;
+					if (U != GenInvalidObjectID && U != Id && U != IgnoreObstacleID)
+					{
+						Worst = FMath::Max(Worst, Kind(U));
+					}
+				}
+			}
+		}
+		From = Path[i];
+	}
+	return Worst;
+}
+
 bool FGenPathfinder::FindPathAroundUnits(FGenObjectID Id, float Radius, const FVector2f& Start, const FVector2f& Goal, uint32 Surfaces,
-	TArray<FVector2f>& OutPath, int32 StartLayer, int32 GoalLayer, TArray<uint8>* OutLayers, FGenObjectID IgnoreObstacleID) const
+	TArray<FVector2f>& OutPath, int32 StartLayer, int32 GoalLayer, TArray<uint8>* OutLayers, FGenObjectID IgnoreObstacleID, TFunctionRef<bool(FGenObjectID)> IsObstacle) const
 {
 	GEN_PERF_SCOPE("Path.AroundUnits");
 	FDetachedSearch Detached(*this);
 	FIgnoreObstacle Ignore(*this, IgnoreObstacleID);
 	AvoidSelf = Id;
+	AvoidTest = &IsObstacle;
 	// A vehicle keeps a cell clear of the parked units, so that its body gets past them too; where that finds
 	// no way (or none that gets near the goal), it tries again hard by them.
 	AvoidRadius = Radius > CellSize ? 1 : 0;
@@ -1087,6 +1160,7 @@ bool FGenPathfinder::FindPathAroundUnits(FGenObjectID Id, float Radius, const FV
 		bFound = FindPath(Start, Goal, Surfaces, OutPath, StartLayer, GoalLayer, OutLayers, IgnoreObstacleID);
 	}
 	AvoidSelf = GenInvalidObjectID;
+	AvoidTest = nullptr;
 	AvoidRadius = -1;
 	return bFound;
 }

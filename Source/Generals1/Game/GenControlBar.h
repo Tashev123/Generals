@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "Game/GenInput.h"
 #include "Logic/GenLogicTypes.h"
+#include "Logic/GenCommandData.h"
 
 class AGenPlayerController;
 class FGenObject;
@@ -10,6 +11,7 @@ class UGenGameLogic;
 struct FGenCommandButton;
 struct FGenThingTemplate;
 struct FGenUpgradeTemplate;
+struct FGenBarShape;
 struct FGenControlBarScheme;
 struct FGenWndLayout;
 struct FGenWndWindow;
@@ -20,9 +22,6 @@ enum class EGenBarSystem : uint8
 	None,
 	Options,       // ButtonOptions: the in-game menu
 	IdleWorker,    // ButtonIdleWorker: InGameUI::selectNextIdleWorker
-	Beacon,        // ButtonPlaceBeacon (a multiplayer thing: shown, not usable)
-	Chat,          // PopupCommunicator (likewise)
-	MinMax,        // ButtonLarge: ControlBar::toggleControlBarStage (not in the port: shown, not usable)
 	GeneralsExit,  // GeneralsExpPoints.wnd:ButtonExit
 };
 
@@ -69,9 +68,13 @@ struct FGenBarText
  * Layout of the in-game interface from the game's own layouts (ControlBar.cpp): ControlBar.wnd - the
  * selected object's CommandSet in ButtonCommand01..14, the production queue in ButtonQueue01..09 or the
  * selected unit's portrait and upgrades, the radar in LeftHUD, money and power, the general's button and
- * the bar's own buttons, placed and dressed by the side's ControlBarScheme; the special power shortcut tray
- * (the faction's GenPowersShortcutBar*.wnd); the promotions panel (GeneralsExpPoints.wnd). The 800 x 600
- * layouts are scaled evenly to the screen's height (gen.ControlBarScale) and the bar centred at the bottom.
+ * the bar's own buttons, dressed by the side's ControlBarScheme; the special power shortcuts in a rail of their
+ * own; the promotions panel (GeneralsExpPoints.wnd). The 800 x 600 layouts are scaled evenly to the screen's
+ * height (gen.ControlBarScale), the promotions panel centred. The bar itself is three sections standing apart
+ * (FGenBarShape, the HUD style's): the radar, the commands and the right panel, side by side at the bottom of the
+ * screen (gen.HudSpread); ControlBar.wnd's windows in the command window follow it (WindowRect). The options and idle
+ * worker buttons are the bar's only own buttons: no beacon, no communicator and no minimize button, which never
+ * did anything here.
  * The player controller hit-tests it, the HUD draws it.
  */
 class FGenControlBar
@@ -91,12 +94,20 @@ public:
 	static bool GetGridCell(int32 Slot, int32& OutRow, int32& OutCol);
 	/** Over any part of the interface: a click there never reaches the world. */
 	bool IsOverPanel(const FVector2D& P) const;
+	/** Whether that unit, on the player's side, has that button and can buy the upgrade for itself right now. */
+	static bool CanBuyForItself(const UGenGameLogic* Logic, const FGenObject& Unit, const FGenCommandButton& Button, const FGenUpgradeTemplate& Upgrade);
 	/** A rectangle of the 800 x 600 bar layouts on the screen. */
 	FBox2D ToScreen(const FBox2D& R) const { return FBox2D(BarOrigin + R.Min * double(Scale), BarOrigin + R.Max * double(Scale)); }
+	/** A rectangle in a section's own units (EGenBarPod, FGenBarShape) on the screen. */
+	FBox2D ToPod(int32 Pod, const FBox2D& R) const { return FBox2D(PodOrigin[Pod] + R.Min * double(Scale), PodOrigin[Pod] + R.Max * double(Scale)); }
 
 	float Scale = 1.f;                          // layout pixels -> screen pixels
 	FVector2D BarOrigin = FVector2D::ZeroVector;  // where the layouts' (0, 0) lies on the screen
+	FVector2D PodOrigin[3] = { FVector2D::ZeroVector, FVector2D::ZeroVector, FVector2D::ZeroVector };  // where each section's (0, 0) lies on the screen, on whole pixels
 	const FGenControlBarScheme* Scheme = nullptr;
+	const class FGenHudStyle* Style = nullptr;  // the look chosen in the options
+	const FGenBarShape* Shape = nullptr;        // its sections on the scheme's side
+	FBox2D LampRect = FBox2D(ForceInit);        // WinUAttack: the "under attack" light
 	const FGenWndLayout* Wnd = nullptr;         // ControlBar.wnd
 
 	bool bVisible = false;                      // the command window (something of ours with commands is selected)
@@ -119,7 +130,6 @@ public:
 	FBox2D MoneyRect = FBox2D(ForceInit);
 	FBox2D PowerRect = FBox2D(ForceInit);
 	FBox2D ExpRect = FBox2D(ForceInit);          // GeneralsExp: filled as the rank's experience grows
-	FBox2D ExpForegroundRect = FBox2D(ForceInit);
 
 	// The bar's own buttons
 	TArray<FGenBarButton> SystemButtons;
@@ -142,8 +152,7 @@ public:
 
 	// Special powers that can be fired without selecting their building (the shortcut tray)
 	TArray<FGenBarButton> Shortcuts;
-	TArray<FBox2D> ShortcutTrays;               // ButtonParentN behind each used button
-	FString ShortcutTrayImage;
+	FBox2D ShortcutRail = FBox2D(ForceInit);    // the rail they stand in
 
 	// The radar window and the size of the map it shows
 	FBox2D Radar = FBox2D(ForceInit);
@@ -152,6 +161,8 @@ public:
 	FVector2f RadarMapSize = FVector2f::ZeroVector;
 
 private:
+	/** The selection's command set without the buttons a map's scripts have taken out (COMMANDBAR_REMOVE_BUTTON_OBJECTTYPE). */
+	FGenCommandSet ScriptFilteredSet;
 	void LayoutSelection(UGenGameLogic* Logic, const TArray<FGenObjectID>& Selection);
 	void LayoutRightPanel(UGenGameLogic* Logic, const FGenObject* Obj);
 	void LayoutGenerals(UGenGameLogic* Logic);
@@ -161,10 +172,11 @@ private:
 	void AssignHotkeys();
 	/** Fills in a special power button; false if it should not be shown at all. */
 	bool FillPower(UGenGameLogic* Logic, const FGenObject* Source, FGenBarButton& B) const;
-	/** The screen rectangle of a window of ControlBar.wnd (empty if it isn't there). */
+	/** The screen rectangle of a window of ControlBar.wnd's command window, on the commands' section (empty if it isn't there). */
 	FBox2D WindowRect(const TCHAR* ShortName) const;
-	TArray<FBox2D> InputRects;                  // what of the bar takes the mouse (screen)
-	FBox2D ShortcutArea = FBox2D(ForceInit);
+	/** A command cell by its row and column; the production queue's nine cells by theirs. */
+	FBox2D CommandCell(int32 Row, int32 Col) const;
+	FBox2D QueueCell(int32 Row, int32 Col) const;
 	uint32 IdleWorkerCheckFrame = 0;
 };
 

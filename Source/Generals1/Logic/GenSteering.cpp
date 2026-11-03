@@ -129,12 +129,21 @@ bool FGenObject::UsesSteering() const
 
 bool FGenObject::SteersAround(const FGenObject& O) const
 {
-	if (&O == this || !O.IsGroundUnit() || O.ID == IgnoreObstacle || O.ID == ContactTarget || O.ID == EnterTarget)
+	if (&O == this || !O.IsGroundUnit())
 	{
 		return false;
 	}
 	// One on a bridge and one under it don't meet.
 	if (O.Layer != Layer && FMath::Abs(O.Position.Z - Position.Z) > 10.f)
+	{
+		return false;
+	}
+	return IsObstacleKind(O);
+}
+
+bool FGenObject::IsObstacleKind(const FGenObject& O) const
+{
+	if (O.ID == IgnoreObstacle || O.ID == ContactTarget || O.ID == EnterTarget)
 	{
 		return false;
 	}
@@ -194,8 +203,9 @@ FGenObject::FSteerChoice FGenObject::Steer(const FVector2f& Toward, float DistTo
 		}
 		const bool bOMoving = OVel.SizeSquared() > FMath::Square(0.05f);
 		const bool bSameWay = bOMoving && FVector2f::DotProduct(OVel.GetSafeNormal(), Out.Dir) > 0.5f;
-		// (A parked group mate - it got there first - is soft all the way: it is not sent out of its place for us.)
-		const bool bSoft = !O.bMoving && (bPushingIn || (MoveGroup != 0 && O.MoveGroup == MoveGroup)) && O.CanBePushed()
+		// (A parked group mate - it got there first - is soft all the way: it is not sent out of its place for us.
+		// Not for a soldier: the vehicle doesn't give, and he would be pushed back as far as he came.)
+		const bool bSoft = !Template->bKindInfantry && !O.bMoving && (bPushingIn || (MoveGroup != 0 && O.MoveGroup == MoveGroup)) && O.CanBePushed()
 			&& Logic->GetRelationship(Owner, O.Owner) == EGenRelationship::Allies;
 		Near.Add(FNear{ &O, Foot, OVel, Bound, Overlaps(Me0, Foot), bOMoving, bSameWay, bSoft });
 	});
@@ -348,14 +358,35 @@ FGenObject::FSteerChoice FGenObject::Steer(const FVector2f& Toward, float DistTo
 	}
 
 	// An idle ally sitting in our way within the next second makes way (Pathfinder::moveAllies: "Only move
-	// allies"; soldiers don't move vehicles).
-	if (Hit0.Who != INDEX_NONE && Hit0.T <= 4.f * Dt && !bPushingIn)
+	// allies"; soldiers don't move vehicles - "If this is a general clear operation, don't let infantry push
+	// vehicles": where there is no other way, they do).
+	if (Hit0.Who != INDEX_NONE && Hit0.T <= 4.f * Dt && (!bPushingIn || bPathThroughParked))
 	{
 		FGenObject& B = *Near[Hit0.Who].Obj;
-		if (B.CanMakeWay() && !(Template->bKindInfantry && !B.Template->bKindInfantry)
+		if (B.CanMakeWay() && (bPathThroughParked || !(Template->bKindInfantry && !B.Template->bKindInfantry))
 			&& Logic->GetRelationship(Owner, B.Owner) == EGenRelationship::Allies)
 		{
 			B.MakeWayFor(*this, Out.Dir);
+		}
+	}
+
+	// Set on a way round: it is kept to for a few frames, while it stays open (from frame to frame, each of that and
+	// straight on can look the better one as the turn gets further: choosing anew, a unit would rock on the spot).
+	if (SteerHold > 0 && SteerSide != 0)
+	{
+		const float Widest = Offsets[UE_ARRAY_COUNT(Offsets) - 1];
+		const float Held = FMath::Clamp(GenLogic::AngleDiff(SteerHeading, WantAngle), -Widest, Widest);
+		const FHit HeldHit = Evaluate(WantAngle + Held, PreferredSpeed, bCheckGround);
+		if (HeldHit.T > 2.f * Dt)
+		{
+			if (Hit0.T != FLT_MAX)
+			{
+				--SteerHold;
+			}
+			Out.bSteered = true;
+			Out.Dir = FVector2f(FMath::Cos(WantAngle + Held), FMath::Sin(WantAngle + Held));
+			Out.Speed = HeldHit.SoftT <= 2.f * Dt ? 0.5f * PreferredSpeed : PreferredSpeed;
+			return Out;
 		}
 	}
 

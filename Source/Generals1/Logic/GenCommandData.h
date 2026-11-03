@@ -6,6 +6,7 @@
 /** CommandButton "Command" values that are implemented; everything else is shown but inert. */
 enum class EGenCommand : uint8
 {
+	SelectAllUnitsOfType, // SELECT_ALL_UNITS_OF_TYPE: a mission's shortcut (the carrier)
 	Other,
 	UnitBuild,        // UNIT_BUILD: queue Object at this factory
 	DozerConstruct,   // DOZER_CONSTRUCT: place Object as a building
@@ -93,6 +94,8 @@ public:
 	static FGenCommandData& Get();
 
 	bool Initialize();
+	/** A map's map.ini: ControlBar::parseCommandSetDefinition's overrides, slot by slot over a copy. They last as long as the map. */
+	void ApplyMapIni(const TArray<TSharedPtr<struct FGenIniBlock>>& Blocks);
 
 	const FGenCommandButton* FindButton(const FString& Name) const;
 	const FGenCommandSet* FindSet(const FString& Name) const;
@@ -116,6 +119,7 @@ private:
 	bool bInitialized = false;
 	TMap<FString, FGenCommandButton> Buttons;   // key: lowercase name
 	TMap<FString, FGenCommandSet> Sets;
+	TMap<FString, TOptional<FGenCommandSet>> MapIniSavedSets; // what the loaded map's map.ini replaced (unset: it wasn't there)
 	TMap<FString, FGenMappedImage> Images;
 	TMap<FString, FGenRadiusDecalTemplate> RadiusCursors; // key: the RadiusCursorType, upper case
 	TMap<FString, FString> Strings;             // key: lowercase label

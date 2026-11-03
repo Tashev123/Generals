@@ -29,6 +29,12 @@ class GENERALS1_API UGenFXManager : public UWorldSubsystem
 	GENERATED_BODY()
 
 public:
+	/** SHOW_WEATHER: SnowManager::setVisible. */
+	void SetSnowVisible(bool bVisible) { bSnowVisible = bVisible; }
+	/** W3DView::shake: a jolt of the camera, weaker the further from where it looks (Type: View::CameraShakeType). */
+	void Shake(const FVector3f& Epicenter, int32 Type);
+	/** W3DView::Add_Camera_Shake: a script's shake, of that strength, felt within that radius of the spot. */
+	void ShakeAt(const FVector3f& Epicenter, float Radius, float Amplitude);
 	static UGenFXManager* Get(const UObject* WorldContext);
 
 	virtual bool ShouldCreateSubsystem(UObject* Outer) const override;
@@ -51,7 +57,7 @@ public:
 	/** Particle system that follows an object (projectile exhaust, debris trails). */
 	FGenParticleSystem* CreateAttachedSystem(const FString& TemplateName, FGenObjectID Object);
 	/** A particle system by itself at a spot (the dust where a gunship's bullets land). */
-	void CreateSystemAt(const FString& TemplateName, const FVector3f& Pos);
+	uint32 CreateSystemAt(const FString& TemplateName, const FVector3f& Pos);
 	void OnObjectDestroyed(FGenObjectID Object);
 	/** Stops a system from emitting; it is removed once its particles have died. */
 	void DestroySystem(uint32 SystemID);
@@ -109,11 +115,22 @@ private:
 	void DoNuggetPos(const FGenFXNugget& N, const FVector3f& Primary, const FTransform3f* PrimaryXf, float PrimarySpeed,
 		const FVector3f* Secondary, float OverrideRadius);
 	void AddLightPulse(const FVector3f& Pos, const FLinearColor& Color, float Radius, int32 IncreaseFrames, int32 DecreaseFrames);
-	void Shake(const FVector3f& Epicenter, int32 Type);
 
 	/** Draw batch per texture and shader; bFlat = quads lying on the ground, bSprite = stand-alone quads (not ribbons). */
 	int32 GetBatch(const FString& Texture, EGenParticleShader Shader, bool bFlat, bool bSprite);
 	void RenderParticles();
+	/** W3DSnowManager: Weather.ini and the map's map.ini; flakes fall through a box round the camera. */
+	void LoadWeather();
+	void RenderSnow(const FVector& CamPos, const FVector& Right, const FVector& Up, const FVector& Forward, double TanX, double TanY);
+	struct FSnow
+	{
+		bool bEnabled = false;
+		FString Texture;
+		float BoxDimensions = 200.f, Density = 1.f, FrequencyScaleX = 0.0533f, FrequencyScaleY = 0.0275f, Amplitude = 5.f;
+		float Velocity = 4.f, PointSize = 1.f, MaxPointSize = 64.f, MinPointSize = 0.f;
+		TArray<float> StartingHeights; // SNOW_NOISE_X * SNOW_NOISE_Y
+	} Snow;
+	bool bSnowVisible = true;
 	void FlushBatches();
 	void UpdateLights();
 	void UpdateSway();

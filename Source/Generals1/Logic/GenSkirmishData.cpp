@@ -215,6 +215,7 @@ void GenScriptIO::ReadTeamProto(const FGenDict& D, FGenTeamProto& T)
 	T.TransportUnitType = DictString(D, TEXT("teamTransport"));
 	T.bStartsFull = DictBool(D, TEXT("teamStartsFull"));
 	T.bTransportsReturn = DictBool(D, TEXT("teamTransportsReturn"));
+	T.bTransportsExit = DictBool(D, TEXT("teamTransportsExit"));
 }
 
 FGenScriptLibrary& FGenScriptLibrary::Get()
@@ -326,6 +327,29 @@ void FGenAIData::Initialize()
 	TArray<TSharedPtr<FGenIniBlock>> Blocks;
 	GenIni::ParseFile(TEXT("Data\\INI\\Default\\AIData.ini"), Blocks);
 	GenIni::ParseFile(TEXT("Data\\INI\\AIData.ini"), Blocks);
+	ApplyBlocks(Blocks);
+	UE_LOG(LogGenerals, Log, TEXT("AIData: build lists for %d sides"), BuildLists.Num());
+}
+
+void FGenAIData::ApplyMapIni(const TArray<TSharedPtr<FGenIniBlock>>& Blocks)
+{
+	// TheAI's parseAiDataDefinition with INI_LOAD_CREATE_OVERRIDES: a map's own numbers, gone again with the map.
+	Initialize();
+	if (MapIniSaved.IsValid())
+	{
+		const TSharedPtr<FGenAIData> Saved = MapIniSaved;
+		*this = *Saved;
+		MapIniSaved.Reset();
+	}
+	if (Blocks.ContainsByPredicate([](const TSharedPtr<FGenIniBlock>& B) { return B->Keyword.Equals(TEXT("AIData"), ESearchCase::IgnoreCase); }))
+	{
+		MapIniSaved = MakeShared<FGenAIData>(*this);
+		ApplyBlocks(Blocks);
+	}
+}
+
+void FGenAIData::ApplyBlocks(const TArray<TSharedPtr<FGenIniBlock>>& Blocks)
+{
 	for (const TSharedPtr<FGenIniBlock>& B : Blocks)
 	{
 		if (!B->Keyword.Equals(TEXT("AIData"), ESearchCase::IgnoreCase))
@@ -346,6 +370,7 @@ void FGenAIData::Initialize()
 		GuardInnerModifierHuman = B->GetFloat(TEXT("GuardInnerModifierHuman"), GuardInnerModifierHuman);
 		GuardOuterModifierHuman = B->GetFloat(TEXT("GuardOuterModifierHuman"), GuardOuterModifierHuman);
 		MaxRecruitRadius = B->GetFloat(TEXT("MaxRecruitRadius"), MaxRecruitRadius);
+		AttackPriorityDistanceModifier = B->GetFloat(TEXT("AttackPriorityDistanceModifier"), AttackPriorityDistanceModifier);
 		SkirmishBaseDefenseExtraDistance = B->GetFloat(TEXT("SkirmishBaseDefenseExtraDistance"), SkirmishBaseDefenseExtraDistance);
 		SupplyCenterSafeRadius = B->GetFloat(TEXT("SupplyCenterSafeRadius"), SupplyCenterSafeRadius);
 		MinInfantryForGroup = B->GetInt(TEXT("MinInfantryForGroup"), MinInfantryForGroup);
@@ -406,5 +431,4 @@ void FGenAIData::Initialize()
 			}
 		}
 	}
-	UE_LOG(LogGenerals, Log, TEXT("AIData: build lists for %d sides"), BuildLists.Num());
 }

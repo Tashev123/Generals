@@ -31,6 +31,7 @@ struct GENERALS1_API FGenMatchSettings
 	// scripts, not from slots. DefaultDifficulty is the campaign's difficulty.
 	FString Campaign;               // "USA"; empty: a skirmish
 	FString Mission;                // "Mission01"
+	FString ChallengeFaction;       // the Generals' Challenge: the general the local player plays (the map's "ThePlayer" is a dummy)
 	int32 StartingCash = 10000;
 	int32 Seed = 0;                 // the simulation's random numbers
 	TArray<FGenSkirmishSlot> Slots;
@@ -103,4 +104,47 @@ struct GENERALS1_API FGenReplay
 	/** One line per frame: "frame checksum" (for comparing two runs outside the game). */
 	bool SaveChecksumLog(const FString& Path) const;
 	static FString GetDefaultFolder();
+};
+
+/** What the list of saved games shows of one. */
+struct GENERALS1_API FGenSaveInfo
+{
+	FString Path;
+	FString Title;   // "USA Mission03", "Skirmish: Tournament Desert"
+	FString Date;    // as the player reads it
+	FString SortKey; // when, for the newest to come first
+	uint32 Frame = 0;
+};
+
+/**
+ * A saved game: the game as it was played so far (a replay), where it had got to, and what the player was looking at.
+ * Loading plays it again, flat out behind the loading screen - the same settings and the same orders make the same
+ * game, down to the last random number - and goes on from there. So a saved game is small, comes back exactly as it
+ * was left, and takes longer to load the longer it was played. Like a replay, it belongs to this build of the game.
+ */
+struct GENERALS1_API FGenSavedGame
+{
+	static constexpr uint32 Magic = 0x53564547; // "GEVS"
+	static constexpr uint32 Version = 1;
+
+	FString Title;
+	FString Date;
+	FString SortKey;
+	uint32 Frame = 0;
+	FVector CameraTarget = FVector::ZeroVector;
+	float CameraYaw = 0.f;
+	float CameraHeight = 0.f;
+	TArray<FGenObjectID> Selection;
+	TArray<FGenObjectID> Groups[10];
+	FGenReplay Replay;
+
+	bool Save(const FString& Path);
+	bool Load(const FString& Path, FString* OutWhy = nullptr);
+	static FString GetFolder();
+	/** The saved games there are, newest first. */
+	static void List(TArray<FGenSaveInfo>& Out);
+	static void Delete(const FString& Path);
+
+private:
+	void SerializeHeader(FArchive& Ar);
 };

@@ -22,17 +22,23 @@ struct GENERALS1_API FGenCursorImage
 	/** The step showing that long after the cursor came up. */
 	int32 StepAt(double Seconds) const;
 
-	// The platform's cursors made of the frames (when first shown, at the scale wanted then).
-	TArray<void*> Handles;
-	int32 HandleScale = 0;
+	// The platform's cursors made of the frames (when first shown, at the scale wanted then): each step, and between
+	// it and the next one as many pictures of the two faded together as it has room for, so that it moves smoothly.
+	struct FSmoothStep
+	{
+		void* Handle = nullptr;
+		float Seconds = 0.f;
+	};
+	TArray<FSmoothStep> Smooth;
+	float HandleScale = 0.f;
 };
 
 /**
  * The mouse cursors: Mouse.ini says which picture each kind of cursor has ("Select" -> SCCSelect, "Scroll"
  * in eight directions), the pictures are the animated cursor files the original hands to Windows
  * (Win32Mouse: LoadCursorFromFile("data\\cursors\\%s.ANI")). Here they are read, made into the
- * platform's cursors frame by frame - so they can be shown at twice or three times their 32 pixels on
- * a screen with many more than the original's - and animated by the file's own timing.
+ * platform's cursors frame by frame - so they can be shown larger than their 32 pixels on a screen with
+ * many more than the original's - and animated by the file's own timing, faded from picture to picture.
  */
 class FGenCursors
 {
@@ -58,7 +64,7 @@ public:
 	const FString& GetCurrentName() const { return CurrentName; }
 	const FGenCursorImage* GetCurrent(int32& OutFrame) const;
 	/** How many screen pixels a pixel of the cursor takes, on a screen that high (gen.CursorScale: 0 = by the screen). */
-	static int32 GetScale(int32 ViewportHeight);
+	static float GetScale(int32 ViewportHeight);
 
 private:
 	void Initialize();

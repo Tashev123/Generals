@@ -42,6 +42,8 @@ public:
 	/** No new sounds while this is set (a network game catching up runs minutes of the match in a second: their
 	 *  sounds would all come at once). The loops of what goes on are kept track of all the same. */
 	void SetSuspended(bool bInSuspended) { bSuspended = bInSuspended; }
+	/** Every sound and speech playing now stops (the music goes on). */
+	void StopAllVoices();
 	bool bSuspended = false;
 
 	// --- AudioManager::addAudioEvent ---
@@ -51,6 +53,8 @@ public:
 	uint32 PlayAt(const FString& Event, const FVector3f& Pos, int32 Player = INDEX_NONE);
 	/** A sound that isn't in the world (interface, notifications). */
 	uint32 PlayUI(const FString& Event, int32 Player = INDEX_NONE);
+	/** ScriptActions::doSpeechPlay: without overlap it is uninterruptable - all other speech stops, and none is taken until it is over. */
+	uint32 PlaySpeech(const FString& Event, bool bAllowOverlap);
 	void Stop(uint32 Handle);
 	bool IsPlaying(uint32 Handle) const;
 
@@ -76,6 +80,36 @@ public:
 	void StartShell(AGenMapActor* InMapActor);
 	/** One track, round and round, instead of the game's own (the score screen's). */
 	void PlayTrackOnly(const FString& Track);
+
+	// --- what a map's scripts ask for ---
+	/** MUSIC_SET_TRACK: that track, once (the scripts choose the next). */
+	void PlayScriptTrack(const FString& Track);
+	/** MUSIC_SET_VOLUME / SOUND_SET_VOLUME (0..1, on top of the player's). */
+	void SetScriptMusicVolume(float Volume) { ScriptMusicVolume = FMath::Clamp(Volume, 0.f, 1.f); ApplyUserVolumes(); }
+	void SetScriptSoundVolume(float Volume) { ScriptSoundVolume = FMath::Clamp(Volume, 0.f, 1.f); ApplyUserVolumes(); }
+	/** AudioManager::setAudioEventVolumeOverride: AUDIO_OVERRIDE_VOLUME_TYPE, and SOUND_DISABLE_TYPE at 0: that event plays at this
+	 *  volume, what plays of it now too. Below 0: as it should again (AUDIO_RESTORE_VOLUME_TYPE, SOUND_ENABLE_TYPE). */
+	void SetScriptEventVolume(const FString& Event, float Volume);
+	/** AUDIO_RESTORE_VOLUME_ALL_TYPE / SOUND_ENABLE_ALL */
+	void ClearScriptEventVolumes() { ScriptEventVolumes.Reset(); }
+	/** SOUND_REMOVE_ALL_DISABLED (removeAllDisabledAudio): what plays at no volume stops. */
+	void StopDisabledVoices();
+	/** Eva::setEvaEnabled: "clear out any waiting messages", and none are taken while it is off. */
+	void SetEvaEnabled(bool bEnabled) { bEvaEnabled = bEnabled; EvaPending.Reset(); }
+	/** SOUND_REMOVE_TYPE: the plays of that event that are going now are taken off. The event itself stays
+	 *  enabled, so a script may ask for it again later (AudioManager::removeAudioEvent -> removePlayingAudio). */
+	void RemoveEvent(const FString& Event)
+	{
+		const FString Key = Event.ToLower();
+		Delayed.RemoveAll([&Key](const FRequest& R) { return R.Info && R.Info->Name.Equals(Key, ESearchCase::IgnoreCase); });
+		for (int32 i = Voices.Num() - 1; i >= 0; --i)   // StopVoiceAt takes the entry out, so go backwards
+		{
+			if (Voices[i].Info && Voices[i].Info->Name.Equals(Key, ESearchCase::IgnoreCase))
+			{
+				StopVoiceAt(i);
+			}
+		}
+	}
 
 	/**
 	 * The player's volumes (the options' audio page), 0..1 each, on top of the original's own: the music;
@@ -103,6 +137,7 @@ private:
 		FVector3f Pos = FVector3f::ZeroVector;
 		int32 Player = INDEX_NONE;
 		bool bManagedLoop = false;      // an object's loop: plays until released
+		bool bUninterruptable = false;  // AudioEventRTS::setUninterruptable: the scripts' speech that allows no overlap
 		double FireTime = 0.0;          // for delayed requests
 	};
 
@@ -232,6 +267,11 @@ private:
 	// Music
 	FString MusicPrefix;                // "Game_USA_": the local side's tracks
 	FString LoopTrack;                  // instead of those: this one, again and again
+	float ScriptMusicVolume = 1.f;
+	float ScriptSoundVolume = 1.f;
+	TMap<FString, float> ScriptEventVolumes;
+	bool bEvaEnabled = true;
+	uint32 UninterruptableSpeech = 0;   // AudioManager::getDisallowSpeech: the voice, while it plays
 	int32 MusicTrackNumber = 0;
 	double MusicNextStart = 0.0;
 	FString MusicPlaying;

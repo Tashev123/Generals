@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Logic/GenCommand.h"
 #include "Logic/GenConditions.h"
 #include "Logic/GenLogicTypes.h"
 #include "Logic/GenShroud.h"
@@ -36,6 +37,7 @@ struct FGenWeaponInstance
 	TArray<int32, TInlineAllocator<12>> ScatterUnused; // ScatterTarget entries not yet used this clip (Weapon::m_scatterTargetsUnused)
 	int32 CurBarrel = 0;            // which launch bone the next shot leaves from
 	int32 ShotsForCurBarrel = 0;
+	bool bLeechRangeActive = false; // Weapon::m_leechWeaponRangeActive: fired once, it reaches its victim wherever that goes
 };
 
 /** Projectile flight state (DumbProjectileBehavior / MissileAIUpdate). */
@@ -85,6 +87,7 @@ enum class EGenAIMode : uint8
 	None,
 	Hunt,         // seek out and attack the closest enemy, wherever it is, again and again
 	Guard,        // hold a spot: attack what comes inside the guarded radius, then return
+	AttackArea,   // inside a map area: attack whatever is inside it; with nothing there, be idle until asked again
 	FollowPath,   // move along a list of points, then be idle
 	AttackMove,   // move to a spot, stopping to fight whatever comes into view on the way
 };
@@ -279,6 +282,8 @@ struct FGenParkingInfo
 	FVector3f RunwayEnd = FVector3f::ZeroVector;
 	FVector3f RunwayApproach = FVector3f::ZeroVector;   // in the air beyond the far end: landings start here
 	FVector3f RunwayExit = FVector3f::ZeroVector;       // ... and takeoffs end here
+	FVector3f RunwayLandingStart = FVector3f::ZeroVector; // a deck's strip for coming down (an airfield lands on its runway)
+	FVector3f RunwayLandingEnd = FVector3f::ZeroVector;
 	FVector3f HangarInternal = FVector3f::ZeroVector;
 	float HangarInternalOrient = 0.f;
 	float RunwayTakeoffDist = 0.f;
@@ -297,7 +302,8 @@ public:
 		FVector3f Location = FVector3f::ZeroVector;
 		float Orient = 0.f;
 		FVector3f Prep = FVector3f::ZeroVector;
-		int32 Runway = 0;
+		int32 Runway = 0;                   // which runway this space is on (a deck's column)
+		int32 Row = 0;                      // how far back from the start of that runway
 		FGenObjectID Occupant = GenInvalidObjectID;
 		bool bReservedForExit = false;      // an aircraft being built will get this space
 		uint8 DoorState = 0;                // hangar door: 0 closed, 1 opening, 2 open, 3 closing
@@ -307,9 +313,20 @@ public:
 	{
 		FVector3f Start = FVector3f::ZeroVector;
 		FVector3f End = FVector3f::ZeroVector;
-		FGenObjectID InUseBy = GenInvalidObjectID;
+		FGenObjectID InUseBy = GenInvalidObjectID;           // (on a deck: m_inUseByForTakeoff)
+		FGenObjectID InUseForLanding = GenInvalidObjectID;   // a deck: the one coming down on this runway's strip, whoever is taking off
 		FGenObjectID NextInLineForTakeoff = GenInvalidObjectID;
 		bool bWasInLine = false;
+		FVector3f LandingStart = FVector3f::ZeroVector;      // a deck's strip for coming down
+		FVector3f LandingEnd = FVector3f::ZeroVector;
+		TArray<FVector3f> Taxi;                              // from the end of that strip to the parked planes
+		TArray<FVector3f> Creation;                          // from the hangar's lift to them
+		float StartOrient = 0.f;                             // how a new plane comes up
+		// A deck works one aircraft at a time per runway: the ramp goes up, the plane at the front of the
+		// runway goes when it is up, and the next one can follow after the wave delay. (FlightDeckBehavior's
+		// m_rampUp / m_rampUpFrame / m_nextLaunchWaveFrame / m_lowerRampFrame / m_catapultSystemFrame.)
+		bool bRampUp = false;
+		uint32 RampUpFrame = 0, LowerRampFrame = 0, NextWaveFrame = 0, CatapultFrame = 0;
 	};
 
 	FGenParkingPlace(FGenObject& InAirfield, UGenGameLogic* InLogic) : Airfield(InAirfield), Logic(InLogic) {}
@@ -343,11 +360,55 @@ public:
 	bool GetHeliPark(FVector3f& OutPos, float& OutAngle);
 	const TArray<FSpace>& GetSpaces() const { return Spaces; }
 	const TArray<FRunway>& GetRunways() const { return Runways; }
+	/** LandingDeckHeightOffset: for a ship's deck this is the height of the deck over the water; for an
+	 *  airfield it is 0 and the ground is the ground. */
+	float GetLandingDeckHeightOffset() const;
+	/** Whether this place is a ship's flight deck rather than an airfield's yard. */
+	bool IsFlightDeck() const;
+	/** The ship this place is on: an order given to it is the deck's order, one given to a plane is not. */
+	FGenObjectID GetAirfieldID() const;
+	/** FlightDeckBehavior::calcBestParkingAssignment: the aircraft takes the frontmost space of its runway with no plane
+	 *  parked between it and that space; OutPos is where it is to stand now. Whether it was moved up. */
+	bool CalcBestParkingAssignment(FGenObjectID Id, FVector3f& OutPos);
+	/** The way from the end of the landing strip, and from the hangar's lift, for the runway of this aircraft's space. */
+	const TArray<FVector3f>* GetTaxiLocations(FGenObjectID Id) const;
+	const TArray<FVector3f>* GetCreationLocations(FGenObjectID Id) const;
+	/** The user's word: a cut scene's flying is over when the player gets the game. Every plane of the deck stands in its
+	 *  space, reloaded, with no orders; the deck has none either. (Under the fade that ends the scene.) */
+	void ParkAllPlanes();
+	/** FlightDeckBehavior::exitObjectViaDoor: the first free space goes to the new plane. Where it comes up, and how. */
+	bool TakeFirstFreeSpace(FGenObjectID Id, FVector3f& OutPos, float& OutAngle);
+	/** FlightDeckBehavior::aiDoCommand: a ship's deck has no AI of its own ("a dumb stump that only
+	 *  propagates orders to its aircraft"), so the order a player gives the ship is kept here and passed on
+	 *  to whatever is standing on the deck, one plane at a time. Returns whether this place is a deck and
+	 *  took the order. */
+	bool OrderDeck(EGenCommandType Type, const FVector3f& Pos, FGenObjectID Target, int32 Slot = 0);
 
 private:
 	void BuildInfo();
 	void PurgeDead();
 	void UpdateDoors(uint32 Frame);
+	// A deck's own work (FlightDeckBehavior): what it was ordered to do, the waves it sends, and the
+	// periodic tidy-up that moves a plane forward into a space nearer the start of its runway.
+	EGenCommandType DeckOrder = EGenCommandType::None;
+	FVector3f DeckPos = FVector3f::ZeroVector;
+	FGenObjectID DeckTarget = GenInvalidObjectID;
+	bool DeckOrderIsPosition = false;         // the order points at a place, not at a thing
+	int32 DeckSlot = 0;                       // the weapon slot the order came with
+	uint32 NextCleanupFrame = 0;
+	bool HasTakeoffOrders();
+	bool IsPlaneStandingInItsSpace(const FGenObject& Jet) const; // isIdle or isTaxiingToParking
+	bool CanPlaneGiveUpSpace(FGenObject* Jet);          // isAbleToGiveUpParkingSpace
+	bool CanPlaneMoveForward(const FGenObject& Jet) const; // isAbleToMoveForward
+	bool IsPlaneAtTakeoffPosition(const FGenObject& Jet) const; // isInPositionToTakeoff
+	void PropagateOrderToPlane(FGenObject* Jet);        // propagateOrderToSpecificPlane
+	void PropagateOrdersToPlanes();
+	FSpace* FrontSpace(int32 Runway);                   // the space at the start of a runway: the ramp
+	void LaunchPlanes(uint32 Frame);
+	void MovePlanesForward(uint32 Frame);
+	void ReplaceLostPlanes(uint32 Frame);               // "Handle automatic production of lost aircraft."
+	uint32 NextReplacementFrame = 0;
+	void SetRampState(int32 Runway, bool bUp);          // the deck's ramps are the game's DOOR_2 / DOOR_3 states
 	FSpace* FindSpace(FGenObjectID Id);
 	FSpace* FindEmptySpace();
 	bool IsGone(FGenObjectID Id) const;
@@ -389,6 +450,13 @@ public:
 	int32 GetLayer() const { return Layer; }
 	/** The height of that at the object's spot (TerrainLogic::getLayerHeight). */
 	float GetSurfaceHeight() const;
+	/** ... at any point. */
+	float GetSurfaceHeightAt(float X, float Y) const;
+	/** ... plus the deck height offset: for an aircraft parked on a flight deck the deck, not the water, is what
+	 *  its feet are on (PhysicsUpdate's ground clamp counts the deck). */
+	float GroundHeightAt(float X, float Y) const;
+	/** Object::getCarrierDeckHeight: the deck height of the parking place this object was built on. */
+	float GetCarrierDeckHeight() const;
 	float GetOrientation() const { return Orientation; }
 	void SetPosition(const FVector3f& P) { Position = P; }
 	/** Sets the heading; pitch and roll are reset (the object stands upright). */
@@ -611,6 +679,8 @@ public:
 	/** bInFlight: a missile in the air may be hit too (a point defense laser shooting it down). */
 	/** DamageFXType: what is shown for it instead of DamageType's effects (m_damageFXOverride - a dose of poison is unresistable damage). */
 	void AttemptDamage(float Amount, const FString& DamageType, const FString& DeathType, FGenObjectID Source, bool bInFlight = false, const TCHAR* DamageFXType = nullptr);
+	/** A weapon's blast throws it about: FromBlast is the way from where the blast came from to it. */
+	void ApplyShockWave(const FVector3f& FromBlast, const FGenWeaponTemplate& W);
 	/** Body::attemptHealing: health back, up to the maximum; the damage state follows. */
 	void AttemptHealing(float Amount);
 	/** Turret angle relative to the body (radians) for turret slot 0/1, and previous frame value. */
@@ -626,10 +696,25 @@ public:
 	bool bMapAmbientOverride = false;     // "objectSoundAmbient": this sound instead of the template's (empty: none)
 	FString MapAmbientSound;
 	int8 MapAmbientEnabled = -1;          // "objectSoundAmbientEnabled": 0 off, 1 on, -1 not said
+	uint32 MapAmbientScriptCount = 0;     // how many times the scripts have switched it (ENABLE_OBJECT_SOUND starts it, each time)
 	// What a map's scripts know and set (Object::setName, BodyModule::setIndestructible, DISABLED_HELD).
 	FString ScriptName;
 	bool bIndestructible = false;         // takes no damage, and can't be killed
+	bool bScriptTargetable = false;       // OBJECT_STATUS_SCRIPT_TARGETABLE: the map says a player may attack it though it is no enemy
+	bool bScriptDisabled = false;         // OBJECT_STATUS_SCRIPT_DISABLED / SCRIPT_UNPOWERED
+	bool bScriptUnsellable = false;       // OBJECT_STATUS_SCRIPT_UNSELLABLE
+	float MapVisionRange = -1.f;          // objectVisualRange: the map's, instead of the template's
 	bool bScriptHeld = false;             // DISABLED_HELD: stands where it is, does nothing
+	bool bScriptUnstealthed = false;      // OBJECT_STATUS_SCRIPT_UNSTEALTHED: NAMED_SET_STEALTH_ENABLED off
+	FLinearColor CustomIndicatorColor = FLinearColor::Transparent; // Object::setCustomIndicatorColor: NAMED_CUSTOM_COLOR
+	bool bCustomIndicatorColor = false;
+	int32 PlayerWhoEntered = INDEX_NONE;  // OpenContain::getPlayerWhoEntered: the last player to come in
+	int8 ScriptAttitude = 0;              // AIUpdateInterface::getAttitude: -2 sleep, -1 passive, 0 normal, 1 alert, 2 aggressive
+	bool IsFiringWeaponForScripts() const { return IsFiringWeaponStatus(); }
+	/** Player::setUnitsShouldIdleOrResume(false): an idle supply truck goes back to gathering. */
+	void ResumeSupplyTrucking();
+	/** getNextMoodTarget's reach for an alert or aggressive unit: an enemy past its weapons, that it would go after. */
+	FGenObject* FindMoodTarget() const;
 	uint8 EvacDisposition = 0;            // ContainModuleInterface::setEvacDisposition: 0 as usual, 1 out to the left, 2 to the right
 	// BodyModule::getLastDamageInfo: who hurt it last (the scripts' "attacked by").
 	FGenObjectID LastDamageSource = GenInvalidObjectID;
@@ -672,11 +757,24 @@ public:
 	float GetDrawConstructionPercent() const { return (bUnderConstruction || SellFrame != 0) ? ConstructionPercent : -1.f; }
 	/** Drawable::setAnimationLoopDuration, asked for by the logic: whatever the object's models are playing is to take that many frames. */
 	uint32 GetDrawAnimDurationVersion() const { return DrawAnimDurationVersion; }
+	/** Drawable::setSecondMaterialPassOpacity( 1.0f ): when a detector last looked it over (0: never). */
+	uint32 GetHeatVisionFrame() const { return HeatVisionFrame; }
+	/** Object::getSafeOcclusionFrame: until then it isn't shown behind buildings (just made, just out of one). */
+	uint32 GetSafeOcclusionFrame() const { return SafeOcclusionFrame; }
+	/** StealthUpdate::update: "Opacity ranges from full to none at midpoint and full again at the end" of a disguise's change; < 0: no change under way. */
+	float GetDisguiseOpacity() const
+	{
+		return DisguiseFramesLeft > 0 ? FMath::Abs(1.f - 2.f * (1.f - float(DisguiseFramesLeft) / float(FMath::Max(1, DisguiseFramesTotal)))) : -1.f;
+	}
 	int32 GetDrawAnimDurationFrames() const { return DrawAnimDurationFrames; }
 	/** Drawable::getShouldAnimate: nothing moves on what is shut down; on a building short of power only where the module says so. */
 	bool ShouldAnimate(bool bConsiderPower) const;
 	/** DISABLED_UNDERPOWERED: a thing of the POWERED kind whose owner hasn't the power for it. */
 	bool IsUnderpowered() const { return bUnderpowered; }
+	/** Drawable::drawDisabled: hacked, paralyzed, hit by an EMP, subdued or without power - the lightning over it. */
+	bool ShowsDisabledIcon() const;
+	/** ActiveBody::getLastHealingTimestamp */
+	uint32 GetLastHealingFrame() const { return LastHealingFrame; }
 	const TArray<FProduction>& GetProductionQueue() const { return Production; }
 	/** The building this dozer is constructing (or on its way to). */
 	FGenObjectID GetBuildTarget() const { return BuildTarget; }
@@ -703,7 +801,8 @@ public:
 	/** AIUpdateInterface::aiEnter: go to the container and get in. */
 	void CommandEnter(FGenObject& Container);
 	/** AIUpdateInterface::aiExit: leave the container as soon as its door is free. */
-	void CommandExit() { bWantsExit = ContainedBy != GenInvalidObjectID; }
+	/** (AIUpdateInterface::privateExit: "if ( objectToExit->isDisabledByType( DISABLED_SUBDUED ) ) return": a knocked-out transport keeps them in.) */
+	void CommandExit();
 	bool WantsToExit() const { return bWantsExit; }
 	void SetOwner(int32 NewOwner);
 	EGenChinookFlight GetChinookFlight() const { return ChinookFlight; }
@@ -725,6 +824,7 @@ public:
 	// --- stealth (GenStealth.cpp) ---
 	/** OBJECT_STATUS_STEALTHED: its enemies can't see or target it, unless it is detected. */
 	bool IsStealthed() const { return bStealthed; }
+	bool HasTurretJustFired(int32 T, uint32 Frame) const { return TurretFiredUntil[T] > Frame; }
 	/** OBJECT_STATUS_DETECTED: a detector nearby is showing it up. */
 	bool IsDetected() const { return bDetected; }
 	bool IsStealthedAndUndetected() const { return bStealthed && !bDetected && !bDead; }
@@ -782,7 +882,12 @@ public:
 	void CommandHunt();
 	/** Guards a spot; Radius is how far out enemies are engaged (0 = this unit's own guard range), Area limits it to a map area. */
 	void CommandGuard(const FVector2f& Pos, float Radius, const FGenPolygonTrigger* Area = nullptr);
-	void CommandFollowPath(const TArray<FVector2f>& Points);
+	/** AIAttackAreaState: hunt inside a map area. It does not hold a post; it goes after whatever is inside the
+	 *  area, and with nothing there it stops being ordered (the scripts that want it kept hunting re-order it). */
+	void CommandAttackArea(const FGenPolygonTrigger* Area);
+	/** Follows a route point by point. LoopBackTo is where a route comes back to - a waypoint path whose last point
+	 *  links into the path (AIFollowWaypointPathState never reaches the end of that); -1: the route ends. */
+	void CommandFollowPath(const TArray<FVector2f>& Points, int32 LoopBackTo = -1);
 	/** AIStateMachine::addToGoalPath: already on its way along a route - one more point at its end (false: it isn't). */
 	bool AppendToRoute(const FVector2f& Point);
 	/** The route it is following (AIFollowPathState's goal path) and the next point of it; none: an empty list. */
@@ -881,10 +986,21 @@ public:
 	/** Drawable::flashAsSelected: lights up for a moment. */
 	void FlashAs(const FLinearColor& Color) { FlashColor = Color; FlashFrame = Logic ? GetFlashNow() : 0; }
 	uint32 GetFlashFrame() const { return FlashFrame; }
+	/** DeliverPayloadAIUpdate::deliverPayloadViaModuleData: drops what rides in it over that spot, and heads off the map. */
+	void StartRiderDelivery(const FVector3f& Target);
+	/** aiMoveToAndEvacuate(AndExit): flies there, lands, everybody out at once, and (with the exit) goes back where it came from. */
+	void CommandMoveAndEvacuate(const FVector3f& Destination, bool bThenLeave);
+	/** Object::reloadAllAmmo(TRUE) */
+	void ReloadAllAmmo();
 	/** Flying a delivery for a special power (DeliverPayloadAIUpdate). */
 	bool IsDelivering() const { return Delivery.IsValid(); }
 	/** Knocked out for the time being (an EMP, or somebody hacking it). */
 	bool IsDisabled() const;
+	bool IsScriptTargetable() const { return bScriptTargetable; }
+	bool IsScriptUnsellable() const { return bScriptUnsellable; }
+	/** DISABLED_SUBDUED (ActiveBody::isSubdued): as much subdual damage as it has health: a microwave has knocked it out. */
+	bool IsSubdued() const { return Template_SubdualCap() > 0.f && CurrentSubdual >= MaxHealth; }
+	float Template_SubdualCap() const;
 	void DisableUntil(uint32 Frame) { DisabledUntilFrame = FMath::Max(DisabledUntilFrame, Frame); }
 	/** DISABLED_EMP: as DisableUntil, and with the sound of a building or vehicle losing its power. */
 	void EMPUntil(uint32 Frame) { DisableUntil(Frame); EMPUntilFrame = FMath::Max(EMPUntilFrame, Frame); }
@@ -907,6 +1023,8 @@ public:
 	/** StickyBombUpdate::detonate */
 	void DetonateStickyBomb();
 	FGenObjectID GetStickyTarget() const { return StickyTarget; }
+	/** LifetimeUpdate: the frame it goes (0: it doesn't). A sticky bomb with one is a timed bomb. */
+	uint32 GetLifetimeDieFrame() const { return LifetimeDieFrame; }
 	/** How many charges (or whatever it makes) this ability has out there. */
 	int32 GetAbilityObjectCount(int32 InAbility) const;
 	/** SpecialAbilityUpdate::findSpecialObjectWithProducerID: one of them sits on that target. */
@@ -962,6 +1080,11 @@ private:
 	TArray<bool> UpgradeModuleDone;        // parallel to the template's UpgradeModules
 	TArray<FString> SetFlags;              // weapon / armor set flags in force (PLAYER_UPGRADE)
 	TArray<FString> BonusConditions;       // weapon bonus conditions in force (PLAYER_UPGRADE)
+public:
+	bool HasBonusCondition(const TCHAR* Condition) const { return BonusConditions.Num() > 0 && BonusConditions.Contains(Condition); }
+private:
+	FString DifficultyBonusCondition;      // the SOLO_* one it has (none: it isn't receiving the difficulty's bonuses)
+	float DifficultyHealthFactor = 1.f;    // ... and what its health was multiplied by with it
 	bool bArmorUpgraded = false;
 	bool bLocoUpgraded = false;            // SET_NORMAL_UPGRADED replaces SET_NORMAL
 	bool bPowerPlantUpgraded = false;
@@ -1084,7 +1207,10 @@ private:
 	TArray<TPair<FString, bool>> SubObjectOverrides;
 	uint32 SubObjectVersion = 0;
 	bool bAutoHealActive = false;
+	bool bVeterancyAutoHealActive = false; // the self-repair of an elite or heroic unit
+	uint32 NextVeterancyAutoHealFrame = 0;
 	bool bAutoHealDone = false;            // SingleBurst has fired
+	void PulseAutoHeal(const struct FGenAutoHeal& H, uint32 Frame);
 	uint32 NextAutoHealFrame = 0;
 
 	// --- special powers ---
@@ -1115,6 +1241,7 @@ private:
 	bool bHackAgain = false;               // told to hack while still packing up: it unpacks again when done
 	bool bHackInterrupt = false;           // an order has come in (even one to stop)
 	uint32 HackedUntilFrame = 0;
+	uint32 LastHealingFrame = MAX_uint32;  // ("So we don't think we just got healed on the first frame")
 	bool bBoobyTrapped = false;
 	FGenObjectID StickyTarget = GenInvalidObjectID; // StickyBombUpdate: what the charge sits on
 	uint32 StickyNextPingFrame = 0;
@@ -1178,6 +1305,7 @@ private:
 	/** False when the object was dealt with here (deleted, went off, hangs under a parachute). */
 	bool UpdatePayload(uint32 Frame);
 	void DropPayloadItem(uint32 Frame);
+	void DropRider(uint32 Frame);
 	void FireVisiblePayload(uint32 Frame);
 	uint32 DisabledUntilFrame = 0;         // EMP: no moving, shooting or building until then
 	uint32 EMPUntilFrame = 0;              // ... of that, what an EMP did (leaflets and a lost master make no sound)
@@ -1200,6 +1328,9 @@ private:
 	void TakeBackBattlePlan();
 	/** ActiveBody::setMaxHealth with its MaxHealthChangeType. */
 	void ChangeMaxHealth(float NewMax, const FString& ChangeType);
+	/** Object::setReceivingDifficultyBonus (Player::friend_applyDifficultyBonusesForObject): a campaign's health and weapon
+	 *  bonuses for its difficulty and for who plays, GameData's Human / AISoloPlayerHealthBonus_* and SOLO_* WeaponBonus. */
+	void SetReceivingDifficultyBonus(bool bReceive);
 	/** TurretAI::recenterTurret, one frame of it; true once every turret rests at its natural angle and pitch. */
 	bool RecenterTurrets();
 	float DamageScalar = 1.f;              // ActiveBody::m_damageScalar (hold the line)
@@ -1216,6 +1347,7 @@ private:
 	FGenObjectID ParachuteRider = GenInvalidObjectID; // ParachuteContain: who hangs under this parachute
 	bool bHeldByParachute = false;         // ... and the rider: hidden from orders until it lands
 	bool bChuteOpen = false;               // the free fall is over
+	float ChutePitch = 0.f, ChuteRoll = 0.f, ChutePitchRate = 0.f, ChuteRollRate = 0.f; // ParachuteContain's sway
 	float ChuteRiderDrop = 0.f;            // ParachuteContain: how far below the canopy's PARA_ATTCH the rider's PARA_MAN hangs
 	bool bChuteLandsWhereItOpens = false;  // no landing spot given (ParachuteContain's m_isLandingOverrideSet is false)
 	float ChuteStartZ = 0.f;
@@ -1237,6 +1369,7 @@ private:
 		int32 Attempts = 0;
 		float PrevDist = FLT_MAX;       // distance to the target last frame (flying towards it, or away?)
 		int32 DiveState = 0;            // 0 before the dive, 1 diving, 2 done
+		bool bRiders = false;           // what goes out is what rides in it (a script's reinforcements)
 	};
 	TUniquePtr<FDelivery> Delivery;
 	/** False when the aircraft does not move this frame (not started yet, or just removed). */
@@ -1340,6 +1473,7 @@ private:
 	int32 Experience = 0;
 	TArray<FVector2f> RoutePoints;
 	int32 RouteIndex = 0;
+	int32 RouteLoopBackTo = -1;      // where the route is gone back to when its last point links into it: -1: it ends
 	/** AIFollowPathState: the next leg of the route, if there is one left (points within a cell of here are skipped). */
 	bool StartNextRouteLeg();
 	float PathExtraDistance = 0.f;     // AIUpdateInterface::m_pathExtraDistance: this much of the way lies beyond the path's end
@@ -1606,12 +1740,47 @@ private:
 	bool bHidden = false;
 	int32 GarrisonPoint = INDEX_NONE;  // the fire point this occupant shoots from
 	EGenChinookFlight ChinookFlight = EGenChinookFlight::Flying;
+	bool bChinookPendingMove = false; // m_pendingCommand: where it goes once it is back in the air
+	FVector3f ChinookPendingGoal = FVector3f::ZeroVector;
+	// ChinookAIStateMachine's MOVE_TO_AND_EVAC(_AND_EXIT): 1 flying there, 2 coming down, 3 going up again, 4 heading home
+	uint8 ChinookEvacStep = 0;
+	bool bChinookEvacAndExit = false;
+	FVector3f ChinookEvacOrigin = FVector3f::ZeroVector;
+	bool bEvacuateOnArrival = false;  // anything else with passengers: AICMD_MOVE_TO_POSITION_AND_EVACUATE
 	FGenObjectID ChinookHealAirfield = GenInvalidObjectID; // m_airfieldForHealing: where it was sent for repairs
 	void SetChinookHealAirfield(FGenObjectID Airfield);
 	bool bHasExitRally = false;       // units: second leg of the way out of the factory (aiFollowExitProductionPath)
 	FVector3f ExitRally = FVector3f::ZeroVector;
 	// --- free physics (PhysicsBehavior for objects without a locomotor: debris, hulks) ---
 	void UpdateFreePhysics(uint32 Frame);
+	void TestStunnedUnitForDestruction();
+	// GenFirestorm.cpp
+	struct FFirestormState
+	{
+		uint32 DelayLeft = 1, TimeActive = 0, LastDamageFrame = 0;
+		bool bStarted = false, bFinished = false, bReverseAtEnd = false, bSwitchedDirections = false, bEffectsFired = false, bScorchPlaced = false;
+		float From = 0.f, To = 0.f, Radius = 0.f;
+		TArray<uint32> Systems;
+	};
+	TUniquePtr<FFirestormState> Firestorm;
+	void UpdateFirestorm(uint32 Frame);
+	bool bBlastDone = false;
+	void OnBlastDeath();
+	void BustTheBunker();
+	TArray<int32> WhenDamagedAmmo;
+	TArray<uint32> WhenDamagedReady;
+	void FireWhenDamagedWeapon(int32 Index, uint32 Frame);
+	void OnDamagedFireWeapon(const FString& DamageType, float ActualDamage);
+	void UpdateWhenDamagedWeapon(uint32 Frame);
+	/** The script's attack priority set it goes by (AIUpdateInterface::getAttackInfo); null: nearest first. */
+	const struct FGenAttackPriority* AttackInfo = nullptr;
+	/** AttackPriorityInfo::getPriority with AI::findClosestEnemy's look inside what carries somebody. */
+	int32 GetAttackPriorityOf(const FGenObject& Other) const;
+	/** AI::findClosestEnemy with a set: the best by priority less a point per so much distance. Range < 0: anywhere. */
+	FGenObject* FindEnemyByPriority(float Range, const FGenPolygonTrigger* Area) const;
+	bool ShouldProjectileCollideWith(const FGenWeaponTemplate& W, const FGenObject& Other) const;
+	/** What the shot runs into between those two points, other than its victim; OutAt: where. */
+	const FGenObject* FindProjectileCollision(const FGenWeaponTemplate& W, const FVector3f& From, const FVector3f& To, FVector3f& OutAt) const;
 	float GetYawFromRotation() const;
 	void DoDeathPhase(int32 Phase);
 	// --- combat (GenObjectCombat.cpp) ---
@@ -1866,6 +2035,8 @@ private:
 	bool UsesSteering() const;
 	/** Whether Other is something our steering keeps clear of (not what we drive over, what we are going for, what steps aside for us). */
 	bool SteersAround(const FGenObject& Other) const;
+	/** Whether a unit of that kind is in this one's way at all, wherever each of them is. */
+	bool IsObstacleKind(const FGenObject& Other) const;
 	/** The way and the pace for this frame, towards Toward (DistToWaypoint away; DistToGoal left of the whole move) at PreferredSpeed at the most. */
 	FSteerChoice Steer(const FVector2f& Toward, float DistToWaypoint, float DistToGoal, float PreferredSpeed, uint32 Frame);
 	/** Standing idle and free to move: may be asked to make way. */
@@ -1948,8 +2119,11 @@ private:
 	float LateralFriction = 0.15f;
 	uint32 MotiveForceExpires = 0;
 	bool bStatusBraking = false;     // OBJECT_STATUS_BRAKING
+	bool bStatusDeckHeightOffset = false;   // OBJECT_STATUS_DECK_HEIGHT_OFFSET: parked on a deck, that is the ground under it
+	bool bStatusReassignParking = false;    // OBJECT_STATUS_REASSIGN_PARKING: moved up a space, not coming from the hangar
 	bool bFreePhysics = false;       // gravity / bounce / tumble simulation is running
 	bool bAllowBounce = false;       // ALLOW_BOUNCE
+	bool bStunned = false;           // IS_STUNNED: a shock wave has it in the air; its locomotor does nothing until it is down
 	FVector3f PrevAccel = FVector3f::ZeroVector; // m_prevAccel
 	int8 Turning = 0;                // m_turning: TURN_NEGATIVE -1, TURN_NONE 0, TURN_POSITIVE 1
 	int8 PrevTurning = 0;            // ... last frame (a goal straight behind doesn't flip the turn)
@@ -2008,6 +2182,8 @@ private:
 	FGenObjectID ContactTarget = GenInvalidObjectID;  // ... and what it has been carried up to
 	uint32 NextBlockedRepathFrame = 0;
 	bool bSidestepPath = false;        // the current path was made to get around a parked unit
+	bool bPathThroughParked = false;   // the current path crosses parked units, there being no other way (Path::getBlockedByAlly)
+	uint32 LastPushedFrame = 0;        // when the collision pass last moved this unit
 	bool bMovingOutOfWay = false;      // AI_MOVE_OUT_OF_THE_WAY: stepping aside for MoveOutOfWayOf
 	FGenObjectID MoveOutOfWayOf = GenInvalidObjectID;
 	bool bHasResumeGoal = false;       // continue to ResumeGoal after stepping aside
@@ -2078,6 +2254,7 @@ private:
 	FGenObjectID TargetID = GenInvalidObjectID;
 	bool bExplicitAttack = false;      // player ordered this attack (pursue)
 	uint32 NextAutoAcquireFrame = 0;
+	bool bMoodCheckOffsetDone = false;     // AIUpdateInterface::m_randomlyOffsetMoodCheck
 	uint32 NextRepathFrame = 0;
 	float TurretAngle[2] = { 0.f, 0.f };
 	float TurretPitch[2] = { 0.f, 0.f };
@@ -2099,13 +2276,30 @@ private:
 	FGenObjectID ContinuousVictim = GenInvalidObjectID;
 	int32 ContinuousShots = 0;
 	uint32 ContinuousCooldownFrame = 0;                   // when it starts to slow down unless it fires again (0: nothing to slow)
+	float CurrentSubdual = 0.f;                           // ActiveBody::m_currentSubdualDamage
+	uint32 SubdualHealFrame = 0;
+	float LastOverkillPercent = 0.f;                      // how far past dead the killing blow went, of its maximum health
+	bool bFlung = false;                                  // SlowDeathBehavior FLUNG_INTO_AIR: in the air, its death's clocks wait
+	int32 SlowDeathWeight(const FGenSlowDeath& D) const;
+	uint32 TurretScanNext[2] = { 0, 0 };                  // TurretAIIdleState::m_nextIdleScan
+	float TurretScanAngle[2] = { 0.f, 0.f };
+	bool bTurretScanning[2] = { false, false };
+	uint32 RodsDoneFrame = 0;                             // PowerPlantUpdate: the rods are out then
+	void ExtendRods(bool bExtend);
+	void ProjectileNowJammed();
+	uint32 HeatVisionFrame = 0;
+	uint32 SafeOcclusionFrame = 0;
+	uint32 ForceReloadFrame = 0;                          // FiringTracker::m_frameToForceReload (0: none)
 	uint8 ContinuousLevel = 0;                            // 0 none, 1 CONTINUOUS_FIRE_MEAN, 2 CONTINUOUS_FIRE_FAST
 	FPendingPath PendingPath;
 	bool bPathQueued = false;                  // in the logic's path queue
 	bool DeferPath(const FPendingPath& Request);
 	float PrevTurretAngle[2] = { 0.f, 0.f };   // drawn (see PublishDraw)
+	float TurretAngleLastFrame[2] = { 0.f, 0.f }; // where it was last frame: whether it is turning
 	float DrawTurretAngle[2] = { 0.f, 0.f };
 	uint32 TurretIdleSince[2] = { 0, 0 };
+	uint32 TurretFiredUntil[2] = { 0, 0 };                // TurretAI::m_enableSweepUntil: it fired a moment ago, so it sweeps
+	bool bTurretSweepPositive[2] = { true, true };
 	int32 FiringState[3] = { 0, 0, 0 }; // 0 none, 1 firing, 2 between shots, 3 reloading
 	uint32 FiringConditionEnd[3] = { 0, 0, 0 };
 
@@ -2127,6 +2321,7 @@ private:
 	friend class FGenPartition;
 	friend class UGenGameLogic;
 	friend class FGenSkirmishAI;
+	friend class FGenTeamFactory;
 	friend class FGenParkingPlace;
 	friend class FGenMapScripts;
 };

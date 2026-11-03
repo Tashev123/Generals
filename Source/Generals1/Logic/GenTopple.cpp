@@ -76,6 +76,10 @@ void FGenObject::ApplyTopplingForce(const FVector2f& Direction, float Speed, uin
 	}
 	Speed = FMath::Max(Speed, T.MinimumToppleSpeed);
 	ToppleDirection = Direction.GetSafeNormal();
+	if (const FGenMapScripts* Scripts = Logic->GetMapScripts())
+	{
+		Scripts->GetToppleDirection(*this, ToppleDirection); // ScriptEngine::adjustToppleDirection
+	}
 	if (ToppleDirection.IsZero())
 	{
 		ToppleDirection = FVector2f(1.f, 0.f);

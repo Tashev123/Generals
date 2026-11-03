@@ -95,6 +95,64 @@ void UGenGameLogic::SetupCampaignPlayers()
 			}
 		}
 	}
+	if (IsChallenge())
+	{
+		SetupChallengePlayer();
+	}
+}
+
+void UGenGameLogic::SetupChallengePlayer()
+{
+	// GameLogic::startNewGame with TheChallengeGameInfo: the sides stay as the map has them, and one more comes after
+	// them for the general chosen. "Some designers have used 'ThePlayer' as an empty player": it stays, and its enemies
+	// become the local player's; a map without it has everybody but the neutral and civilian players against the local player.
+	FGenGameData& GD = FGenGameData::Get();
+	const int32 Dummy = Players.IndexOfByPredicate([](const FGenPlayer& O) { return O.ScriptName == TEXT("ThePlayer"); });
+	if (Dummy != INDEX_NONE)
+	{
+		Players[Dummy].bHuman = true; // (nobody's: no computer player for it)
+	}
+	const int32 Local = Players.AddDefaulted();
+	{
+		FGenPlayer& P = Players[Local];
+		P.Index = Local;
+		P.ScriptName = TEXT("player0");
+		P.Name = TEXT("Challenger");
+		P.Template = GD.FindPlayerTemplate(Match.ChallengeFaction);
+		P.bHuman = true;
+		P.bScriptRelations = true;
+		P.Difficulty = Match.DefaultDifficulty;
+		P.StartPosition = 0;
+		P.Color = (P.Template && P.Template->PreferredColor != FColor::White) ? FLinearColor(P.Template->PreferredColor) : CampaignPalette[0];
+		P.Money = (P.Template && P.Template->StartMoney > 0) ? P.Template->StartMoney : 10000;
+		InitPlayerSciences(P);
+		if (!P.Template)
+		{
+			UE_LOG(LogGenerals, Warning, TEXT("Challenge: unknown faction '%s'"), *Match.ChallengeFaction);
+		}
+	}
+	LocalPlayer = Local;
+	for (int32 i = 1; i < Local; ++i)
+	{
+		bool bEnemy;
+		if (Dummy != INDEX_NONE)
+		{
+			const EGenRelationship* ToThem = Players[Dummy].Relations.Find(i);
+			const EGenRelationship* ToDummy = Players[i].Relations.Find(Dummy);
+			bEnemy = (ToThem && *ToThem == EGenRelationship::Enemies) || (ToDummy && *ToDummy == EGenRelationship::Enemies);
+			if (!bEnemy)
+			{
+				continue;
+			}
+		}
+		else
+		{
+			bEnemy = Players[i].ScriptName != TEXT("PlyrCivilian");
+		}
+		const EGenRelationship Relation = bEnemy ? EGenRelationship::Enemies : EGenRelationship::Neutral;
+		Players[i].Relations.Add(Local, Relation);
+		Players[Local].Relations.Add(i, Relation);
+	}
 }
 
 void UGenGameLogic::RefreshAllianceMasks()
@@ -163,7 +221,59 @@ void UGenGameLogic::ScriptShroudMap(int32 Player)
 	}
 }
 
-void UGenGameLogic::ScriptRevealPermanently(int32 Player, const FVector2f& Pos, float Radius)
+void UGenGameLogic::ScriptShroudOnce(int32 Player, const FVector2f& Pos, float Radius)
+{
+	if (!Shroud.IsValid() || !Players.IsValidIndex(Player))
+	{
+		return;
+	}
+	FGenSighting S;
+	Shroud.WorldToCell(Pos.X, Pos.Y, S.CellX, S.CellY);
+	S.CellRadius = Shroud.WorldToCellDist(Radius);
+	S.Mask = 1u << Player;
+	Shroud.ShroudCells(S);
+}
+
+bool UGenGameLogic::GetScriptWaterHeight(const FString& Name, float& OutHeight) const
+{
+	const FGenMapData* Map = MapActor ? MapActor->GetMapData() : nullptr;
+	const FGenPolygonTrigger* Area = Map ? Map->FindTrigger(Name) : nullptr;
+	if (!Area || !Area->bWater)
+	{
+		return false;
+	}
+	OutHeight = Area->GetWaterHeight();
+	return true;
+}
+
+void UGenGameLogic::SetScriptWaterHeight(const FString& Name, float Height, bool bFinal)
+{
+	FGenMapData* Map = MapActor ? MapActor->GetMapDataForLogic() : nullptr;
+	if (!Map)
+	{
+		return;
+	}
+	for (FGenPolygonTrigger& T : Map->PolygonTriggers)
+	{
+		if (T.bWater && T.Name == Name)
+		{
+			FBox2f Bounds(ForceInit);
+			for (FIntVector& Pt : T.Points)
+			{
+				Pt.Z = FMath::RoundToInt32(Height);
+				Bounds += FVector2f(float(Pt.X), float(Pt.Y));
+			}
+			if (bFinal)
+			{
+				// (TerrainLogic::setWaterHeight: "changes in the water level force us to recalculate the pathfinding map".)
+				Pathfinder.RefreshWater(*Map, Bounds);
+			}
+			return;
+		}
+	}
+}
+
+void UGenGameLogic::ScriptRevealPermanently(int32 Player, const FVector2f& Pos, float Radius, bool bUndo)
 {
 	// ScriptEngine::createNamedMapReveal + doNamedMapReveal: a look at the spot that is never taken back.
 	if (!Shroud.IsValid() || !Players.IsValidIndex(Player))
@@ -174,18 +284,67 @@ void UGenGameLogic::ScriptRevealPermanently(int32 Player, const FVector2f& Pos, 
 	Shroud.WorldToCell(Pos.X, Pos.Y, S.CellX, S.CellY);
 	S.CellRadius = Shroud.WorldToCellDist(Radius);
 	S.Mask = 1u << Player;
-	Shroud.DoReveal(S);
+	if (bUndo)
+	{
+		Shroud.UndoReveal(S);
+	}
+	else
+	{
+		Shroud.DoReveal(S);
+	}
+}
+
+void UGenGameLogic::ScriptRevealOnce(int32 Player, const FVector2f& Pos, float Radius)
+{
+	// doRevealMapAtWaypoint: doShroudReveal and undoShroudReveal at once.
+	ScriptRevealPermanently(Player, Pos, Radius, false);
+	ScriptRevealPermanently(Player, Pos, Radius, true);
+}
+
+void UGenGameLogic::ScriptRevealMapOnce(int32 Player)
+{
+	// doRevealMapEntire: PartitionManager::revealMapForPlayer.
+	if (Shroud.IsValid() && Players.IsValidIndex(Player))
+	{
+		Shroud.RevealMapForPlayer(Player);
+	}
 }
 
 void UGenGameLogic::SetActiveBoundary(int32 Boundary)
 {
 	// TerrainLogic::setActiveBoundary (the map actor keeps the map; the camera and the radar read the playable area).
-	if (FGenMapData* Map = MapActor ? MapActor->GetMapDataForLogic() : nullptr)
+	FGenMapData* Map = MapActor ? MapActor->GetMapDataForLogic() : nullptr;
+	if (!Map || !Map->Boundaries.IsValidIndex(Boundary) || Boundary == Map->ActiveBoundary)
 	{
-		if (Map->Boundaries.IsValidIndex(Boundary))
-		{
-			Map->ActiveBoundary = Boundary;
-		}
+		return;
+	}
+	const FIntPoint New = Map->Boundaries[Boundary];
+	if (New.X <= 0 || New.Y <= 0)
+	{
+		return;
+	}
+	Map->ActiveBoundary = Boundary;
+	if (Shroud.IsValid())
+	{
+		// "causes reset of PartitionManager": the fog starts over on the new area, and only what can be carried over
+		// is (PartitionManager::storeFoggedCells / restoreFoggedCells). Objects forget what they looked at, and look again.
+		const FBox2f Bounds = Map->GetPlayableBounds();
+		Shroud.SwitchActiveArea(FMath::CeilToInt32(Bounds.Max.X / Shroud.GetCellSize()), FMath::CeilToInt32(Bounds.Max.Y / Shroud.GetCellSize()),
+			[this]()
+			{
+				for (FGenObjectID Id : ObjectOrder)
+				{
+					Objects[Id]->LastLook = FGenSighting();
+					Objects[Id]->LastRevealAll = FGenSighting();
+				}
+			},
+			[this]()
+			{
+				for (FGenObjectID Id : ObjectOrder)
+				{
+					UpdateObjectLook(*Objects[Id]);
+				}
+			});
 	}
 }
 

@@ -9,8 +9,10 @@
 //
 // Ids for test automation (-GenTestMenu="seconds,click,Id;..."). A test run starts on the skirmish setup -
 // on the main menu if its script has "Main." ids:
+//   Main.Campaign (GenShellCampaign.cpp has the campaign menu's ids)
 //   Main.Skirmish, Main.Online, Main.Options, Main.Exit the main menu
 //   SelectMap, Map=<name>, MapAccept, MapBack           the map selection
+//   MapTab=Random map (GenShellRandomMap.cpp has its ids), MapTab=Official maps
 //   Slot<N>.State / .Color / .Side / .Team              opens that list of slot N (0 = the player's);
 //   Slot<N>.State=<item> ...                            ... or chooses the item with that label at once
 //   Cash, Cash=<item>, TestUnits                        starting cash, the battle group switch
@@ -23,6 +25,7 @@
 //   Pause.Toggle                                        the pause hotkey (a test run has no keyboard)
 
 #include "Game/GenHUD.h"
+#include "Game/GenCampaign.h"
 #include "Audio/GenAudioData.h"
 #include "Audio/GenAudioManager.h"
 #include "Core/GenFileSystem.h"
@@ -440,6 +443,24 @@ void AGenHUD::ShellTextEx(const FString& Text, float X, float Y, const FLinearCo
 	{
 		Item.EnableShadow(FLinearColor(0.f, 0.f, 0.f, Color.A * 0.85f), FVector2D(1.5, 1.5));
 	}
+	Canvas->DrawItem(Item);
+}
+
+FVector2D AGenHUD::BarTextSize(const FString& Text, float Pixels, bool bBold) const
+{
+	return MeasureShellText(Text, ShellFont(Pixels, bBold));
+}
+
+void AGenHUD::DrawBarLine(const FString& Text, float X, float Y, const FLinearColor& Color, float Pixels, bool bBold)
+{
+	const FSlateFontInfo Font = ShellFont(Pixels, bBold);
+	if (!Font.FontObject)
+	{
+		DrawText(Text, Color, X, Y, nullptr, Pixels / 16.f);
+		return;
+	}
+	FCanvasTextItem Item(FVector2D(FMath::RoundToFloat(X), FMath::RoundToFloat(Y)), FText::FromString(Text), Font, Color);
+	Item.EnableShadow(FLinearColor(0.f, 0.f, 0.f, Color.A * 0.85f), FVector2D(1.0, 1.0));
 	Canvas->DrawItem(Item);
 }
 
@@ -1041,7 +1062,21 @@ UTexture2D* AGenHUD::GetMapPreview(const FString& MapName)
 	UTexture2D* Texture = nullptr;
 	TArray<uint8> Bytes;
 	FGenImage Image;
-	if (FGenFileSystem::Get().ReadFile(FString::Printf(TEXT("Maps\\%s\\%s.tga"), *MapName, *MapName), Bytes) && GenTextureLoader::DecodeTGA(Bytes, Image))
+	if (GenRandomMap::IsRandomName(MapName))
+	{
+		// A generated map has no picture lying next to it: making one means making the map.
+		if (GenRandomMap::MakePreview(MapName, Image))
+		{
+			Texture = GenTextureLoader::CreateFromImage(Image, TEXT("MapPreview_") + Key.Replace(TEXT(":"), TEXT("_")), true, false);
+		}
+		RandomMapPreviews.Add(Key);
+		if (RandomMapPreviews.Num() > 4)
+		{
+			MapPreviews.Remove(RandomMapPreviews[0]);
+			RandomMapPreviews.RemoveAt(0);
+		}
+	}
+	else if (FGenFileSystem::Get().ReadFile(FString::Printf(TEXT("Maps\\%s\\%s.tga"), *MapName, *MapName), Bytes) && GenTextureLoader::DecodeTGA(Bytes, Image))
 	{
 		Texture = GenTextureLoader::CreateFromImage(Image, TEXT("MapPreview_") + Key, true, false);
 	}
@@ -1056,7 +1091,7 @@ void AGenHUD::DrawShellMenu(AGenGameMode* GM)
 	// Esc goes back one screen - unless an open list, the map selection or a line being typed into has it.
 	const APlayerController* PC = GetOwningPlayerController();
 	const AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC);
-	const bool bEsc = GenPC && GenPC->IsGenInputEnabled() && !Options.bOpen && !Shell.bEditingName && !Shell.bEditingAddress
+	const bool bEsc = GenPC && GenPC->IsGenInputEnabled() && !Options.bOpen && !Shell.bEditingName && !Shell.bEditingAddress && !Shell.bEditingSeed
 		&& PC->WasInputKeyJustPressed(EKeys::Escape);
 	const EGenMenuScreen Screen = GM->GetMenuScreen();
 	switch (Screen)
@@ -1066,6 +1101,15 @@ void AGenHUD::DrawShellMenu(AGenGameMode* GM)
 		break;
 	case EGenMenuScreen::Online:
 		DrawOnlineMenu(GM);
+		break;
+	case EGenMenuScreen::Challenge:
+		DrawChallengeMenu(GM);
+		break;
+	case EGenMenuScreen::Campaign:
+		DrawCampaignMenu(GM);
+		break;
+	case EGenMenuScreen::LoadGame:
+		DrawLoadGameMenu(GM);
 		break;
 	default:
 		DrawSkirmishMenu(GM);
@@ -1096,7 +1140,7 @@ void AGenHUD::DrawShellMenu(AGenGameMode* GM)
 	{
 		Shell.OpenId.Reset();
 		Shell.bMapSelect = false;
-		Shell.bEditingName = Shell.bEditingAddress = false;
+		Shell.bEditingName = Shell.bEditingAddress = Shell.bEditingSeed = false;
 	}
 }
 
@@ -1121,8 +1165,21 @@ void AGenHUD::DrawMainMenu(AGenGameMode* GM)
 
 	UGenNetSubsystem* Net = UGenNetSubsystem::Get(this);
 	const int32 NumMaps = FGenShellData::Get().GetMaps().Num();
-	float Y = 300.f;
-	const float Step = 92.f;
+	float Y = 270.f;
+	const float Step = 88.f;
+	if (ShellMenuItem(TEXT("Main.Campaign"), ShellRect(100, Y, 460, 76), FGenShellData::Text(TEXT("GUI:Campaign"), TEXT("Campaign")), TEXT("The USA, China and GLA campaigns")))
+	{
+		GM->ClearShellError();
+		GM->SetMenuScreen(EGenMenuScreen::Campaign);
+	}
+	Y += Step;
+	if (ShellMenuItem(TEXT("Main.Load"), ShellRect(100, Y, 460, 76), FGenShellData::Text(TEXT("GUI:LoadGame"), TEXT("Load Game")), TEXT("Go on with a saved game")))
+	{
+		GM->ClearShellError();
+		Shell.SaveMode = 0;
+		GM->SetMenuScreen(EGenMenuScreen::LoadGame);
+	}
+	Y += Step;
 	if (ShellMenuItem(TEXT("Main.Skirmish"), ShellRect(100, Y, 460, 76), FGenShellData::Text(TEXT("GUI:Skirmish"), TEXT("Skirmish")),
 		FString::Printf(TEXT("Battle computer armies on %d maps"), NumMaps)))
 	{
@@ -1601,6 +1658,11 @@ void AGenHUD::DrawSkirmishMenu(AGenGameMode* GM)
 	{
 		Shell.bMapSelect = true;
 		Shell.MapChoice = Setup->Map;
+		Shell.MapTab = GenRandomMap::IsRandomName(Setup->Map) ? 1 : 0;
+		if (Shell.MapTab == 1)
+		{
+			OpenRandomMapOptions(Setup);
+		}
 		const int32 Index = Data.GetMaps().IndexOfByPredicate([Setup](const FGenMapInfo& M) { return M.Name.Equals(Setup->Map, ESearchCase::IgnoreCase); });
 		Shell.MapScroll = float(FMath::Max(0, Index - 6));
 		GM->ClearShellError();
@@ -1744,19 +1806,11 @@ void AGenHUD::DrawNetOverlay(AGenGameMode* GM, UGenGameLogic* Logic)
 	}
 }
 
-void AGenHUD::DrawMapSelect()
+void AGenHUD::DrawMapList()
 {
-	FGenSetupData* Setup = ShellSetup ? ShellSetup : static_cast<FGenSetupData*>(UGenSkirmishSetup::Get(this));
 	const TArray<FGenMapInfo>& Maps = FGenShellData::Get().GetMaps();
-	DrawRect(FLinearColor(0.f, 0.f, 0.02f, 0.72f), 0.f, 0.f, Canvas->SizeX, Canvas->SizeY);
-	ShellPanel(ShellRect(230, 56, 1140, 788), 1.f);
 	const float S = Shell.Scale;
-	ShellTextEx(FGenShellData::Text(TEXT("GUI:SelectMap"), TEXT("SELECT MAP")).ToUpper(), ShellRect(256, 0, 0, 0).Min.X, ShellRect(0, 76, 0, 0).Min.Y, ShellGold, 28.f, 0, true, 100);
 	ShellTextEx(FGenShellData::Text(TEXT("GUI:Players"), TEXT("Players")).ToUpper(), ShellRect(796, 0, 0, 0).Min.X, ShellRect(0, 98, 0, 0).Min.Y, ShellDim * 1.3f, 12.f, 2, true, 160);
-	{
-		const FBox2D Rule = ShellRect(250, 122, 1100, 0);
-		DrawRect(ShellLine, Rule.Min.X, Rule.Min.Y, Rule.GetSize().X, FMath::Max(1.f, S));
-	}
 
 	// Test automation: "Map=<name>" (the name the list shows, or the map's folder).
 	if (Shell.TestClick.StartsWith(TEXT("Map="), ESearchCase::IgnoreCase))
@@ -1826,8 +1880,50 @@ void AGenHUD::DrawMapSelect()
 		DrawRect(FLinearColor(0.01f, 0.02f, 0.05f, 0.7f), ListArea.Max.X - 5.f * S, ListArea.Min.Y, 3.f * S, Track);
 		DrawRect(WithAlpha(ShellEdge, 0.9f), ListArea.Max.X - 7.f * S, ListArea.Min.Y + (Track - Thumb) * Shell.MapScroll / MaxScroll, 6.f * S, Thumb);
 	}
+}
 
-	if (const FGenMapInfo* Map = FGenShellData::Get().FindMap(Shell.MapChoice))
+void AGenHUD::DrawMapSelect()
+{
+	FGenSetupData* Setup = ShellSetup ? ShellSetup : static_cast<FGenSetupData*>(UGenSkirmishSetup::Get(this));
+	const FGenShellData& Data = FGenShellData::Get();
+	DrawRect(FLinearColor(0.f, 0.f, 0.02f, 0.72f), 0.f, 0.f, Canvas->SizeX, Canvas->SizeY);
+	ShellPanel(ShellRect(230, 56, 1140, 788), 1.f);
+	const float S = Shell.Scale;
+	ShellTextEx(FGenShellData::Text(TEXT("GUI:SelectMap"), TEXT("SELECT MAP")).ToUpper(), ShellRect(256, 0, 0, 0).Min.X, ShellRect(0, 76, 0, 0).Min.Y, ShellGold, 28.f, 0, true, 100);
+	{
+		const FBox2D Rule = ShellRect(250, 122, 1100, 0);
+		DrawRect(ShellLine, Rule.Min.X, Rule.Min.Y, Rule.GetSize().X, FMath::Max(1.f, S));
+	}
+
+	// The maps that came with the game, or one made up here. Each tab remembers its own choice.
+	static const TArray<FString> Tabs = { TEXT("Official maps"), TEXT("Random map") };
+	const int32 Tab = ShellTabs(TEXT("MapTab"), ShellRect(840, 70, 500, 40), Tabs, Shell.MapTab);
+	if (Tab != Shell.MapTab)
+	{
+		Shell.MapTab = Tab;
+		Shell.bEditingSeed = false;
+		if (Tab == 1)
+		{
+			Shell.OfficialChoice = Shell.MapChoice;
+			OpenRandomMapOptions(Setup);
+			Shell.MapChoice = Shell.RandomMap.ToName();
+		}
+		else
+		{
+			const bool bHasChoice = Data.FindMap(Shell.OfficialChoice) && !GenRandomMap::IsRandomName(Shell.OfficialChoice);
+			Shell.MapChoice = bHasChoice ? Shell.OfficialChoice : (Data.GetMaps().Num() > 0 ? Data.GetMaps()[0].Name : FString());
+		}
+	}
+	if (Shell.MapTab == 1)
+	{
+		DrawRandomMapOptions();
+	}
+	else
+	{
+		DrawMapList();
+	}
+
+	if (const FGenMapInfo* Map = Data.FindMap(Shell.MapChoice))
 	{
 		DrawMapPreview(*Map, ShellRect(840, 134, 500, 500), false);
 		ShellText(Map->DisplayName, ShellRect(840, 0, 0, 0).Min.X, ShellRect(0, 648, 0, 0).Min.Y, FLinearColor::White, 24.f, 0, true);
@@ -1852,6 +1948,15 @@ void AGenHUD::DrawMapSelect()
 
 void AGenHUD::DrawLoading()
 {
+	if (const AGenGameMode* LoadingGM = GetWorld()->GetAuthGameMode<AGenGameMode>())
+	{
+		const FGenCampaign* Campaign = FGenCampaignData::Get().FindCampaign(LoadingGM->GetPendingCampaign());
+		if (Campaign && Campaign->bChallenge)
+		{
+			DrawChallengeLoading(*Campaign, LoadingGM->GetPendingMission());
+			return;
+		}
+	}
 	// The original's multiplayer load screen behind, and along the bottom the map that is being loaded.
 	const FGenMappedImage* Img = nullptr;
 	ShellBackdrop(FindShellTexture(TEXT("Mp_Load"), Img) ? TEXT("Mp_Load") : TEXT("MainMenuBackdrop"), 0.15f);
@@ -1885,36 +1990,52 @@ void AGenHUD::DrawQuitMenu(AGenGameMode* GM)
 	if (!GM->IsQuitMenuOpen())
 	{
 		Shell.bQuitConfirm = false;
+		Shell.SaveMode = 0;
 		return;
 	}
-	// (The options, opened from here, cover it all.)
+	// (The options, opened from here, cover it all. So does the list of saved games.)
 	if (Options.bOpen)
 	{
+		return;
+	}
+	if (Shell.SaveMode != 0)
+	{
+		DrawSaveLoadPanel(GM);
 		return;
 	}
 	const float S = Shell.Scale;
 	const bool bNetwork = UGenGameLogic::Get(this) && UGenGameLogic::Get(this)->IsNetworkGame();
 	DrawRect(FLinearColor(0.f, 0.005f, 0.02f, 0.62f), 0.f, 0.f, Canvas->SizeX, Canvas->SizeY);
-	ShellPanel(ShellRect(570, 150, 460, 600), 1.f);
-	if (!ShellImage(TEXT("GeneralsLogo"), ShellRect(615, 176, 370, 120)))
+	ShellPanel(ShellRect(570, 80, 460, 740), 1.f);
+	if (!ShellImage(TEXT("GeneralsLogo"), ShellRect(615, 100, 370, 120)))
 	{
-		ShellTextEx(TEXT("GENERALS"), Canvas->SizeX * 0.5f, ShellRect(0, 206, 0, 0).Min.Y, ShellGold, 34.f, 1, true, 120);
+		ShellTextEx(TEXT("GENERALS"), Canvas->SizeX * 0.5f, ShellRect(0, 130, 0, 0).Min.Y, ShellGold, 34.f, 1, true, 120);
 	}
 	// (A network game goes on whatever one player does: no restart there, and the game doesn't stand still.)
-	ShellTextEx(bNetwork ? TEXT("NETWORK GAME  -  THE BATTLE GOES ON") : TEXT("GAME PAUSED"), Canvas->SizeX * 0.5f, ShellRect(0, 308, 0, 0).Min.Y,
+	ShellTextEx(bNetwork ? TEXT("NETWORK GAME  -  THE BATTLE GOES ON") : TEXT("GAME PAUSED"), Canvas->SizeX * 0.5f, ShellRect(0, 232, 0, 0).Min.Y,
 		ShellDim * 1.4f, 13.f, 1, true, 220);
 	{
-		const FBox2D Rule = ShellRect(610, 338, 380, 0);
+		const FBox2D Rule = ShellRect(610, 262, 380, 0);
 		FillGradientH(Canvas, FBox2D(Rule.Min, FVector2D(Rule.GetCenter().X, Rule.Min.Y + FMath::Max(1.f, S))), WithAlpha(ShellGold, 0.f), WithAlpha(ShellGold, 0.8f));
 		FillGradientH(Canvas, FBox2D(FVector2D(Rule.GetCenter().X, Rule.Min.Y), FVector2D(Rule.Max.X, Rule.Min.Y + FMath::Max(1.f, S))), WithAlpha(ShellGold, 0.8f), WithAlpha(ShellGold, 0.f));
 	}
 
 	Shell.bBlocked = Shell.bQuitConfirm; // (under the question nothing reacts)
-	float Y = 362.f;
+	float Y = 286.f;
 	const float Step = 68.f;
 	if (ShellPrimaryButton(TEXT("Menu.Resume"), ShellRect(610, Y, 380, 54), FGenShellData::Text(TEXT("GUI:ReturnToGame"), TEXT("RETURN TO GAME"))))
 	{
 		GM->ToggleQuitMenu();
+	}
+	Y += Step;
+	if (ShellButton(TEXT("Menu.Save"), ShellRect(610, Y, 380, 54), FGenShellData::Text(TEXT("GUI:SaveGame"), TEXT("SAVE GAME")), GM->CanSaveGame()))
+	{
+		OpenSaveLoad(true);
+	}
+	Y += Step;
+	if (ShellButton(TEXT("Menu.Load"), ShellRect(610, Y, 380, 54), FGenShellData::Text(TEXT("GUI:LoadGame"), TEXT("LOAD GAME")), !bNetwork))
+	{
+		OpenSaveLoad(false);
 	}
 	Y += Step;
 	if (ShellButton(TEXT("Menu.Options"), ShellRect(610, Y, 380, 54), FGenShellData::Text(TEXT("GUI:Options"), TEXT("OPTIONS"))))
@@ -1988,7 +2109,7 @@ void AGenHUD::DrawScoreScreen(AGenGameMode* GM, UGenGameLogic* Logic)
 		FillGradientH(Canvas, FBox2D(Rule.Min, FVector2D(Rule.GetCenter().X, Rule.Min.Y + 2.f * S)), WithAlpha(TitleColor, 0.f), WithAlpha(TitleColor, 0.9f));
 		FillGradientH(Canvas, FBox2D(FVector2D(Rule.GetCenter().X, Rule.Min.Y), FVector2D(Rule.Max.X, Rule.Min.Y + 2.f * S)), WithAlpha(TitleColor, 0.9f), WithAlpha(TitleColor, 0.f));
 	}
-	if (const UGenSkirmishSetup* Setup = UGenSkirmishSetup::Get(this); Setup && Setup->GetMapInfo())
+	if (const UGenSkirmishSetup* Setup = UGenSkirmishSetup::Get(this); Setup && Setup->GetMapInfo() && !Logic->IsCampaign()) // (a mission's map isn't the skirmish setup's)
 	{
 		ShellTextEx(Setup->GetMapInfo()->DisplayName.ToUpper(), Canvas->SizeX * 0.5f, ShellRect(0, 136, 0, 0).Min.Y, ShellDim * 1.4f, 13.f, 1, true, 220);
 	}
@@ -1997,10 +2118,23 @@ void AGenHUD::DrawScoreScreen(AGenGameMode* GM, UGenGameLogic* Logic)
 	TArray<const FGenPlayer*> Rows;
 	for (const FGenPlayer& P : Players)
 	{
-		if (!P.bNeutral && P.Template && P.StartPosition >= 0)
+		// (A campaign: its sides, but those its scripts keep off the score screen.)
+		if (!P.bNeutral && P.Template && (Logic->IsCampaign() ? !(Logic->GetMapScripts() && Logic->GetMapScripts()->IsExcludedFromScore(P.Index)) : P.StartPosition >= 0))
 		{
 			Rows.Add(&P);
 		}
+	}
+	// (The Challenge: the player and the general, not the dummy or the turrets some maps give sides of their own.)
+	const FGenMatchSettings& ScoreMatch = Logic->GetMatchSettings();
+	const FGenCampaign* ScoreCampaign = !ScoreMatch.ChallengeFaction.IsEmpty() ? FGenCampaignData::Get().FindCampaign(ScoreMatch.Campaign) : nullptr;
+	const FGenCampaignMission* ScoreMission = ScoreCampaign ? ScoreCampaign->FindMission(ScoreMatch.Mission) : nullptr;
+	if (ScoreMission)
+	{
+		const FGenChallengeGeneral* Opponent = FGenCampaignData::Get().FindGeneralByName(ScoreMission->GeneralName);
+		Rows.RemoveAll([Local, Opponent](const FGenPlayer* P)
+		{
+			return P->Index != Local && !(Opponent && P->Template->Name.Equals(Opponent->PlayerTemplate, ESearchCase::IgnoreCase));
+		});
 	}
 	Rows.StableSort([](const FGenPlayer& A, const FGenPlayer& B) { return A.Score.Calculate(A.Index) > B.Score.Calculate(B.Index); });
 
@@ -2067,10 +2201,26 @@ void AGenHUD::DrawScoreScreen(AGenGameMode* GM, UGenGameLogic* Logic)
 		}
 	}
 
+	if (ScoreMission && (bWon || bLost))
+	{
+		DrawChallengeResult(ScoreMatch, bWon, 176.f + 120.f + Rows.Num() * 56.f + 24.f);
+	}
 	ShellBottomBar();
 	if (GM->CanKeepWatching() && ShellButton(TEXT("Score.Watch"), ShellRect(940, 812, 300, 56), FGenShellData::Text(TEXT("GUI:ReturnToGame"), TEXT("RETURN TO GAME"))))
 	{
 		GM->KeepWatching();
+	}
+	else if (ScoreMission && bWon && !ScoreMission->NextMission.IsEmpty())
+	{
+		// The Generals' Challenge goes on to the next general.
+		if (ShellPrimaryButton(TEXT("Score.Next"), ShellRect(1260, 812, 300, 56), FGenShellData::Text(TEXT("GUI:Continue"), TEXT("CONTINUE"))))
+		{
+			GM->PlayNextMission(ScoreMission->NextMission);
+		}
+	}
+	else if (ScoreMission && bLost && ShellButton(TEXT("Score.Retry"), ShellRect(620, 812, 300, 56), FGenShellData::Text(TEXT("GUI:Retry"), TEXT("TRY AGAIN"))))
+	{
+		GM->RestartGame();
 	}
 	else if (ShellPrimaryButton(TEXT("Score.Continue"), ShellRect(1260, 812, 300, 56), FGenShellData::Text(TEXT("GUI:Continue"), TEXT("CONTINUE"))))
 	{

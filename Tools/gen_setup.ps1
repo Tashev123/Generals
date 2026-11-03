@@ -2,7 +2,7 @@
 # The Unreal Editor must be closed.
 #
 #   .\gen_setup.ps1                 everything (minutes: all materials recompile)
-#   .\gen_setup.ps1 -Only water     just the water materials (also: roads, shroud, w3d, decal, sky, terrain)
+#   .\gen_setup.ps1 -Only water     just the water materials (also: roads, shroud, w3d, decal, sky, terrain, smudge)
 param([string]$Only = "")
 
 $ErrorActionPreference = "Stop"

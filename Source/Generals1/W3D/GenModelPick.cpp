@@ -178,6 +178,25 @@ void UGenModelComponent::BuildPickParts() const
 	}
 }
 
+FString UGenModelComponent::DescribePick() const
+{
+	if (!bPickPartsBuilt)
+	{
+		BuildPickParts();
+	}
+	const FVector At = GetComponentLocation();
+	int32 Hidden = 0;
+	for (const FPickPart& Part : PickParts)
+	{
+		if (SubObjects.IsValidIndex(Part.SubObject) && (SubObjects[Part.SubObject].bHiddenByDefault || SubObjects[Part.SubObject].bForcedHidden))
+		{
+			++Hidden;
+		}
+	}
+	return FString::Printf(TEXT("file %d, %d bones, hidden in game %d, %d pick parts (%d hidden), reach %.1f, at (%.0f, %.0f, %.0f) cm"),
+		File ? 1 : 0, PoseW3D.Num(), bHiddenInGame ? 1 : 0, PickParts.Num(), Hidden, PickRadius, At.X, At.Y, At.Z);
+}
+
 bool UGenModelComponent::RaycastWorld(const FVector& Origin, const FVector& Dir, double& InOutT) const
 {
 	if (!File || PoseW3D.Num() == 0 || bHiddenInGame)

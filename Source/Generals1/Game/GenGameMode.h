@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "GameFramework/GameModeBase.h"
 #include "Logic/GenGameLogic.h"
+#include "Logic/GenMatch.h"
 #include "GenGameMode.generated.h"
 
 class AGenMapActor;
@@ -25,6 +26,9 @@ enum class EGenMenuScreen : uint8
 	Main,       // the main menu: skirmish, online, options, exit
 	Skirmish,   // the skirmish setup
 	Online,     // host a network game or join one
+	Campaign,   // the campaigns, their missions and the difficulty
+	Challenge,  // the Generals' Challenge: a general, an opponent and the difficulty
+	LoadGame,   // the saved games
 };
 
 /**
@@ -43,6 +47,7 @@ enum class EGenMenuScreen : uint8
  *   -GenShotDelay=<sec>        wait before the screenshot (default 4)
  *   -GenCam=X,Y,Yaw,Height     camera look-at in Generals units, yaw degrees, height
  *   -GenObject=T1,T2           spawn units for the local player at the camera target (or -GenObjectAt=X,Y)
+ *   -GenObjectRank=N           those units start at that rank (0 regular ... 3 heroic)
  *   -GenTestMove=X,Y           after 1 s, order all local mobile units to move there
  *   -GenEnemyObject=T1,T2      spawn units for the enemy player (at -GenEnemyAt=X,Y)
  *   -GenTestAttack             after 1 s, order all local armed units to attack the first enemy unit
@@ -93,8 +98,22 @@ public:
 	/** The pause hotkey: the game stands still with no menu up. A network game can't be stopped - the host
 	 *  keeps the clock - so this does nothing there. */
 	void TogglePause();
+	/** The campaign menu's "start": that mission of that campaign (Difficulty: 0 easy, 1 normal, 2 hard). */
+	void RequestCampaignStart(const FString& Campaign, const FString& Mission, int32 Difficulty);
 	/** The in-game menu's "restart": the same game again from the beginning. */
 	void RestartGame();
+	/** The Generals' Challenge: on to that mission of the same campaign, as the same general. */
+	void PlayNextMission(const FString& Mission);
+	const FString& GetPendingCampaign() const { return PendingCampaign; }
+	const FString& GetPendingMission() const { return PendingMission; }
+	/** The in-game menu's "save game": the game as it stands, to that file (empty: a new one). */
+	bool SaveGame(const FString& Path);
+	bool CanSaveGame() const;
+	/** "Load game": a fresh start of the level, which plays that saved game. */
+	void RequestLoadGame(const FString& Path);
+	/** The saved game is being played up to where it was left. */
+	bool IsResumingSave() const { return bResumingSave; }
+	const FString& GetResumeTitle() const { return ResumeSave.Title; }
 	/** The in-game menu's "exit": to the score screen. */
 	void EndGame();
 	/** The score screen's "continue": back to the menu, on the screen the game was started from. */
@@ -115,9 +134,34 @@ private:
 	bool BeginGame(const FString& MapName, const TArray<FGenSkirmishSlot>& Slots, int32 StartingCash, bool bFromMenu);
 	/** Loads the match's map, starts it and puts the camera over the local player's base. */
 	bool BeginMatch(const FGenMatchSettings& Settings, bool bFromMenu, int32 InLocalPlayer = INDEX_NONE);
+	/** A campaign mission (GenGameModeCampaign.cpp): its map, its players and its scripts. */
+	bool BeginCampaign(const FString& Campaign, const FString& Mission, int32 Difficulty, bool bFromMenu);
+	/** During a campaign mission: what its scripts want seen and heard, and the camera and input they hold. */
+	void TickCampaign(float DeltaSeconds);
+public:
+	/** A mission's intro can be skipped: how far Space has been held (0 to 1), below 0 when it can't be now. */
+	float GetIntroSkipHold() const { return IntroPhase == 1 ? IntroSkipHeld / 1.f : -1.f; }
+	bool IsSkippingIntro() const { return bSkippingIntro; }
+private:
+	int32 IntroPhase = 0;        // 0: not begun, 1: the scripts have the input for the first time, 2: over
+	float IntroSkipHeld = 0.f;   // seconds
+	bool bSkippingIntro = false;
+	bool bTestHoldSpace = false; // (-TestPowers "frame,holdspace")
+	FString SkippedTrack;        // the music the skipped part asked for last
+	TArray<FGenScriptClientEvent> ScriptEvents;
+	TArray<FGenObjectID> LastScriptSelection;
+	FString ScriptCameraFollow;              // CAMERA_FOLLOW_NAMED: who the camera stays over
+	FString ScriptCameraLook;                // CAMERA_LOOK_TOWARD_OBJECT: who the camera keeps looking at
+	uint32 ScriptCameraLookFrom = 0, ScriptCameraLookUntil = 0;
 	/** -GenReplay=file: a recorded game played again from its start with its own orders - to watch, or to check
 	 *  that it comes out the same (-GenReplayViewer=N watches it as player N). */
 	bool StartReplay(const FString& Path);
+	/** Starts the match of a saved game and plays it up to where it was left. */
+	bool BeginFromSave(const FString& Path, bool bFromMenu);
+	/** ... and there: the view, the selection and the player's groups as they were. */
+	void FinishResumeSave();
+	bool bResumingSave = false;
+	FGenSavedGame ResumeSave;      // (its replay gone to the logic)
 	/** Writes the recording of the game so far (Saved/Replays/LastReplay.genrep, or -GenRecord=file; and with
 	 *  -GenChecksumLog=file its checksums, a frame to a line). */
 	void SaveReplay();
@@ -155,8 +199,11 @@ public:
 	EGenMenuScreen MenuScreen = EGenMenuScreen::Main;
 	FString ShellError;
 	TArray<FGenSkirmishSlot> PendingSlots;   // settled by RequestStart, used when the loading tick comes
+	FString PendingCampaign, PendingMission;   // ... or the campaign mission the campaign menu asked for
+	int32 PendingDifficulty = 1;
 	int32 LoadingTicks = 0;
 	bool bStartedFromMenu = false;
+	bool bReloading = false;           // the level is on its way out (ReloadLevel)
 	bool bQuitMenuOpen = false;
 	bool bPauseRequested = false;             // the pause hotkey, on its own (the HUD says it on screen)
 	bool bWatching = false;                  // defeated, looking on: no score screen until the game is over

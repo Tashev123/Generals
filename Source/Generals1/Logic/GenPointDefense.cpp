@@ -82,7 +82,7 @@ const FGenObject* FGenObject::ScanPointDefense(int32 Index)
 		{
 			return;
 		}
-		if (Logic->GetRelationship(Owner, Other.GetOwner()) != EGenRelationship::Enemies || Other.IsStealthedAndUndetected())
+		if (Logic->GetRelationship(*this, Other) != EGenRelationship::Enemies || Other.IsStealthedAndUndetected())
 		{
 			return;
 		}

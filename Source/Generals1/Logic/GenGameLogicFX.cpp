@@ -58,6 +58,19 @@ void UGenGameLogic::PlayParticleSystemAt(const FString& TemplateName, const FVec
 	}
 }
 
+uint32 UGenGameLogic::CreateParticleSystemAt(const FString& TemplateName, const FVector3f& Pos)
+{
+	return FX ? FX->CreateSystemAt(TemplateName, Pos) : 0;
+}
+
+void UGenGameLogic::SetParticleSystemRadius(uint32 SystemID, float Radius)
+{
+	if (FGenParticleSystem* Sys = (FX && SystemID != 0) ? FX->FindSystem(SystemID) : nullptr)
+	{
+		Sys->SetEmissionRadius(Radius);
+	}
+}
+
 void UGenGameLogic::DestroyParticleSystem(uint32 SystemID)
 {
 	if (FX && SystemID != 0)
@@ -146,37 +159,91 @@ bool UGenGameLogic::GetWeaponBoneTransform(const FGenObject& Obj, int32 Slot, bo
 	// getProjectileLaunchOffset): the pose is the one shown, turret angle included.
 	const TObjectPtr<UGenModelComponent>* MC = Drawables.Find(Obj.GetID());
 	const FDrawState* DS = DrawStates.Find(Obj.GetID());
-	const FGenDrawModule* Draw = Obj.GetTemplate()->PrimaryDraw();
-	if (!MC || !*MC || !DS || !Draw || !DS->State.Cur || Slot < 0 || Slot > 2)
+	if (!MC || !*MC || !DS || Slot < 0 || Slot > 2)
 	{
 		return false;
 	}
-	const FGenModelConditionState& State = *DS->State.Cur;
-	const FString& BoneName = bLaunchBone ? State.LaunchBone[Slot] : State.FireFXBone[Slot];
 	FTransform3f Bone;
-	if (BoneName.IsEmpty() || !(*MC)->GetBoneTransformW3D(BoneName, Bone))
+	// (W3DDependencyModelDraw::adjustTransformMtx: an add-on riding in the open stands on a bone of what carries it, a
+	// gatling cannon on the Overlord's turret; its muzzles are out from there, not out from the middle of the tank.)
+	FTransform3f ObjectWorld = Obj.GetTransform();
+	const FGenDrawModule* Primary = Obj.GetTemplate()->PrimaryDraw();
+	if (DS->bRider && Primary)
 	{
-		return false;
+		const FDrawState* Their = DrawStates.Find(Obj.GetContainedBy());
+		const FGenObject* Carrier = FindObject(Obj.GetContainedBy());
+		FTransform3f Attach;
+		if (Their && Their->Model && Carrier && Their->Model->GetBoneTransformW3D(Primary->AttachToBoneInContainer, Attach))
+		{
+			ObjectWorld = Attach * Carrier->GetTransform();
+		}
 	}
-	OutWorld = Bone * Obj.GetTransform();
-	return true;
+	// (Drawable::handleWeaponFireFX goes over the draw modules: whichever has the bone in the state it shows.)
+	if (DS->State.Cur)
+	{
+		const FString& BoneName = bLaunchBone ? DS->State.Cur->LaunchBone[Slot] : DS->State.Cur->FireFXBone[Slot];
+		if (!BoneName.IsEmpty() && (*MC)->GetBoneTransformW3D(BoneName, Bone))
+		{
+			OutWorld = Bone * ObjectWorld;
+			return true;
+		}
+	}
+	const FGenThingTemplate* DrawT = DS->DrawTemplate ? DS->DrawTemplate : Obj.GetTemplate();
+	for (const FExtraDraw& E : DS->Extras)
+	{
+		UGenModelComponent* Extra = E.Model.Get();
+		if (!Extra || !E.State.Cur)
+		{
+			continue;
+		}
+		const FString& BoneName = bLaunchBone ? E.State.Cur->LaunchBone[Slot] : E.State.Cur->FireFXBone[Slot];
+		if (BoneName.IsEmpty() || !Extra->GetBoneTransformW3D(BoneName, Bone))
+		{
+			continue;
+		}
+		FTransform3f Attach;
+		if (DrawT->Draws.IsValidIndex(E.DrawIndex) && (*MC)->GetBoneTransformW3D(DrawT->Draws[E.DrawIndex].AttachToBone, Attach))
+		{
+			Bone = Bone * Attach;
+		}
+		OutWorld = Bone * Obj.GetTransform();
+		return true;
+	}
+	return false;
+}
+
+namespace
+{
+	/** Drawable::getProjectileLaunchOffset goes over the draw modules: the first whose state says where the slot's shots start. */
+	const FGenDrawModule* FindLaunchModule(const FGenObject& Obj, int32 Slot, const FGenModelConditionState*& OutState)
+	{
+		for (const FGenDrawModule& Draw : Obj.GetTemplate()->Draws)
+		{
+			const int32 StateIndex = Draw.FindBestState(Obj.GetModelConditions());
+			if (Draw.States.IsValidIndex(StateIndex) && !Draw.States[StateIndex].Model.IsEmpty() && !Draw.States[StateIndex].LaunchBone[Slot].IsEmpty())
+			{
+				OutState = &Draw.States[StateIndex];
+				return &Draw;
+			}
+		}
+		return nullptr;
+	}
 }
 
 int32 UGenGameLogic::GetWeaponBarrelCount(const FGenObject& Obj, int32 Slot) const
 {
-	const FGenDrawModule* Draw = Obj.GetTemplate()->PrimaryDraw();
 	UGenAssetSubsystem* Assets = UGenAssetSubsystem::Get();
-	if (!Draw || !Assets || Slot < 0 || Slot > 2)
+	if (!Assets || Slot < 0 || Slot > 2)
 	{
 		return 0;
 	}
-	const int32 StateIndex = Draw->FindBestState(Obj.GetModelConditions());
-	if (!Draw->States.IsValidIndex(StateIndex) || Draw->States[StateIndex].Model.IsEmpty() || Draw->States[StateIndex].LaunchBone[Slot].IsEmpty())
+	const FGenModelConditionState* State = nullptr;
+	if (!FindLaunchModule(Obj, Slot, State))
 	{
 		return 0;
 	}
 	TArray<FTransform3f> Bones;
-	return Assets->GetPristineBones(Draw->States[StateIndex].Model, Draw->States[StateIndex].LaunchBone[Slot], 1, 32, Bones);
+	return Assets->GetPristineBones(State->Model, State->LaunchBone[Slot], 1, 32, Bones);
 }
 
 namespace
@@ -192,7 +259,7 @@ namespace
 
 void UGenGameLogic::FireTempWeapon(const FGenWeaponTemplate& Weapon, FGenObject& Source, const FVector3f& TargetPos)
 {
-	DoFXPos(Weapon.FireFX, Source.GetPosition(), nullptr, 0.f, &TargetPos, Weapon.PrimaryDamageRadius);
+	DoFXPos(Weapon.GetFireFX(Source.GetVeterancyLevel()), Source.GetPosition(), nullptr, 0.f, &TargetPos, Weapon.PrimaryDamageRadius);
 	if (!Weapon.FireOCL.IsEmpty())
 	{
 		DoOCL(Weapon.FireOCL, Source);
@@ -215,6 +282,16 @@ void UGenGameLogic::FlashSelected(FGenObjectID Id)
 		DS->FlashStart = FPlatformTime::Seconds();
 		DS->bBusy = true; // (looked at every frame while it lasts)
 	}
+}
+
+FString UGenGameLogic::DescribeDrawablePick(FGenObjectID Id) const
+{
+	const FDrawState* DS = DrawStates.Find(Id);
+	if (!DS)
+	{
+		return TEXT("no draw state");
+	}
+	return FString::Printf(TEXT("%s%s"), DS->bHidden ? TEXT("draw state hidden, ") : TEXT(""), DS->Model ? *DS->Model->DescribePick() : TEXT("no model"));
 }
 
 bool UGenGameLogic::RaycastDrawable(FGenObjectID Id, const FVector& Origin, const FVector& Dir, double& InOutT) const
@@ -240,42 +317,59 @@ bool UGenGameLogic::GetWeaponLaunchTransform(const FGenObject& Obj, int32 Slot, 
 	// The look the object's conditions ask for, whether or not the screen has caught up with them; the
 	// bone where the model's base pose has it, turned with the turret. (Animation doesn't come into it,
 	// in the original either: what the logic does must not depend on what a screen happens to show.)
-	const FGenDrawModule* Draw = Obj.GetTemplate()->PrimaryDraw();
 	UGenAssetSubsystem* Assets = UGenAssetSubsystem::Get();
-	if (!Draw || !Assets || Slot < 0 || Slot > 2)
+	if (!Assets || Slot < 0 || Slot > 2)
 	{
 		return false;
 	}
-	const int32 StateIndex = Draw->FindBestState(Obj.GetModelConditions());
-	if (!Draw->States.IsValidIndex(StateIndex))
+	const FGenModelConditionState* FoundState = nullptr;
+	const FGenDrawModule* Draw = FindLaunchModule(Obj, Slot, FoundState);
+	if (!Draw)
 	{
 		return false;
 	}
-	const FGenModelConditionState& State = Draw->States[StateIndex];
+	const FGenModelConditionState& State = *FoundState;
 	FTransform3f Bone;
-	if (State.Model.IsEmpty() || State.LaunchBone[Slot].IsEmpty())
-	{
-		return false;
-	}
 	// (The bones are numbered from 01; without a number the first of them is found.)
 	bool bLastFrame = false;
 	const FString& Anim = PristineAnimation(State, bLastFrame);
-	if (!(Barrel > 0 && Assets->GetPristineBoneTurned(State.Model, State.LaunchBone[Slot] + FString::Printf(TEXT("%02d"), Barrel + 1), State.Turret, Obj.GetTurretAngle(0), Bone, Anim, bLastFrame))
-		&& !Assets->GetPristineBoneTurned(State.Model, State.LaunchBone[Slot], State.Turret, Obj.GetTurretAngle(0), Bone, Anim, bLastFrame))
+	// (getProjectileLaunchOffset: the slot's own turret, as its art points.)
+	const int32 T = Obj.TurretForSlot(Slot) == 1 ? 1 : 0;
+	const FString& YawBone = T == 0 ? State.Turret : State.AltTurret;
+	const FString& PitchBoneName = T == 0 ? State.TurretPitch : State.AltTurretPitch;
+	const float Turn = Obj.GetTurretAngle(T) + State.TurretArtAngle[T];
+	if (!(Barrel > 0 && Assets->GetPristineBoneTurned(State.Model, State.LaunchBone[Slot] + FString::Printf(TEXT("%02d"), Barrel + 1), YawBone, Turn, Bone, Anim, bLastFrame))
+		&& !Assets->GetPristineBoneTurned(State.Model, State.LaunchBone[Slot], YawBone, Turn, Bone, Anim, bLastFrame))
 	{
 		return false;
 	}
 	// Weapon::positionProjectileForLaunch: "pitchAdjustment.Rotate_Y(-pitch)" about the turret's pitch
 	// bone, then the turn - the shot leaves the way the raised barrel points.
-	const float Pitch = Obj.TurretPitch[0];
+	const float Pitch = Obj.TurretPitch[T] + State.TurretArtPitch[T];
 	FTransform3f PitchBone;
-	if (FMath::Abs(Pitch) > 1e-4f && !State.TurretPitch.IsEmpty()
-		&& Assets->GetPristineBoneTurned(State.Model, State.TurretPitch, State.Turret, Obj.GetTurretAngle(0), PitchBone, Anim, bLastFrame))
+	if (FMath::Abs(Pitch) > 1e-4f && !PitchBoneName.IsEmpty()
+		&& Assets->GetPristineBoneTurned(State.Model, PitchBoneName, YawBone, Turn, PitchBone, Anim, bLastFrame))
 	{
-		const float Turn = Obj.GetTurretAngle(0);
 		const FVector3f Pivot = PitchBone.GetTranslation();
 		const FQuat4f Raise(FVector3f(-FMath::Sin(Turn), FMath::Cos(Turn), 0.f), -Pitch); // (the model's y axis, turned with the turret)
 		Bone = FTransform3f(Raise * Bone.GetRotation(), Pivot + Raise.RotateVector(Bone.GetTranslation() - Pivot), Bone.GetScale3D());
+	}
+	// getProjectileLaunchOffset: "must use pristine bone here since the result is used by logic" - the Technical's gun
+	// stands where the truck's bed is.
+	if (!Draw->AttachToBone.IsEmpty())
+	{
+		const FGenDrawModule* Primary = Obj.GetTemplate()->PrimaryDraw();
+		const int32 PrimaryIndex = Primary ? Primary->FindBestState(Obj.GetModelConditions()) : INDEX_NONE;
+		FTransform3f Attach;
+		if (Primary && Primary->States.IsValidIndex(PrimaryIndex))
+		{
+			bool bPrimaryLastFrame = false;
+			const FString& PrimaryAnim = PristineAnimation(Primary->States[PrimaryIndex], bPrimaryLastFrame);
+			if (Assets->GetPristineBoneTurned(Primary->States[PrimaryIndex].Model, Draw->AttachToBone, FString(), 0.f, Attach, PrimaryAnim, bPrimaryLastFrame))
+			{
+				Bone.AddToTranslation(Attach.GetTranslation());
+			}
+		}
 	}
 	OutWorld = Bone * Obj.GetTransform();
 	return true;
@@ -486,13 +580,13 @@ void UGenGameLogic::PlayObjectSound(const FGenObject& Obj, std::initializer_list
 
 void UGenGameLogic::DoWeaponFireFX(const FGenObject& Shooter, int32 Slot, const FGenWeaponTemplate& Weapon, const FVector3f& TargetPos)
 {
-	const FGenFXList* List = FX ? FGenFXData::Get().FindFXList(Weapon.FireFX) : nullptr;
+	const FGenFXList* List = FX ? FGenFXData::Get().FindFXList(Weapon.GetFireFX(Shooter.GetVeterancyLevel())) : nullptr;
 	if (!List)
 	{
 		return;
 	}
 	// Weapon::fireWeaponTemplate: a stealthed unit that isn't the watcher's own fires without giving itself away.
-	if (GetStealthLook(Shooter) == EGenStealthLook::Invisible)
+	if (GetStealthLook(Shooter) == EGenStealthLook::Invisible && !Weapon.bPlayFXWhenStealthed && !Shooter.GetTemplate()->IsKindOf(TEXT("MINE")))
 	{
 		return;
 	}
@@ -512,13 +606,14 @@ void UGenGameLogic::PlayPendingFireFX()
 	PendingFireFX.Reset();
 	for (const FPendingFireFX& P : Fired)
 	{
-		const FGenFXList* List = FX && P.Weapon ? FGenFXData::Get().FindFXList(P.Weapon->FireFX) : nullptr;
+		const FGenObject* Shooter = FindObject(P.Shooter);
+		const FGenFXList* List = FX && P.Weapon ? FGenFXData::Get().FindFXList(P.Weapon->GetFireFX(Shooter ? Shooter->GetVeterancyLevel() : 0)) : nullptr;
 		if (!List)
 		{
 			continue;
 		}
 		FTransform3f Xf = P.ShooterXf;
-		if (const FGenObject* Shooter = FindObject(P.Shooter))
+		if (Shooter)
 		{
 			GetWeaponBoneTransform(*Shooter, P.Slot, false, Xf);
 		}

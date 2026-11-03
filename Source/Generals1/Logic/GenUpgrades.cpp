@@ -117,10 +117,8 @@ void FGenObject::GiveObjectUpgrade(const FGenUpgradeTemplate& Upgrade)
 
 void FGenObject::RemoveObjectUpgrade(const FString& UpgradeName)
 {
-	if (ObjectUpgrades.Remove(UpgradeName.ToLower()) == 0)
-	{
-		return;
-	}
+	// (Object::removeUpgrade: whether we have it right now or not, what it runs may run again.)
+	const bool bHad = ObjectUpgrades.Remove(UpgradeName.ToLower()) > 0;
 	for (int32 i = 0; i < Template->UpgradeModules.Num(); ++i)
 	{
 		if (ContainsName(Template->UpgradeModules[i].TriggeredBy, UpgradeName))
@@ -128,7 +126,7 @@ void FGenObject::RemoveObjectUpgrade(const FString& UpgradeName)
 			UpgradeModuleDone[i] = false; // UpgradeMux::resetUpgrade
 		}
 	}
-	UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [upgrade f%u] #%u %s no longer has %s"), Logic->GetFrame(), ID, *Template->Name, *UpgradeName);
+	UE_CLOG(bHad && Logic->IsTracing(), LogGenerals, Log, TEXT("  [upgrade f%u] #%u %s no longer has %s"), Logic->GetFrame(), ID, *Template->Name, *UpgradeName);
 }
 
 void FGenObject::UpdateUpgradeModules()
@@ -138,6 +136,11 @@ void FGenObject::UpdateUpgradeModules()
 	{
 		if (!UpgradeModuleDone[i] && WouldUpgrade(Template->UpgradeModules[i], None))
 		{
+			// UpgradeMux::giveSelfUpgrade: "Need to execute removals first, to prevent both being on for a moment."
+			for (const FString& Removed : Template->UpgradeModules[i].RemovesUpgrades)
+			{
+				RemoveObjectUpgrade(Removed);
+			}
 			UpgradeModuleDone[i] = true;
 			ExecuteUpgradeModule(Template->UpgradeModules[i]);
 		}
@@ -177,9 +180,8 @@ void FGenObject::ExecuteUpgradeModule(const FGenUpgradeModule& Module)
 		break;
 	case EGenUpgradeEffect::PowerPlant:
 	{
-		static const int32 Upgraded = GenConditions::Index(TEXT("POWER_PLANT_UPGRADED"));
 		bPowerPlantUpgraded = true;
-		SetModelCondition(Upgraded, true);
+		ExtendRods(true);
 		break;
 	}
 	case EGenUpgradeEffect::CommandSet:
@@ -204,7 +206,14 @@ void FGenObject::ExecuteUpgradeModule(const FGenUpgradeModule& Module)
 		BonusConditions.AddUnique(PlayerUpgradeFlag);
 		break;
 	case EGenUpgradeEffect::AutoHeal:
-		bAutoHealActive = Template->AutoHeal.bValid;
+		if (Module.bVeterancyAutoHeal)
+		{
+			bVeterancyAutoHealActive = Template->VeterancyAutoHeal.bValid;
+		}
+		else
+		{
+			bAutoHealActive = Template->AutoHeal.bValid;
+		}
 		break;
 	case EGenUpgradeEffect::UnpauseSpecialPower:
 		for (int32 i = 0; i < Template->PowerModules.Num(); ++i)
@@ -292,6 +301,12 @@ void FGenObject::RefreshWeaponSet()
 	// WeaponSet::updateWeaponSet: slots whose weapon changes start fresh, the others keep their state.
 	const FGenGameData& GD = FGenGameData::Get();
 	const FGenWeaponSetEntry* WS = Template->FindWeaponSet(SetFlags);
+	if (WS && WS != WeaponSetEntry && !WS->bLockSharedAcrossSets)
+	{
+		// "release all locks. sorry!"
+		WeaponLockSlot = INDEX_NONE;
+		PermanentLockSlot = INDEX_NONE;
+	}
 	WeaponSetEntry = WS;
 	for (int32 s = 0; s < 3; ++s)
 	{
@@ -332,14 +347,16 @@ void FGenObject::SetOvercharge(bool bOn)
 		return;
 	}
 	bOverchargeActive = bOn;
-	static const int32 Upgraded = GenConditions::Index(TEXT("POWER_PLANT_UPGRADED"));
-	SetModelCondition(Upgraded, bOn || bPowerPlantUpgraded);
+	ExtendRods(bOn || bPowerPlantUpgraded);
 	UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [power f%u] #%u %s overcharge %s"), Logic->GetFrame(), ID, *Template->Name, bOn ? TEXT("on") : TEXT("off"));
 }
 
 float FGenObject::GetWeaponBonus(const FGenWeaponTemplate& Weapon, int32 Field) const
 {
-	if (BonusConditions.Num() == 0)
+	// Weapon::computeBonus: "We may be able to add in our container's flags"
+	const FGenObject* Container = ContainedBy != GenInvalidObjectID ? Logic->FindObject(ContainedBy) : nullptr;
+	const auto* Passed = Container && Container->Template->Contain.bWeaponBonusPassedToPassengers ? &Container->BonusConditions : nullptr;
+	if (BonusConditions.Num() == 0 && (!Passed || Passed->Num() == 0))
 	{
 		return 1.f;
 	}
@@ -351,7 +368,7 @@ float FGenObject::GetWeaponBonus(const FGenWeaponTemplate& Weapon, int32 Field) 
 		for (const FGenWeaponBonus& B : *List)
 		{
 			// (Bonuses of one field add up: 125% and 125% make 150%.)
-			if (int32(B.Field) == Field && BonusConditions.Contains(B.Condition))
+			if (int32(B.Field) == Field && (BonusConditions.Contains(B.Condition) || (Passed && Passed->Contains(B.Condition))))
 			{
 				Factor += B.Value - 1.f;
 			}
@@ -588,12 +605,25 @@ float FGenObject::GetAttackRange(const FGenWeaponTemplate& Weapon) const
 void FGenObject::UpdateAutoHeal(uint32 Frame)
 {
 	// AutoHealBehavior: itself, after it has been left alone for a while; or (Radius) whatever of ours stands near.
+	for (const FGenAutoHeal& More : Template->MoreAutoHeals)
+	{
+		if (Frame % uint32(More.Delay) == 0)
+		{
+			PulseAutoHeal(More, Frame);
+		}
+	}
 	const FGenAutoHeal& H = Template->AutoHeal;
 	if (bAutoHealDone || Frame < NextAutoHealFrame)
 	{
 		return;
 	}
 	NextAutoHealFrame = Frame + uint32(H.Delay);
+	PulseAutoHeal(H, Frame);
+	bAutoHealDone = H.bSingleBurst;
+}
+
+void FGenObject::PulseAutoHeal(const FGenAutoHeal& H, uint32 Frame)
+{
 	if (H.Radius <= 0.f && !H.bAffectsWholePlayer)
 	{
 		if (Health < MaxHealth && (LastDamageFrame == 0 || Frame >= LastDamageFrame + uint32(H.StartDelay)))
@@ -605,7 +635,7 @@ void FGenObject::UpdateAutoHeal(uint32 Frame)
 	for (FGenObjectID Id : Logic->GetObjectIDs())
 	{
 		FGenObject* O = Logic->FindObject(Id);
-		if (!O || O == this || O->bDead || O->bPendingDestroy || O->Projectile.bActive || Logic->GetRelationship(Owner, O->Owner) != EGenRelationship::Allies)
+		if (!O || (O == this && H.bSkipSelf) || O->bDead || O->bPendingDestroy || O->Projectile.bActive || Logic->GetRelationship(Owner, O->Owner) != EGenRelationship::Allies)
 		{
 			continue;
 		}
@@ -620,7 +650,6 @@ void FGenObject::UpdateAutoHeal(uint32 Frame)
 			O->AttemptHealing(H.Amount);
 		}
 	}
-	bAutoHealDone = H.bSingleBurst;
 }
 
 // ---- upgrades: the player's side ----------------------------------------------------------------
@@ -813,7 +842,7 @@ bool UGenGameLogic::CanPurchaseScience(int32 Player, const FString& Science, FSt
 	// Player::isCapableOfPurchasingScience
 	auto No = [OutWhy](const FString& Why) { if (OutWhy) { *OutWhy = Why; } return false; };
 	const FGenScience* S = FGenUpgradeData::Get().FindScience(Science);
-	if (!S || !Players.IsValidIndex(Player) || (MapScripts && MapScripts->IsScienceHidden(Player, Science)))
+	if (!S || !Players.IsValidIndex(Player) || (MapScripts && (MapScripts->IsScienceHidden(Player, Science) || MapScripts->IsScienceDisabled(Player, Science))))
 	{
 		return No(TEXT("Not available"));
 	}
@@ -922,10 +951,76 @@ bool UGenGameLogic::ConsumeScriptEvent(int32 Player, const FString& Name, bool b
 	return Events.RemoveSingle(Name.ToLower()) > 0;
 }
 
+void UGenGameLogic::PromoteToRank(FGenPlayer& Player, int32 TargetLevel)
+{
+	// Player::setRankLevel, one rank at a time: what each rank between gives is granted as it is reached.
+	const TArray<FGenRank>& Ranks = FGenUpgradeData::Get().GetRanks();
+	while (Player.RankLevel < TargetLevel && Player.RankLevel < Ranks.Num())
+	{
+		const FGenRank& Next = Ranks[Player.RankLevel];
+		++Player.RankLevel;
+		Player.SciencePurchasePoints = FMath::Max(0, Player.SciencePurchasePoints + Next.PurchasePointsGranted);
+		for (const FString& S : Next.SciencesGranted)
+		{
+			AddScience(Player.Index, S);
+		}
+		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [science f%u] p%d promoted to rank %d (%d skill points, %d to spend)"), Frame, Player.Index, Player.RankLevel,
+			Player.SkillPoints, Player.SciencePurchasePoints);
+		if (Player.Index == LocalPlayer)
+		{
+			EvaEvent(TEXT("GeneralLevelUp"), Player.Index); // Player::setRankLevel
+			FGenFloatingText& Text = FloatingTexts.AddDefaulted_GetRef();
+			Text.Text = FString::Printf(TEXT("Promoted: rank %d"), Player.RankLevel);
+			Text.Color = FLinearColor(1.f, 0.85f, 0.2f);
+			Text.Frame = Frame;
+			Text.bScreen = true;
+		}
+	}
+}
+
+void UGenGameLogic::SetRankLevel(int32 Player, int32 Level)
+{
+	// Player::setRankLevel (PLAYER_SET_RANKLEVEL): inside the ranks the data has, and inside any limit the map set.
+	if (!Players.IsValidIndex(Player))
+	{
+		return;
+	}
+	const TArray<FGenRank>& Ranks = FGenUpgradeData::Get().GetRanks();
+	if (Ranks.Num() == 0)
+	{
+		return;
+	}
+	Level = FMath::Clamp(Level, 1, Ranks.Num());
+	if (RankLevelLimit > 0)
+	{
+		Level = FMath::Min(Level, RankLevelLimit);
+	}
+	FGenPlayer& P = Players[Player];
+	if (Level == P.RankLevel)
+	{
+		return;
+	}
+	if (Level < P.RankLevel)
+	{
+		// "when downgrading in rank, you lose everything" (Player::resetRank): the general starts again at rank 1
+		// with what that rank grants. The port keeps no record of which science a rank granted, so a demotion here
+		// can only move the level.
+		P.RankLevel = Level;
+		return;
+	}
+	PromoteToRank(P, Level);
+}
+
 void UGenGameLogic::AddSkillPoints(int32 Player, int32 Points)
 {
-	// Player::addSkillPoints / setRankLevel
+	// Player::addSkillPoints
 	if (!Players.IsValidIndex(Player) || Points <= 0)
+	{
+		return;
+	}
+	// (Player::addSkillPoints applies what PLAYER_AFFECT_RECEIVING_EXPERIENCE set: "delta = REAL_TO_INT_CEIL(modifier * delta)".)
+	Points = FMath::CeilToInt32(float(Points) * Players[Player].SkillPointsModifier);
+	if (Points <= 0)
 	{
 		return;
 	}
@@ -938,27 +1033,12 @@ void UGenGameLogic::AddSkillPoints(int32 Player, int32 Points)
 	// (Capped at what the highest rank needs.)
 	P.SkillPoints = FMath::Min(P.SkillPoints + Points, Ranks.Last().SkillPointsNeeded);
 	// (Player::setRankLevel: a campaign's scripts may hold the general below some rank.)
-	while (P.RankLevel < Ranks.Num() && P.SkillPoints >= Ranks[P.RankLevel].SkillPointsNeeded && (RankLevelLimit <= 0 || P.RankLevel < RankLevelLimit))
+	int32 Target = P.RankLevel;
+	while (Target < Ranks.Num() && P.SkillPoints >= Ranks[Target].SkillPointsNeeded && (RankLevelLimit <= 0 || Target < RankLevelLimit))
 	{
-		const FGenRank& Next = Ranks[P.RankLevel];
-		++P.RankLevel;
-		P.SciencePurchasePoints = FMath::Max(0, P.SciencePurchasePoints + Next.PurchasePointsGranted);
-		for (const FString& S : Next.SciencesGranted)
-		{
-			AddScience(Player, S);
-		}
-		UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [science f%u] p%d promoted to rank %d (%d skill points, %d to spend)"), Frame, Player, P.RankLevel,
-			P.SkillPoints, P.SciencePurchasePoints);
-		if (Player == LocalPlayer)
-		{
-			EvaEvent(TEXT("GeneralLevelUp"), Player); // Player::setRankLevel
-			FGenFloatingText& Text = FloatingTexts.AddDefaulted_GetRef();
-			Text.Text = FString::Printf(TEXT("Promoted: rank %d"), P.RankLevel);
-			Text.Color = FLinearColor(1.f, 0.85f, 0.2f);
-			Text.Frame = Frame;
-			Text.bScreen = true;
-		}
+		++Target;
 	}
+	PromoteToRank(P, Target);
 }
 
 void UGenGameLogic::OnObjectKilled(const FGenObject& Victim, FGenObjectID KillerId)

@@ -2,6 +2,7 @@
 #include "Core/GenFileSystem.h"
 #include "Logic/GenLogicTypes.h"
 #include "Generals1.h"
+#include "HAL/FileManager.h"
 #include "HAL/IConsoleManager.h"
 #include "HAL/PlatformProcess.h"
 #include "Misc/CommandLine.h"
@@ -52,7 +53,7 @@ void FGenSkirmishSlot::Serialize(FArchive& Ar)
 
 void FGenMatchSettings::Serialize(FArchive& Ar)
 {
-	Ar << Map << Campaign << Mission << StartingCash << Seed;
+	Ar << Map << Campaign << Mission << ChallengeFaction << StartingCash << Seed;
 	int32 NumSlots = Slots.Num();
 	Ar << NumSlots;
 	if (Ar.IsLoading())
@@ -292,4 +293,105 @@ bool FGenReplay::SaveChecksumLog(const FString& Path) const
 FString FGenReplay::GetDefaultFolder()
 {
 	return FPaths::ProjectSavedDir() / TEXT("Replays");
+}
+
+// ---- saved games ----------------------------------------------------------------------------------
+
+void FGenSavedGame::SerializeHeader(FArchive& Ar)
+{
+	Ar << Title << Date << SortKey << Frame;
+	Ar << CameraTarget << CameraYaw << CameraHeight;
+}
+
+bool FGenSavedGame::Save(const FString& Path)
+{
+	TArray<uint8> Bytes;
+	FMemoryWriter Writer(Bytes);
+	uint32 M = Magic, V = Version;
+	Writer << M << V;
+	SerializeHeader(Writer);
+	Writer << Selection;
+	for (TArray<FGenObjectID>& Group : Groups)
+	{
+		Writer << Group;
+	}
+	Replay.Serialize(Writer);
+	return FFileHelper::SaveArrayToFile(Bytes, *Path);
+}
+
+bool FGenSavedGame::Load(const FString& Path, FString* OutWhy)
+{
+	TArray<uint8> Bytes;
+	if (!FFileHelper::LoadFileToArray(Bytes, *Path))
+	{
+		if (OutWhy) { *OutWhy = TEXT("can't read the file"); }
+		return false;
+	}
+	FMemoryReader Reader(Bytes);
+	uint32 M = 0, V = 0;
+	Reader << M << V;
+	if (M != Magic || V != Version)
+	{
+		if (OutWhy) { *OutWhy = M != Magic ? FString(TEXT("not a saved game")) : FString::Printf(TEXT("a saved game of version %u (this game reads %u)"), V, Version); }
+		return false;
+	}
+	SerializeHeader(Reader);
+	Reader << Selection;
+	for (TArray<FGenObjectID>& Group : Groups)
+	{
+		Reader << Group;
+	}
+	Replay.Serialize(Reader);
+	if (Reader.IsError())
+	{
+		if (OutWhy) { *OutWhy = TEXT("the file is damaged"); }
+		return false;
+	}
+	return true;
+}
+
+FString FGenSavedGame::GetFolder()
+{
+	return FPaths::ProjectSavedDir() / TEXT("SaveGames") / TEXT("Generals");
+}
+
+void FGenSavedGame::List(TArray<FGenSaveInfo>& Out)
+{
+	Out.Reset();
+	const FString Folder = GetFolder();
+	TArray<FString> Files;
+	IFileManager::Get().FindFiles(Files, *(Folder / TEXT("*.gensave")), true, false);
+	for (const FString& File : Files)
+	{
+		const FString Path = Folder / File;
+		TUniquePtr<FArchive> Reader(IFileManager::Get().CreateFileReader(*Path));
+		if (!Reader)
+		{
+			continue;
+		}
+		uint32 M = 0, V = 0;
+		*Reader << M << V;
+		if (M != Magic || V != Version)
+		{
+			continue;
+		}
+		FGenSavedGame Header;
+		Header.SerializeHeader(*Reader);
+		if (Reader->IsError())
+		{
+			continue;
+		}
+		FGenSaveInfo& Info = Out.AddDefaulted_GetRef();
+		Info.Path = Path;
+		Info.Title = Header.Title;
+		Info.Date = Header.Date;
+		Info.SortKey = Header.SortKey;
+		Info.Frame = Header.Frame;
+	}
+	Out.StableSort([](const FGenSaveInfo& A, const FGenSaveInfo& B) { return A.SortKey > B.SortKey; });
+}
+
+void FGenSavedGame::Delete(const FString& Path)
+{
+	IFileManager::Get().Delete(*Path);
 }

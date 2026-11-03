@@ -349,6 +349,14 @@ bool FGenObject::DockAction(FGenObject& Docker)
 
 // ---- dockers ------------------------------------------------------------------------------------
 
+void FGenObject::ResumeSupplyTrucking()
+{
+	if (Template->bIsSupplyTruck && IsAIIdle())
+	{
+		bForceWanting = true;
+	}
+}
+
 bool FGenObject::IsAIIdle() const
 {
 	// (JetAIUpdate::isIdle: an aircraft busy with its airfield routine, or with an order waiting, is not idle.)
@@ -565,6 +573,12 @@ void FGenObject::UpdateDocking(uint32 Frame)
 			DockApproachIndex = -1;
 			SetModelCondition(DockingEndingBit(), false);
 			D->SetModelCondition(DockingEndingBit(), false);
+			// AIDockMoveToRallyState (RepairDockUpdate::isRallyPointAfterDockType: "A minority of docks want to give you
+			// a final command to their rally point"): mended, a vehicle goes on to where the building sends what it makes.
+			if (D->Template->bRepairDock && D->HasRallyPoint())
+			{
+				StartPath(D->GetRallyPoint(), false);
+			}
 		}
 		break;
 
@@ -595,6 +609,9 @@ void FGenObject::OnPlayerCommand(bool bDockOrder)
 		EndCombatDrop(); // ... and the flight to a combat drop (once the ropes are out, orders wait)
 	}
 	bHasExitRally = false; // an order replaces the trip to the rally point
+	ChinookEvacStep = 0;   // ... and a landing that empties a helicopter
+	bChinookPendingMove = false;
+	bEvacuateOnArrival = false;
 	SetChinookHealAirfield(GenInvalidObjectID); // ... and a helicopter's stay at an airfield (ChinookAIUpdate::aiDoCommand)
 	StopEntering();        // ... and the walk to a transport or a building
 	ExitAbility(false);    // ... and a capture under way

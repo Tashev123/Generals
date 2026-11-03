@@ -6,9 +6,9 @@
 #include "GenericPlatform/ICursor.h"
 #include "Generals1.h"
 
-static TAutoConsoleVariable<int32> CVarGenCursorScale(
-	TEXT("gen.CursorScale"), 0,
-	TEXT("How many screen pixels a pixel of the game's 32 x 32 cursors takes. 0: by the height of the screen (1 up to 1200 lines, 2 up to 2000, 3 above)."));
+static TAutoConsoleVariable<float> CVarGenCursorScale(
+	TEXT("gen.CursorScale"), 0.f,
+	TEXT("How many screen pixels a pixel of the game's 32 x 32 cursors takes. 0: by the height of the screen (1 up to 1200 lines, 1.5 up to 2000, 2 above)."));
 
 static TAutoConsoleVariable<int32> CVarGenCursors(
 	TEXT("gen.Cursors"), 1,
@@ -38,14 +38,14 @@ int32 FGenCursorImage::StepAt(double Seconds) const
 	return Steps.Num() - 1;
 }
 
-int32 FGenCursors::GetScale(int32 ViewportHeight)
+float FGenCursors::GetScale(int32 ViewportHeight)
 {
-	const int32 Asked = CVarGenCursorScale.GetValueOnGameThread();
-	if (Asked > 0)
+	const float Asked = CVarGenCursorScale.GetValueOnGameThread();
+	if (Asked > 0.f)
 	{
-		return FMath::Min(Asked, 8);
+		return FMath::Min(Asked, 8.f);
 	}
-	return ViewportHeight > 2000 ? 3 : (ViewportHeight > 1200 ? 2 : 1);
+	return ViewportHeight > 2000 ? 2.f : (ViewportHeight > 1200 ? 1.5f : 1.f);
 }
 
 void FGenCursors::Initialize()
@@ -117,6 +117,25 @@ FGenCursorImage* FGenCursors::Load(const FString& File)
 
 namespace
 {
+	/** A spot of a picture, its pixels weighed by how much they cover: red, green, blue (each times its cover) and cover, 0 to 1. */
+	FVector4f SampleCursor(const TArray<FColor>& Pixels, int32 W, int32 H, float X, float Y)
+	{
+		const int32 X0 = FMath::FloorToInt32(X), Y0 = FMath::FloorToInt32(Y);
+		const float FX = X - float(X0), FY = Y - float(Y0);
+		FVector4f Sum(0.f, 0.f, 0.f, 0.f);
+		auto Add = [&](int32 PX, int32 PY, float Weight)
+		{
+			const FColor& C = Pixels[FMath::Clamp(PY, 0, H - 1) * W + FMath::Clamp(PX, 0, W - 1)];
+			const float A = float(C.A) / 255.f * Weight;
+			Sum += FVector4f(float(C.R) / 255.f * A, float(C.G) / 255.f * A, float(C.B) / 255.f * A, A);
+		};
+		Add(X0, Y0, (1.f - FX) * (1.f - FY));
+		Add(X0 + 1, Y0, FX * (1.f - FY));
+		Add(X0, Y0 + 1, (1.f - FX) * FY);
+		Add(X0 + 1, Y0 + 1, FX * FY);
+		return Sum;
+	}
+
 	uint32 ReadU32(const uint8* P) { return uint32(P[0]) | (uint32(P[1]) << 8) | (uint32(P[2]) << 16) | (uint32(P[3]) << 24); }
 	uint16 ReadU16(const uint8* P) { return uint16(uint32(P[0]) | (uint32(P[1]) << 8)); }
 
@@ -309,36 +328,72 @@ void FGenCursors::Show(APlayerController* PC, const FString& Name, int32 Directi
 		return;
 	}
 	const int32 Frame = Image->Steps.IsValidIndex(0) ? Image->Steps[Image->StepAt(Now - CurrentSince)].Frame : 0;
-	const int32 Scale = GetScale(ViewportHeight);
+	const float Scale = GetScale(ViewportHeight);
 	TSharedPtr<ICursor> Platform = FSlateApplication::IsInitialized() ? FSlateApplication::Get().GetPlatformCursor() : nullptr;
 	if (Platform.IsValid() && Platform->IsCreateCursorFromRGBABufferSupported())
 	{
 		if (Image->HandleScale != Scale)
 		{
-			// The frames as cursors of the platform's, each pixel Scale by Scale (nothing smoothed: they are drawn pixel by pixel).
+			// The steps as cursors of the platform's, at that size, each with what lies between it and the next one.
 			Image->HandleScale = Scale;
-			Image->Handles.Reset();
-			const int32 W = Image->Width * Scale, H = Image->Height * Scale;
+			Image->Smooth.Reset();
+			const int32 W = FMath::RoundToInt32(float(Image->Width) * Scale), H = FMath::RoundToInt32(float(Image->Height) * Scale);
 			TArray<FColor> Big;
 			Big.SetNumUninitialized(W * H);
-			const FVector2D Hot((double(Image->HotSpot.X) + (Scale > 1 ? 0.5 : 0.0)) / double(Image->Width), (double(Image->HotSpot.Y) + (Scale > 1 ? 0.5 : 0.0)) / double(Image->Height));
-			for (const TArray<FColor>& Pixels : Image->Frames)
+			const double HotShift = Scale > 1.f ? 0.5 : 0.0;
+			const FVector2D Hot((double(Image->HotSpot.X) + HotShift) / double(Image->Width), (double(Image->HotSpot.Y) + HotShift) / double(Image->Height));
+			constexpr float SmoothStepSeconds = 1.f / 30.f;
+			bool bFailed = false;
+			auto MakeCursor = [&](const TArray<FColor>& From, const TArray<FColor>& To, float Blend)
 			{
 				for (int32 y = 0; y < H; ++y)
 				{
 					for (int32 x = 0; x < W; ++x)
 					{
+						const float SX = (float(x) + 0.5f) / Scale - 0.5f, SY = (float(y) + 0.5f) / Scale - 0.5f;
+						FVector4f S = SampleCursor(From, Image->Width, Image->Height, SX, SY);
+						if (Blend > 0.f)
+						{
+							S = S * (1.f - Blend) + SampleCursor(To, Image->Width, Image->Height, SX, SY) * Blend;
+						}
+						const float Cover = FMath::Max(S.W, 1e-4f);
 						// (The platform wants the bytes red first: an FColor has them blue first.)
-						const FColor C = Pixels[(y / Scale) * Image->Width + (x / Scale)];
-						Big[y * W + x] = FColor(C.B, C.G, C.R, C.A);
+						Big[y * W + x] = FColor(uint8(FMath::Clamp(S.Z / Cover, 0.f, 1.f) * 255.f + 0.5f), uint8(FMath::Clamp(S.Y / Cover, 0.f, 1.f) * 255.f + 0.5f),
+							uint8(FMath::Clamp(S.X / Cover, 0.f, 1.f) * 255.f + 0.5f), uint8(FMath::Clamp(S.W, 0.f, 1.f) * 255.f + 0.5f));
 					}
 				}
-				Image->Handles.Add(Platform->CreateCursorFromRGBABuffer(Big.GetData(), W, H, Hot));
+				void* Made = Platform->CreateCursorFromRGBABuffer(Big.GetData(), W, H, Hot);
+				bFailed = bFailed || !Made;
+				return Made;
+			};
+			for (int32 i = 0; i < Image->Steps.Num(); ++i)
+			{
+				const FGenCursorImage::FStep& Step = Image->Steps[i];
+				const FGenCursorImage::FStep& NextStep = Image->Steps[(i + 1) % Image->Steps.Num()];
+				const int32 Parts = NextStep.Frame != Step.Frame ? FMath::Clamp(FMath::RoundToInt32(Step.Seconds / SmoothStepSeconds), 1, 4) : 1;
+				for (int32 Part = 0; Part < Parts; ++Part)
+				{
+					Image->Smooth.Add({ MakeCursor(Image->Frames[Step.Frame], Image->Frames[NextStep.Frame], float(Part) / float(Parts)), Step.Seconds / float(Parts) });
+				}
 			}
-			UE_LOG(LogGenerals, Log, TEXT("Cursors: %s.ani - %d frame(s), %d step(s) in %.2f s, hot spot (%d, %d) - made into the platform's at x%d (the view is %d high)%s"), *Image->File,
-				Image->Frames.Num(), Image->Steps.Num(), Image->Duration, Image->HotSpot.X, Image->HotSpot.Y, Scale, ViewportHeight, Image->Handles.Contains(nullptr) ? TEXT(": FAILED") : TEXT(""));
+			UE_LOG(LogGenerals, Log, TEXT("Cursors: %s.ani - %d frame(s), %d step(s) in %.2f s, hot spot (%d, %d) - made into %d of the platform's at x%.2f (the view is %d high)%s"), *Image->File,
+				Image->Frames.Num(), Image->Steps.Num(), Image->Duration, Image->HotSpot.X, Image->HotSpot.Y, Image->Smooth.Num(), Scale, ViewportHeight, bFailed ? TEXT(": FAILED") : TEXT(""));
 		}
-		void* Handle = Image->Handles.IsValidIndex(Frame) ? Image->Handles[Frame] : nullptr;
+		void* Handle = nullptr;
+		if (Image->Smooth.Num() > 0)
+		{
+			float T = Image->Duration > 0.f ? float(FMath::Fmod(Now - CurrentSince, double(Image->Duration))) : 0.f;
+			Handle = Image->Smooth.Last().Handle;
+			for (const FGenCursorImage::FSmoothStep& Step : Image->Smooth)
+			{
+				if (T < Step.Seconds)
+				{
+					Handle = Step.Handle;
+					break;
+				}
+				T -= Step.Seconds;
+			}
+		}
 		if (Handle && Handle != CurrentHandle)
 		{
 			CurrentHandle = Handle;

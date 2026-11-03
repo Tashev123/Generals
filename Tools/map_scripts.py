@@ -141,6 +141,11 @@ for cname, cver, s, e in r.chunks(len(data)):
                                                                     "objectStoppingDistance", "objectMaxHPs", "objectRadius")}
                 if "objectName" in props or "waypointName" in props or props.get("originalOwner", "").find("/") >= 0 or "objectScriptAttachment" in props:
                     out.append(f"OBJECT {oname} at ({x:.0f},{y:.0f},{z:.0f}) ang={ang:.2f} {keep}")
+    elif cname == "WaypointsList":
+        n = r.i32()
+        for _ in range(n):
+            a, b = r.i32(), r.i32()
+            out.append(f"LINK {a} {b}")
     elif cname == "PolygonTriggers":
         n = r.i32()
         for _ in range(n):

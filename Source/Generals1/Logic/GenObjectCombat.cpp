@@ -131,7 +131,7 @@ void FGenObject::InitCombat()
 	FlameDamageLimit = Template->Flammable.FlameDamageLimit;
 	for (int32 t = 0; t < 2; ++t)
 	{
-		TurretAngle[t] = PrevTurretAngle[t] = DrawTurretAngle[t] = Template->Turrets[t].NaturalAngle;
+		TurretAngle[t] = PrevTurretAngle[t] = DrawTurretAngle[t] = TurretAngleLastFrame[t] = Template->Turrets[t].NaturalAngle;
 	}
 }
 
@@ -168,6 +168,150 @@ bool FGenObject::ContainsPoint(const FVector3f& P) const
 		return FMath::Abs(Dx * C + Dy * S) <= Template->GeometryMajorRadius && FMath::Abs(-Dx * S + Dy * C) <= Template->GeometryMinorRadius;
 	}
 	return Dx * Dx + Dy * Dy <= Template->GeometryMajorRadius * Template->GeometryMajorRadius;
+}
+
+bool FGenObject::ShouldProjectileCollideWith(const FGenWeaponTemplate& W, const FGenObject& Other) const
+{
+	// WeaponTemplate::shouldProjectileCollideWith, for what isn't the intended victim.
+	const FGenObject* Launcher = Logic->FindObject(Projectile.Launcher);
+	if (Launcher)
+	{
+		// "Don't hit your own launcher, ever." "If our launcher is inside something, and that something is
+		// 'thingWeCollidedWith' we won't collide"
+		if (Launcher == &Other || Launcher->ContainedBy == Other.ID)
+		{
+			return false;
+		}
+	}
+	// "never bother burning already-burned things."
+	if (Other.bBurned && (W.DamageType.Equals(TEXT("FLAME"), ESearchCase::IgnoreCase) || W.DamageType.Equals(TEXT("PARTICLE_BEAM"), ESearchCase::IgnoreCase)))
+	{
+		return false;
+	}
+	// "horrible special case for airplanes sitting on airfields"
+	if (Other.Parking && Other.Parking->HasReservedSpace(Projectile.Victim))
+	{
+		return false;
+	}
+	// "if something has a Sneaky Target offset, it is momentarily immune to being hit..."
+	if (Other.GetSneakyTargetingOffset(nullptr))
+	{
+		return false;
+	}
+	uint32 Required = 0;
+	const EGenRelationship Rel = Logic->GetRelationship(*this, Other);
+	if (Rel == EGenRelationship::Allies) { Required = GenWeaponCollide::Allies; }
+	else if (Rel == EGenRelationship::Enemies) { Required = GenWeaponCollide::Enemies; }
+	if (Other.IsKindOf(TEXT("STRUCTURE")))
+	{
+		Required |= Other.Owner == Owner ? GenWeaponCollide::ControlledStructures : GenWeaponCollide::Structures;
+	}
+	if (Other.IsKindOf(TEXT("SHRUBBERY"))) { Required |= GenWeaponCollide::Shrubbery; }
+	if (Other.Template->FenceWidth > 0.f) { Required |= GenWeaponCollide::Walls; }
+	return (W.ProjectileCollideMask & Required) != 0;
+}
+
+const FGenObject* FGenObject::FindProjectileCollision(const FGenWeaponTemplate& W, const FVector3f& From, const FVector3f& To, FVector3f& OutAt) const
+{
+	GEN_PERF_SCOPE("Obj.ProjectileCollide");
+	// PartitionManager's collisions, seen from the shot. The victim has its own test; projectiles are nothing the game's
+	// data asks to run into. What goes up at the first of four points along the move, of the lowest id at that point.
+	const FVector2f Mid((From.X + To.X) * 0.5f, (From.Y + To.Y) * 0.5f);
+	const float Reach = FVector2f::Distance(FVector2f(From.X, From.Y), FVector2f(To.X, To.Y)) * 0.5f;
+	const FGenObject* Best = nullptr;
+	int32 BestStep = 5;
+	Logic->GetPartition().ForEachInRange(Mid, Reach + 1.f, [&](FGenObject& Other)
+	{
+		if (&Other == this || Other.ID == Projectile.Victim || Other.bDead || Other.bPendingDestroy || Other.ContainedBy != GenInvalidObjectID
+			|| Other.Projectile.bActive || Other.bMasked)
+		{
+			return;
+		}
+		for (int32 i = 1; i <= 4 && i <= BestStep; ++i)
+		{
+			if (Other.ContainsPoint(FMath::Lerp(From, To, float(i) / 4.f)))
+			{
+				if ((i < BestStep || (Best && Other.ID < Best->ID)) && !Other.IsKindOf(TEXT("NO_COLLIDE")) && !Other.IsKindOf(TEXT("PROJECTILE")) && ShouldProjectileCollideWith(W, Other))
+				{
+					Best = &Other;
+					BestStep = i;
+				}
+				return;
+			}
+		}
+	});
+	if (Best)
+	{
+		OutAt = FMath::Lerp(From, To, float(BestStep) / 4.f);
+		UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [collide f%u] #%u %s runs into #%u %s at (%.0f, %.0f, %.0f)"), Logic->GetFrame(), ID, *Template->Name, Best->ID,
+			*Best->Template->Name, OutAt.X, OutAt.Y, OutAt.Z);
+	}
+	return Best;
+}
+
+void FGenObject::ApplyShockWave(const FVector3f& FromBlast, const FGenWeaponTemplate& W)
+{
+	// Object::attemptDamage: "Process any shockwave forces that might affect this object due to the incurred damage"
+	if (W.ShockWaveAmount <= 0.f || W.ShockWaveRadius <= 0.f || !Template->bHasPhysics || Projectile.bActive || IsAirborneTarget())
+	{
+		return;
+	}
+	const float Distance = FromBlast.Size();
+	const float DistanceFromCenter = FMath::Min(1.f, Distance / W.ShockWaveRadius);
+	const float ShockTaperMult = 1.f - DistanceFromCenter * (1.f - W.ShockWaveTaperOff);
+	// (Weapon::dealDamageInternal: "Guard against zero vector. Make vector stright up if that is the case")
+	const FVector3f Dir = Distance > 1.e-4f ? FromBlast / Distance : FVector3f(0.f, 0.f, 1.f);
+	FVector3f Force = Dir * (W.ShockWaveAmount * ShockTaperMult);
+	Force.Z = Force.Size(); // "Apply up force equal to the lateral force for dramatic effect"
+	// PhysicsBehavior::applyForce: "Only accept the lateral acceleration" from what is driving itself.
+	if (Logic->GetFrame() < MotiveForceExpires)
+	{
+		const FVector2f Heading = GetDirection2D();
+		const float LateralDot = Force.X * (-Heading.Y) + Force.Y * Heading.X;
+		Force.X = LateralDot * -Heading.Y;
+		Force.Y = LateralDot * Heading.X;
+	}
+	ApplyForce(Force);
+	// PhysicsBehavior::applyRandomRotation: "Ignore any pitch, roll & yaw rotation if behavior is stick to ground"
+	if (Locomotor && Locomotor->bStickToGround)
+	{
+		return; // (it slides along the ground: UpdatePhysics keeps it down)
+	}
+	FRandomStream& Rand = Logic->GetRandom();
+	YawRate += 0.05f * Rand.FRandRange(-1.f, 1.f);    // DEFAULT_SHOCK_YAW (no object in the data has its own)
+	PitchRate += 0.025f * Rand.FRandRange(-1.f, 1.f); // DEFAULT_SHOCK_PITCH
+	RollRate += 0.025f * Rand.FRandRange(-1.f, 1.f);  // DEFAULT_SHOCK_ROLL
+	bAllowBounce = true;
+	if (bDead)
+	{
+		bFreePhysics = true;
+	}
+	else
+	{
+		bStunned = true;
+	}
+	UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [shock f%u] #%u %s thrown by (%.1f, %.1f, %.1f) by %s"), Logic->GetFrame(), ID, *Template->Name, Force.X, Force.Y, Force.Z, *W.Name);
+}
+
+int32 FGenObject::SlowDeathWeight(const FGenSlowDeath& D) const
+{
+	// SlowDeathBehavior::getProbabilityModifier: "pick more spectacular deaths when severly killed"
+	return FMath::Max(D.ProbabilityModifier + int32(LastOverkillPercent * D.ModifierBonusPerOverkillPercent), 1);
+}
+
+void FGenObject::TestStunnedUnitForDestruction()
+{
+	// PhysicsBehavior::testStunnedUnitForDestruction: "If a stunned object is upside down when it hits the ground, kill it"
+	if (Rotation.RotateVector(FVector3f::UpVector).Z < 0.f)
+	{
+		Kill();
+		return;
+	}
+	// "Check if unit has exited playable area. If so, kill it"; "stuck on cliffs"; "stuck on water" - no way of moving there.
+	if (Locomotor && (Logic->GetPathfinder().LocomotorSurfacesAt(FVector2f(Position.X, Position.Y), Layer) & GetPathSurfaces()) == 0)
+	{
+		Kill();
+	}
 }
 
 bool FGenObject::IsTargetable() const
@@ -470,6 +614,29 @@ int32 FGenObject::ChooseWeapon(const FGenObject& Target) const
 	return Best;
 }
 
+FGenObject* FGenObject::FindMoodTarget() const
+{
+	// AI::getAdjustedVisionRangeForObject, AI_VISIONFACTOR_MOOD (AIData.ini: AlertRangeModifier, AggressiveRangeModifier).
+	const float Range = GetVisionRange() * (ScriptAttitude >= 2 ? 1.5f : 1.1f);
+	FGenObject* Best = nullptr;
+	float BestDistSq = FLT_MAX;
+	Logic->GetPartition().ForEachInRange(FVector2f(Position.X, Position.Y), Range, [&](FGenObject& Other)
+	{
+		if (&Other == this || !Other.IsAttackable() || (Other.IsStealthed() && !Other.IsDetected())
+			|| Logic->GetRelationship(*this, Other) != EGenRelationship::Enemies || ChooseWeapon(Other) == INDEX_NONE)
+		{
+			return;
+		}
+		const float DistSq = (Other.Position - Position).SizeSquared();
+		if (DistSq < BestDistSq || (DistSq == BestDistSq && Best && Other.ID < Best->ID))
+		{
+			BestDistSq = DistSq;
+			Best = &Other;
+		}
+	});
+	return Best;
+}
+
 FGenObject* FGenObject::FindAutoTarget() const
 {
 	GEN_PERF_SCOPE("Obj.FindAutoTarget");
@@ -490,11 +657,18 @@ FGenObject* FGenObject::FindAutoTarget() const
 	// reaches what it touches, that is where the mines it may clear are.
 	const float MineRange = bMineTool ? GetVisionRange() : 0.f;
 	MaxRange = FMath::Max(MaxRange, MineRange);
+	// (AIUpdateInterface::getNextMoodTarget hands findClosestEnemy the team's set.)
+	if (AttackInfo)
+	{
+		FGenObject* Chosen = FindEnemyByPriority(MaxRange, nullptr);
+		const int32 Slot = Chosen ? ChooseWeapon(*Chosen) : INDEX_NONE;
+		return Slot != INDEX_NONE && AttackDistance(*Chosen) <= FMath::Max(GetAttackRange(*Weapons[Slot].Template), Weapons[Slot].Template->bAntiMine ? MineRange : 0.f) ? Chosen : nullptr;
+	}
 	Logic->GetPartition().ForEachInRange(FVector2f(Position.X, Position.Y), MaxRange + Template->GetBoundingCircleRadius(), [&](FGenObject& Other)
 	{
 		FGenObject* O = &Other;
 		// (PartitionFilterStealthedAndUndetected: what is stealthed and not shown up is no target.)
-		if (O == this || !O->IsAttackable() || Logic->GetRelationship(Owner, O->Owner) != EGenRelationship::Enemies)
+		if (O == this || !O->IsAttackable() || Logic->GetRelationship(*this, *O) != EGenRelationship::Enemies)
 		{
 			return;
 		}
@@ -521,6 +695,17 @@ FGenObject* FGenObject::FindAutoTarget() const
 
 void FGenObject::CommandAttack(FGenObjectID Target, bool bForce)
 {
+	// FlightDeckBehavior's aiDoCommand is the whole of a deck's AI ("The carrier is a dumb stump that only
+	// propagates orders to it's aircraft"), so an order that reaches the ship is kept by its deck and passed
+	// on to the aircraft standing on it. Only the ship is ordered this way - what a plane on the deck is
+	// given is the deck's order handed back to it, so the deck must not be ordered again from inside that.
+	if (FGenParkingPlace* Deck = GetParking(); Deck && Deck->IsFlightDeck() && Deck->GetAirfieldID() == ID)
+	{
+		if (Deck->OrderDeck(bForce ? EGenCommandType::ForceAttack : EGenCommandType::Attack, FVector3f::ZeroVector, Target))
+		{
+			return;
+		}
+	}
 	AttackShotsLeft = -1;
 	if (bDead || !HasWeapons() || Target == ID)
 	{
@@ -531,7 +716,7 @@ void FGenObject::CommandAttack(FGenObjectID Target, bool bForce)
 	if (const FGenObject* Victim = Logic->FindObject(Target))
 	{
 		// ("force-attack allows you to attack disguised things, which also happen to be stealthed")
-		if (Victim->IsStealthedAndUndetected() && Logic->GetRelationship(Owner, Victim->Owner) != EGenRelationship::Allies && !(bForce && Victim->IsDisguised()))
+		if (Victim->IsStealthedAndUndetected() && Logic->GetRelationship(*this, *Victim) != EGenRelationship::Allies && !(bForce && Victim->IsDisguised()))
 		{
 			return;
 		}
@@ -630,6 +815,7 @@ void FGenObject::ClearAttack()
 	for (FGenWeaponInstance& WI : Weapons)
 	{
 		WI.PreAttackDoneFrame = 0;
+		WI.bLeechRangeActive = false; // (Object::clearLeechRangeModeForAllWeapons, AIAttackState::onExit)
 	}
 	ConsecutiveVictim = GenInvalidObjectID;
 	ConsecutiveShots = 0;
@@ -685,10 +871,19 @@ bool FGenObject::AimAtPoint(const FVector3f& Point, bool bGroundTarget, int32 Sl
 	{
 		// TurretAI: rotate the turret (relative to the body) towards the target.
 		const float DesiredRel = GenLogic::AngleDiff(Desired, Orientation);
-		const float Diff = GenLogic::AngleDiff(DesiredRel, TurretAngle[T]);
-		const float Rate = Template->Turrets[T].TurnRate;
+		// TurretAIAimTurretState: a gun with a sweep swings from one side of the target to the other while it fires.
+		const float Sweep = Slot >= 0 && Slot < 3 ? Template->Turrets[T].FireAngleSweep[Slot] : 0.f;
+		const bool bSweeping = Sweep > 0.f && TurretFiredUntil[T] > Logic->GetFrame();
+		const float AimRel = bSweeping ? DesiredRel + (bTurretSweepPositive[T] ? Sweep : -Sweep) : DesiredRel;
+		const float Diff = GenLogic::AngleDiff(AimRel, TurretAngle[T]);
+		const float Rate = Template->Turrets[T].TurnRate * (bSweeping ? Template->Turrets[T].SweepSpeedModifier[Slot] : 1.f);
 		TurretAngle[T] = GenLogic::NormalizeAngle(TurretAngle[T] + FMath::Clamp(Diff, -Rate, Rate));
 		TurretIdleSince[T] = Logic->GetFrame();
+		if (Sweep > 0.f && FMath::Abs(GenLogic::AngleDiff(AimRel, TurretAngle[T])) <= 0.035f)
+		{
+			bTurretSweepPositive[T] = !bTurretSweepPositive[T];
+			UE_CLOG(bSweeping && Logic->IsTracing(), LogGenerals, Log, TEXT("  [sweep f%u] #%u %s turret %d swings back at %.0f degrees"), Logic->GetFrame(), ID, *Template->Name, T, FMath::RadiansToDegrees(TurretAngle[T]));
+		}
 		bool bPitchAligned = true;
 		const FGenTurretData& TD = Template->Turrets[T];
 		if (TD.bAllowsPitch)
@@ -711,10 +906,13 @@ bool FGenObject::AimAtPoint(const FVector3f& Point, bool bGroundTarget, int32 Sl
 			}
 			bPitchAligned = TurnTurretTowardsPitch(T, DesiredPitch, 1.f);
 		}
-		return bPitchAligned && FMath::Abs(GenLogic::AngleDiff(DesiredRel, TurretAngle[T])) <= Tolerance;
+		// ("turnAlignedToNemesis = (fabs(angleDiff) < sweep)")
+		return bPitchAligned && FMath::Abs(GenLogic::AngleDiff(DesiredRel, TurretAngle[T])) <= (Sweep > 0.f ? Sweep : Tolerance);
 	}
 
-	if (!CanMove())
+	// (A stinger site's soldier is held to his spot - DISABLED_HELD - but AIUpdate goes on for that: he doesn't walk, he
+	// does turn to aim. Else the missile leaves the way he happens to face, and loops round the site to its target.)
+	if (!Locomotor || !bHasAI || Template->IsKindOf(TEXT("IMMOBILE")) || Template->IsKindOf(TEXT("STRUCTURE")) || ScuttleFrame != 0)
 	{
 		return true; // fixed weapons without a turret fire in any direction
 	}
@@ -1061,11 +1259,21 @@ void FGenObject::FinishShot(int32 Slot, FGenObjectID Victim, uint32 Frame)
 	++WI.FireCount;
 	WI.LastShotFrame = Frame;
 	WI.PreAttackDoneFrame = 0;
+	WI.bLeechRangeActive = W.bLeechRange; // Weapon::privateFireWeapon
+	// FiringTracker::shotFired: "Push back the time that we should force a reload with each shot"
+	if (W.AutoReloadWhenIdle > 0)
+	{
+		ForceReloadFrame = Frame + uint32(W.AutoReloadWhenIdle);
+	}
 	// FiringTracker::shotFired
 	ConsecutiveShots = ConsecutiveVictim == Victim ? ConsecutiveShots + 1 : 1;
 	ConsecutiveVictim = Victim;
 	SetFiringConditions(Slot, FS_Firing);
 	FiringConditionEnd[Slot] = Frame + 1;
+	if (const int32 FiredTurret = TurretForSlot(Slot); FiredTurret != INDEX_NONE)
+	{
+		TurretFiredUntil[FiredTurret] = Frame + 3; // (TurretAI: ENABLE_SWEEP_FRAME_COUNT)
+	}
 
 	// Rate of fire and clips (Weapon::privateFireWeapon / reloadWithBonus).
 	// (The RATE_OF_FIRE bonuses -- veterancy -- shorten both the time between shots and the reload.)
@@ -1091,6 +1299,18 @@ void FGenObject::FinishShot(int32 Slot, FGenObjectID Victim, uint32 Frame)
 	else
 	{
 		WI.ReadyFrame = Frame + FMath::Max(1, ShotDelay);
+	}
+	if (WeaponSetEntry && WeaponSetEntry->bShareReloadTime && (W.ClipSize <= 0 || WI.AmmoInClip > 0))
+	{
+		// Weapon::privateFireWeapon, reloadWithBonus: "go through other weapons in weapon set, set their m_whenWeCanFireAgain to this guy's delay"
+		for (FGenWeaponInstance& Other : Weapons)
+		{
+			if (Other.Template)
+			{
+				Other.ReadyFrame = WI.ReadyFrame;
+				Other.bReloading = WI.bReloading;
+			}
+		}
 	}
 	NoteContinuousFire(W, WI, Victim, Frame);
 }
@@ -1186,15 +1406,48 @@ void FGenObject::ContinuousFireCoolDown()
 	ContinuousVictim = GenInvalidObjectID;
 }
 
+void FGenObject::ReloadAllAmmo()
+{
+	for (FGenWeaponInstance& WI : Weapons)
+	{
+		if (WI.Template && WI.Template->ClipSize > 0)
+		{
+			WI.AmmoInClip = WI.Template->ClipSize;
+			WI.ReadyFrame = Logic->GetFrame();
+			WI.bReloading = false;
+			WI.ScatterUnused.Reset();
+		}
+	}
+}
+
 void FGenObject::UpdateCombat(uint32 Frame)
 {
 	GEN_PERF_SCOPE("Obj.Combat");
+	if (Template->bFlightDeck)
+	{
+		return; // FlightDeckBehavior: "The carrier is a dumb stump": it picks no targets, and what it is ordered goes to its aircraft
+	}
 
 	// FiringTracker::update: "If it has been too long since I fired. I have to start over."
 	if (ContinuousCooldownFrame != 0 && Frame > ContinuousCooldownFrame)
 	{
 		ContinuousCooldownFrame = Frame + uint32(GenLogic::GetLogicFPS());
 		ContinuousFireCoolDown();
+	}
+	// "I have been idle long enough that I should reload, so I do not hang around with a near empty clip forever."
+	if (ForceReloadFrame != 0 && Frame >= ForceReloadFrame)
+	{
+		ForceReloadFrame = 0;
+		for (FGenWeaponInstance& WI : Weapons) // Object::reloadAllAmmo( TRUE ): now
+		{
+			if (WI.Template && WI.Template->ClipSize > 0 && WI.AmmoInClip < WI.Template->ClipSize)
+			{
+				WI.AmmoInClip = WI.Template->ClipSize;
+				WI.ReadyFrame = Frame;
+				WI.bReloading = false;
+				WI.ScatterUnused.Reset();
+			}
+		}
 	}
 	if (Delivery)
 	{
@@ -1212,7 +1465,8 @@ void FGenObject::UpdateCombat(uint32 Frame)
 	// An aircraft on the ground, or busy taking off, landing or flying home, does not fight.
 	const bool bJetBusy = bJetAI && (JetState != EGenJetState::None || !bJetAllowAirLoco);
 	// Planes (unlike helicopters) attack only what they are sent against.
-	const bool bNoAutoAcquire = bJetBusy || (bJetAI && !Template->bAutoAcquireEnemiesWhenIdle) || Template->bNoIdleAutoAcquire;
+	// (MM_Mood_Passive, MM_Mood_Sleep: nothing is looked for until something happens to it.)
+	const bool bNoAutoAcquire = bJetBusy || (bJetAI && !Template->bAutoAcquireEnemiesWhenIdle) || Template->bNoIdleAutoAcquire || ScriptAttitude < 0;
 
 	FGenObject* Target = (TargetID != GenInvalidObjectID && !bJetBusy) ? Logic->FindObject(TargetID) : nullptr;
 	// (AIAttackApproachTargetState / PursueTargetState: "If obj is stealthed, can no longer approach.")
@@ -1238,8 +1492,8 @@ void FGenObject::UpdateCombat(uint32 Frame)
 	// our own stealth and a disguise.)
 	const bool bForcedSees = bForceAttack && Target && Target->IsTargetable() && (Target->Owner == Owner || Target->IsDisguised());
 	if (TargetID != GenInvalidObjectID && (!Target || !(Target->IsAttackable() || (bIgnoringStealth && Target->IsTargetable()) || bForcedSees)
-		|| (!bForceAttack && (Target->Owner == Owner || Logic->GetRelationship(Owner, Target->Owner) == EGenRelationship::Allies || Target->IsUnmanned()
-		|| (Logic->GetRelationship(Owner, Target->Owner) != EGenRelationship::Enemies && Target->GetContain() && Target->GetTemplate()->Contain.Type == EGenContainType::Garrison)))))
+		|| (!bForceAttack && (Target->Owner == Owner || Logic->GetRelationship(*this, *Target) == EGenRelationship::Allies || Target->IsUnmanned()
+		|| (Logic->GetRelationship(*this, *Target) != EGenRelationship::Enemies && !Target->bScriptTargetable && Target->GetContain() && Target->GetTemplate()->Contain.Type == EGenContainType::Garrison)))))
 	{
 		ClearAttack();
 		Target = nullptr;
@@ -1263,8 +1517,25 @@ void FGenObject::UpdateCombat(uint32 Frame)
 	// (Nor while it unpacks or packs for one: aiBusy.)
 	if (!Target && !bAttackingPosition && !bMoving && !bNoAutoAcquire && !bStealthVeto && !bUsingAbility && AbilityAnimFrames == 0 && Frame >= NextAutoAcquireFrame)
 	{
-		NextAutoAcquireFrame = Frame + uint32(GenLogic::GetLogicFPS() / 2) + (ID % 7);
-		if (FGenObject* Found = FindAutoTarget())
+		// AIUpdateInterface::getNextMoodTarget: MoodAttackCheckRate (2 s unless the module says), the first time off by a
+		// random part of it so that they don't all look at once.
+		const int32 CheckRate = Template->MoodAttackCheckRate > 0 ? Template->MoodAttackCheckRate : GenLogic::GetLogicFPS() * 2;
+		int32 NextCheck = CheckRate;
+		if (!bMoodCheckOffsetDone)
+		{
+			bMoodCheckOffsetDone = true;
+			NextCheck += Logic->GetRandom().RandRange(-CheckRate / 2, CheckRate / 2);
+		}
+		NextAutoAcquireFrame = Frame + uint32(FMath::Max(NextCheck, 1));
+		FGenObject* Found = FindAutoTarget();
+		if (!Found && ScriptAttitude > 0 && CanMove() && IsAIIdle())
+		{
+			if (const FGenObject* Far = FindMoodTarget())
+			{
+				CommandAttack(Far->ID);
+			}
+		}
+		if (Found)
 		{
 			TargetID = Found->ID;
 			// (A mine an idle dozer or worker has spotted is gone after, as the original's mood target is - it
@@ -1313,6 +1584,14 @@ void FGenObject::UpdateCombat(uint32 Frame)
 			if (Firing.PreAttackDoneFrame == 0 || Frame >= Firing.PreAttackDoneFrame)
 			{
 				FireWeaponAtPosition(ActiveSlot, AttackPosition, Frame);
+				// AIAttackFireWeaponState: "LINKED TURRETS ... were firing with all barrels".
+				for (int32 Other = 0; Template->bTurretsLinked && Other < 3; ++Other)
+				{
+					if (Other != ActiveSlot && Weapons[Other].Template && Frame >= Weapons[Other].ReadyFrame)
+					{
+						FireWeaponAtPosition(Other, AttackPosition, Frame);
+					}
+				}
 				if (--AttackPositionShots <= 0)
 				{
 					bAttackingPosition = false; // "the attack is done"
@@ -1359,7 +1638,9 @@ void FGenObject::UpdateCombat(uint32 Frame)
 		// Weapon::isWithinAttackRange: nothing inside the minimum range (and a quarter cell, "otherwise if
 		// it teters on the edge, attacks can fail") can be fired at.
 		const float MinRange = WI.Template->MinimumAttackRange;
-		const bool bTooClose = MinRange > 0.f && Dist < MinRange + GenLogic::PathfindCellSize * 0.25f;
+		// ("A weapon with leech range temporarily has unlimited range and is locked onto its target.")
+		const bool bLeech = WI.bLeechRangeActive;
+		const bool bTooClose = !bLeech && MinRange > 0.f && Dist < MinRange + GenLogic::PathfindCellSize * 0.25f;
 		if (bTooClose)
 		{
 			Weapons[ActiveSlot].PreAttackDoneFrame = 0;
@@ -1378,7 +1659,7 @@ void FGenObject::UpdateCombat(uint32 Frame)
 				ActiveSlot = INDEX_NONE;
 			}
 		}
-		else if (Dist > Range)
+		else if (!bLeech && Dist > Range)
 		{
 			Weapons[ActiveSlot].PreAttackDoneFrame = 0;
 			if (bExplicitAttack && CanMove() && ContainedBy == GenInvalidObjectID)
@@ -1411,6 +1692,14 @@ void FGenObject::UpdateCombat(uint32 Frame)
 				bStatusBraking = false;
 			}
 			bAiming = true;
+			// AIAttackAimAtTargetState: "Order all turrets to attack." (Of a thing, only the current weapon fires.)
+			for (int32 Other = 0; Template->bTurretsLinked && Other < 3; ++Other)
+			{
+				if (Other != ActiveSlot && Weapons[Other].Template && TurretForSlot(Other) != TurretForSlot(ActiveSlot))
+				{
+					AimAt(*Target, Other);
+				}
+			}
 			// A turret can already track and fire on the move; everything else has to stand still to aim. (One that
 			// deploys - the Nuke Cannon - neither aims nor fires until it has unpacked: DeployStyleAIUpdate.)
 			if (IsDeployedToFire() && (!bMoving || TurretForSlot(ActiveSlot) != INDEX_NONE) && AimAt(*Target, ActiveSlot) && Frame >= WI.ReadyFrame)
@@ -1425,6 +1714,7 @@ void FGenObject::UpdateCombat(uint32 Frame)
 					{
 						Firing.PreAttackDoneFrame = Frame + uint32(Delay);
 						SetDrawAnimDuration(Delay);
+						Firing.bLeechRangeActive |= Firing.Template->bLeechRange; // (Weapon::preFireWeapon)
 					}
 				}
 				if (Firing.PreAttackDoneFrame == 0 || Frame >= Firing.PreAttackDoneFrame)
@@ -1447,9 +1737,46 @@ void FGenObject::UpdateCombat(uint32 Frame)
 	for (int32 t = 0; t < 2; ++t)
 	{
 		const FGenTurretData& TD = Template->Turrets[t];
-		if (!TD.bValid || (ActiveSlot != INDEX_NONE && TurretForSlot(ActiveSlot) == t))
+		// (A gun that is being packed away looks at nothing: TurretAI::recenterTurret ends the idle scan. A sentry drone sweeping
+		// when it was told to move pulled its turret off centre for ever, and so never packed.)
+		if (!TD.bValid || !IsDeployedToFire() || (ActiveSlot != INDEX_NONE && (TurretForSlot(ActiveSlot) == t || Template->bTurretsLinked)))
 		{
+			bTurretScanning[t] = false;
+			TurretScanNext[t] = 0;
 			continue;
+		}
+		// TurretAIIdleState / TurretAIIdleScanState: nothing to do, now and then it looks off to one side; then it holds and recenters.
+		if (TD.MaxIdleScanAngle != 0.f || TD.MinIdleScanAngle != 0.f)
+		{
+			if (bTurretScanning[t])
+			{
+				const float Want = GenLogic::NormalizeAngle(TD.NaturalAngle + TurretScanAngle[t]);
+				const float Rate = TD.TurnRate * 0.5f;
+				const float Off = GenLogic::AngleDiff(Want, TurretAngle[t]);
+				TurretAngle[t] = GenLogic::NormalizeAngle(TurretAngle[t] + FMath::Clamp(Off, -Rate, Rate));
+				if (FMath::Abs(Off) <= Rate)
+				{
+					bTurretScanning[t] = false;
+					TurretScanNext[t] = 0;
+					TurretIdleSince[t] = Frame;
+				}
+				continue;
+			}
+			if (FMath::Abs(GenLogic::AngleDiff(TD.NaturalAngle, TurretAngle[t])) < 0.01f)
+			{
+				FRandomStream& ScanRand = Logic->GetRandom();
+				if (TurretScanNext[t] == 0)
+				{
+					TurretScanNext[t] = Frame + uint32(ScanRand.RandRange(TD.MinIdleScanInterval, FMath::Max(TD.MinIdleScanInterval, TD.MaxIdleScanInterval)));
+				}
+				else if (Frame >= TurretScanNext[t])
+				{
+					TurretScanAngle[t] = (TD.MinIdleScanAngle + ScanRand.FRandRange(0.f, TD.MaxIdleScanAngle - TD.MinIdleScanAngle)) * (ScanRand.RandRange(0, 1) == 0 ? -1.f : 1.f);
+					bTurretScanning[t] = true;
+					UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [scan f%u] #%u %s turret %d looks %.0f degrees off"), Frame, ID, *Template->Name, t, FMath::RadiansToDegrees(TurretScanAngle[t]));
+					continue;
+				}
+			}
 		}
 		if (Frame > TurretIdleSince[t] + uint32(FMath::Max(TD.RecenterTime, GenLogic::GetLogicFPS() * 2)))
 		{
@@ -1459,6 +1786,17 @@ void FGenObject::UpdateCombat(uint32 Frame)
 		}
 	}
 
+	// TurretAI::friend_turnTowardsAngle: TURRET_ROTATE while a turret is on its way round (the Technical's gunner shuffles).
+	{
+		static const int32 TurretRotate = GenConditions::Index(TEXT("TURRET_ROTATE"));
+		bool bTurretTurning = false;
+		for (int32 t = 0; t < 2; ++t)
+		{
+			bTurretTurning = bTurretTurning || (Template->Turrets[t].bValid && FMath::Abs(GenLogic::AngleDiff(TurretAngle[t], TurretAngleLastFrame[t])) > 1e-4f);
+			TurretAngleLastFrame[t] = TurretAngle[t];
+		}
+		SetModelCondition(TurretRotate, bTurretTurning);
+	}
 	// Object::adjustModelConditionForWeaponStatus
 	bCombatPosesSet = bAttackingPosition || Target != nullptr;
 	for (int32 s = 0; s < 3; ++s)
@@ -1500,6 +1838,16 @@ void FGenObject::AttemptDamage(float Amount, const FString& DamageType, const FS
 	const bool bShotDown = bInFlight && Projectile.bActive && !bDead && !bPendingDestroy;
 	if ((!IsTargetable() && !bShotDown) || Logic->GetFrame() < InvulnerableUntilFrame || bIndestructible)
 	{
+		return;
+	}
+	if (DamageType.Equals(TEXT("DISARM"), ESearchCase::IgnoreCase))
+	{
+		// Weapon::dealDamageInternal, DAMAGE_DISARM: a mine (a booby trap, a demo trap) is disarmed; nothing else is touched.
+		// (Before the armor: a booby trap's lets nothing through.)
+		if (MineState || IsKindOf(TEXT("MINE")) || IsKindOf(TEXT("BOOBY_TRAP")) || IsKindOf(TEXT("DEMOTRAP")))
+		{
+			DisarmMine();
+		}
 		return;
 	}
 	if (Template->HivePropagateDamage.Num() > 0 && Template->HivePropagateDamage.Contains(DamageType.ToUpper()))
@@ -1546,6 +1894,26 @@ void FGenObject::AttemptDamage(float Amount, const FString& DamageType, const FS
 	{
 		Amount *= DamageScalar;
 	}
+	if (DamageType.StartsWith(TEXT("SUBDUAL"), ESearchCase::IgnoreCase))
+	{
+		// ActiveBody::attemptDamage, IsSubdualDamage: it doesn't hurt; enough of it and the thing is out until it wears off.
+		if (Template->SubdualDamageCap > 0.f && Amount > 0.f)
+		{
+			const bool bWas = IsSubdued();
+			CurrentSubdual = FMath::Min(CurrentSubdual + Amount, Template->SubdualDamageCap);
+			SubdualHealFrame = Logic->GetFrame() + uint32(FMath::Max(Template->SubdualDamageHealRate, 1)); // (SubdualDamageHelper::notifySubdualDamage)
+			if (!bWas && IsSubdued() && Projectile.bActive)
+			{
+				ProjectileNowJammed();
+			}
+			else if (!bWas && IsSubdued())
+			{
+				ClearAttack();
+				UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [subdue f%u] #%u %s is out (%.0f of %.0f)"), Logic->GetFrame(), ID, *Template->Name, CurrentSubdual, MaxHealth);
+			}
+		}
+		return;
+	}
 	if (DamageType.Equals(TEXT("KILL_GARRISONED"), ESearchCase::IgnoreCase))
 	{
 		// ActiveBody::attemptDamage: as many inside die as the damage says; the building itself is untouched.
@@ -1566,16 +1934,6 @@ void FGenObject::AttemptDamage(float Amount, const FString& DamageType, const FS
 	{
 		const FGenGameData& RegenData = FGenGameData::Get();
 		BaseRegenFrame = RegenData.BaseRegenHealthPercentPerSecond > 0.f ? Logic->GetFrame() + uint32(RegenData.BaseRegenDelay) : MAX_uint32;
-	}
-	if (DamageType.Equals(TEXT("DISARM"), ESearchCase::IgnoreCase))
-	{
-		// Weapon::dealDamageInternal, DAMAGE_DISARM: a mine (a booby trap, a demo trap) is disarmed; nothing
-		// else is touched.
-		if (MineState || IsKindOf(TEXT("MINE")) || IsKindOf(TEXT("BOOBY_TRAP")) || IsKindOf(TEXT("DEMOTRAP")))
-		{
-			DisarmMine();
-		}
-		return;
 	}
 	if (DamageType.Equals(TEXT("KILL_PILOT"), ESearchCase::IgnoreCase))
 	{
@@ -1604,9 +1962,17 @@ void FGenObject::AttemptDamage(float Amount, const FString& DamageType, const FS
 	{
 		LastDamageSourcePlayer = Damager->Owner;
 		LastDamageSourceTemplate = Damager->Template;
+		// (Player::setAttackedBy: this stays for the rest of the game, and the map's scripts ask for it —
+		// only damage that actually lands counts, not what a script says.)
+		Logic->MarkAttackedBy(Owner, LastDamageSourcePlayer);
 	}
 	PreviousHealth = Health;
+	LastOverkillPercent = FMath::Max(0.f, Amount - Health) / FMath::Max(MaxHealth, 1.f); // (SlowDeathBehavior::getProbabilityModifier)
 	Health = FMath::Max(bImmortal ? 1.f : 0.f, Health - Amount);
+	if (Template->WhenDamaged.bValid)
+	{
+		OnDamagedFireWeapon(DamageType, Amount);
+	}
 	if (DamageFX)
 	{
 		DoDamageFX(DamageFXType ? FString(DamageFXType) : DamageType, Amount, Source);
@@ -1682,7 +2048,7 @@ void FGenObject::AttemptDamage(float Amount, const FString& DamageType, const FS
 		&& !Template->IsKindOf(TEXT("CANNOT_RETALIATE")) && !Template->IsKindOf(TEXT("IMMOBILE")) && !Template->IsKindOf(TEXT("DRONE")))
 	{
 		const FGenObject* Attacker = Logic->FindObject(Source);
-		if (Attacker && Attacker->IsAttackable() && Logic->GetRelationship(Owner, Attacker->Owner) == EGenRelationship::Enemies
+		if (Attacker && Attacker->IsAttackable() && Logic->GetRelationship(*this, *Attacker) == EGenRelationship::Enemies
 			&& ChooseWeapon(*Attacker) != INDEX_NONE)
 		{
 			TargetID = Source;
@@ -1705,6 +2071,7 @@ void FGenObject::AttemptHealing(float Amount)
 		PoisonAmount = 0.f;
 	}
 	Health = FMath::Min(MaxHealth, Health + Amount);
+	LastHealingFrame = Logic->GetFrame();
 	if (MineState)
 	{
 		OnMineHealthChanged(true, ID, TEXT("HEALING")); // MinefieldBehavior::onHealing
@@ -1735,7 +2102,7 @@ void FGenObject::StartSecondLife(const FString& DeathType)
 		if (DeathTypeApplies(D.DeathTypes, DeathType) && !StatusExemptApplies(*this, D.ExemptStatus) && StatusRequiredMet(*this, D.RequiredStatus))
 		{
 			Candidates.Add(&D);
-			TotalWeight += FMath::Max(1, D.ProbabilityModifier);
+			TotalWeight += SlowDeathWeight(D);
 		}
 	}
 	if (Candidates.Num() == 0)
@@ -1746,7 +2113,7 @@ void FGenObject::StartSecondLife(const FString& DeathType)
 	const FGenSlowDeath* Chosen = Candidates[0];
 	for (const FGenSlowDeath* D : Candidates)
 	{
-		Roll -= FMath::Max(1, D->ProbabilityModifier);
+		Roll -= SlowDeathWeight(*D);
 		if (Roll < 0) { Chosen = D; break; }
 	}
 	if (!Chosen->bBattleBus)
@@ -1915,7 +2282,7 @@ void FGenObject::UpdateHorde(uint32 Frame)
 				return;
 			}
 		}
-		if (H.bAlliesOnly && Logic->GetRelationship(Owner, O.Owner) != EGenRelationship::Allies)
+		if (H.bAlliesOnly && Logic->GetRelationship(*this, O) != EGenRelationship::Allies)
 		{
 			return;
 		}
@@ -1962,6 +2329,10 @@ void FGenObject::Die(const FString& DeathType, FGenObjectID Killer)
 	}
 	const uint32 Frame = Logic->GetFrame();
 	bDead = true;
+	if (Template->BunkerBuster.bValid || Template->NeutronShell.bValid)
+	{
+		OnBlastDeath();
+	}
 	if (Template->AssaultTransport.bValid)
 	{
 		AssaultGiveFinalOrders(); // AssaultTransportAIUpdate::update: "isEffectivelyDead -> giveFinalOrders"
@@ -2033,6 +2404,10 @@ void FGenObject::Die(const FString& DeathType, FGenObjectID Killer)
 		EndHackInternet();
 	}
 	CheckAndDetonateBoobyTrap(nullptr); // "Already dying, so no need to handle death case of explosion"
+	if (!Template->SpecialPowerCompletion.IsEmpty() && Logic->GetMapScripts())
+	{
+		Logic->GetMapScripts()->NoteSpecialPowerCompleted(GetOwner(), Template->SpecialPowerCompletion); // SpecialPowerCompletionDie
+	}
 	HuntButton.Reset();
 	ClearAttack();
 	StopDocking(); // whoever was queueing behind us at a dock moves up
@@ -2120,7 +2495,7 @@ void FGenObject::Die(const FString& DeathType, FGenObjectID Killer)
 		}
 		if (const FGenWeaponTemplate* W = FGenGameData::Get().FindWeapon(DW.Weapon))
 		{
-			Logic->DoFXPos(W->FireFX, Position, nullptr, 0.f, nullptr, W->PrimaryDamageRadius);
+			Logic->DoFXPos(W->GetFireFX(GetVeterancyLevel()), Position, nullptr, 0.f, nullptr, W->PrimaryDamageRadius);
 			if (!W->FireOCL.IsEmpty()) { Logic->DoOCL(W->FireOCL, *this); }
 			Logic->DealDamage(*W, ID, GenInvalidObjectID, Position, true);
 		}
@@ -2164,7 +2539,7 @@ void FGenObject::Die(const FString& DeathType, FGenObjectID Killer)
 
 	// Die modules: every one whose DeathTypes apply runs (FXListDie, CreateObjectDie, DestroyDie, InstantDeathBehavior).
 	FRandomStream& Rand = Logic->GetRandom();
-	bool bDestroyNow = false;
+	bool bDestroyNow = Template->RebuildHole.bValid; // (RebuildHoleBehavior::onDie: "destroy us")
 	for (const FGenDieModule& M : Template->DieModules)
 	{
 		// DieMuxData::isDieApplicable: "wrong death type? punt", "wrong vet level? punt", "wrong status? punt"
@@ -2247,7 +2622,7 @@ void FGenObject::Die(const FString& DeathType, FGenObjectID Killer)
 		if (DeathTypeApplies(D.DeathTypes, DeathType) && !StatusExemptApplies(*this, D.ExemptStatus) && StatusRequiredMet(*this, D.RequiredStatus))
 		{
 			Candidates.Add(&D);
-			TotalWeight += FMath::Max(1, D.ProbabilityModifier);
+			TotalWeight += SlowDeathWeight(D);
 		}
 	}
 	if (Candidates.Num() > 0)
@@ -2256,15 +2631,46 @@ void FGenObject::Die(const FString& DeathType, FGenObjectID Killer)
 		const FGenSlowDeath* Chosen = Candidates[0];
 		for (const FGenSlowDeath* D : Candidates)
 		{
-			Roll -= FMath::Max(1, D->ProbabilityModifier);
+			Roll -= SlowDeathWeight(*D);
 			if (Roll < 0) { Chosen = D; break; }
 		}
 		DestroyFrame = Frame + uint32(Chosen->DestructionDelay + Logic->GetRandom().RandRange(0, FMath::Max(0, Chosen->DestructionDelayVariance)));
-		SinkStartFrame = Frame + uint32(Chosen->SinkDelay);
+		UE_CLOG(Logic->IsTracing() && Candidates.Num() > 1, LogGenerals, Log, TEXT("  [death f%u] #%u %s: %d possible deaths, overkill %.0f%%, total weight %d"), Frame, ID, *Template->Name, Candidates.Num(), LastOverkillPercent * 100.f, TotalWeight);
+		SinkStartFrame = Frame + uint32(Chosen->SinkDelay + Logic->GetRandom().RandRange(0, FMath::Max(0, Chosen->SinkDelayVariance)));
 		SinkRate = Chosen->SinkRate;
+		if (Chosen->FlingForce > 0.f && Template->bHasPhysics)
+		{
+			// SlowDeathBehavior::beginSlowDeath: thrown into the air, flailing ("make sure we are at least a bit above the
+			// ground"), flat of bounce, its clocks waiting until it is down.
+			FRandomStream& Fling = Logic->GetRandom();
+			const float Angle = Fling.FRandRange(-PI, PI);
+			const float Pitch = Fling.FRandRange(Chosen->FlingPitch, Chosen->FlingPitch + Chosen->FlingPitchVariance);
+			const float Mag = Fling.FRandRange(Chosen->FlingForce, Chosen->FlingForce + Chosen->FlingForceVariance);
+			const float Horizontal = Mag * FMath::Cos(Pitch);
+			const FVector3f Force(Horizontal * FMath::Cos(Angle), Horizontal * FMath::Sin(Angle), Mag * FMath::Sin(Pitch));
+			static const int32 Flailing = GenConditions::Index(TEXT("EXPLODED_FLAILING"));
+			Position.Z = FMath::Max(Position.Z, GroundHeightAt(Position.X, Position.Y) + 1.f);
+			Velocity = FVector3f::ZeroVector;
+			ApplyForce(Force);
+			bFreePhysics = true;
+			bAllowBounce = false;
+			ExtraFriction = -3.f / float(GenLogic::GetLogicFPS());
+			SetOrientation(FMath::Atan2(Force.Y, Force.X));
+			SetModelCondition(Flailing, true);
+			bFlung = true;
+			UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [fling f%u] #%u %s thrown: force (%.1f, %.1f, %.1f)"), Frame, ID, *Template->Name, Force.X, Force.Y, Force.Z);
+		}
 		// SlowDeathBehavior::beginSlowDeath: INITIAL effects now, MIDPOINT somewhere in the middle third, FINAL at destruction.
 		SlowDeath = Chosen;
 		MidpointFrame = Frame + uint32(Rand.FRandRange(0.35f, 0.65f) * float(DestroyFrame - Frame));
+		if (const FGenMapScripts* Scripts = Logic->GetMapScripts(); Scripts && Scripts->GetHulkLifetimeOverride() != -1 && Template->IsKindOf(TEXT("HULK")))
+		{
+			// SlowDeathBehavior::beginSlowDeath: "Scripts don't want hulks around, so start sinking immediately!"
+			const uint32 FPS = uint32(GenLogic::GetLogicFPS());
+			SinkStartFrame = Frame + 1;
+			MidpointFrame = Frame + FPS / 2 + 1;
+			DestroyFrame = Frame + FPS + 1;
+		}
 		DoDeathPhase(FGenSlowDeath::Initial);
 	}
 	else if (Template->bKeepObjectDie)
@@ -2319,7 +2725,7 @@ void FGenObject::DoDeathPhase(int32 Phase)
 	{
 		if (const FGenWeaponTemplate* W = FGenGameData::Get().FindWeapon(PhaseWeapons[Rand.RandRange(0, PhaseWeapons.Num() - 1)]))
 		{
-			Logic->DoFXPos(W->FireFX, Position, nullptr, 0.f, nullptr, W->PrimaryDamageRadius);
+			Logic->DoFXPos(W->GetFireFX(GetVeterancyLevel()), Position, nullptr, 0.f, nullptr, W->PrimaryDamageRadius);
 			Logic->DealDamage(*W, ID, GenInvalidObjectID, Position, true);
 		}
 	}
@@ -2345,6 +2751,21 @@ void FGenObject::UpdateDying(uint32 Frame)
 	{
 		if (bStructureToppling) { UpdateStructureTopple(Frame); } else { UpdateStructureCollapse(Frame); }
 		return;
+	}
+	if (bFlung)
+	{
+		// SlowDeathBehavior::update: "++m_sinkFrame; ++m_midpointFrame; ++m_destructionFrame" until it lands.
+		++SinkStartFrame;
+		++MidpointFrame;
+		++DestroyFrame;
+		if (Position.Z <= GroundHeightAt(Position.X, Position.Y))
+		{
+			static const int32 Flailing = GenConditions::Index(TEXT("EXPLODED_FLAILING")), Bouncing = GenConditions::Index(TEXT("EXPLODED_BOUNCING"));
+			SetModelCondition(Flailing, false);
+			SetModelCondition(Bouncing, true);
+			bFlung = false;
+			UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [fling f%u] #%u %s is down"), Frame, ID, *Template->Name);
+		}
 	}
 	if (SlowDeath && !bMidpointDone && Frame >= MidpointFrame)
 	{
@@ -2399,14 +2820,28 @@ void FGenObject::LaunchProjectile(const FGenWeaponTemplate* Weapon, FGenObjectID
 	{
 		SetRotation(FQuat4f::FindBetweenNormals(FVector3f::ForwardVector, Aim));
 	}
-	if (!Weapon->ProjectileExhaust.IsEmpty())
+	const FGenObject* Shooter = Logic->FindObject(Launcher);
+	const FString& Exhaust = Weapon->GetProjectileExhaust(Shooter ? Shooter->GetVeterancyLevel() : 0);
+	if (!Exhaust.IsEmpty())
 	{
-		Logic->AttachParticleSystem(Weapon->ProjectileExhaust, ID);
+		Logic->AttachParticleSystem(Exhaust, ID);
 	}
 
-	const float Speed = FMath::Max(Weapon->WeaponSpeed, 0.01f);
+	float Speed = FMath::Max(Weapon->WeaponSpeed, 0.01f);
 	if (!Projectile.bMissile)
 	{
+		// DumbProjectileBehavior::projectileFireAtObjectOrPosition: "if an object, aim at the center, not the ground part"
+		if (const FGenObject* AimedAt = Victim != GenInvalidObjectID ? Logic->FindObject(Victim) : nullptr)
+		{
+			Projectile.End = AimedAt->Position + FVector3f(0.f, 0.f, AimedAt->Template->GeometryHeight * 0.5f);
+		}
+		// "Some weapons want to scale their start speed to the range"
+		if (Weapon->bScaleWeaponSpeed)
+		{
+			const float Range = FVector2f::Distance(FVector2f(Position.X, Position.Y), FVector2f(Projectile.End.X, Projectile.End.Y));
+			const float RangeRatio = (Range - Weapon->MinimumAttackRange) / FMath::Max(Weapon->AttackRange - Weapon->MinimumAttackRange, 1.f);
+			Speed = FMath::Max(RangeRatio * (Weapon->WeaponSpeed - Weapon->MinWeaponSpeed) + Weapon->MinWeaponSpeed, 0.01f);
+		}
 		// calcFlightPath: number of steps = curve length / speed.
 		const FGenDumbProjectile& D = Template->DumbProjectile;
 		const float Top = FMath::Max(Projectile.Start.Z, Projectile.End.Z);
@@ -2432,6 +2867,11 @@ void FGenObject::UpdateProjectile(uint32 Frame)
 	{
 		UpdateNeutronMissile(Frame);
 		return;
+	}
+	// BunkerBusterBehavior::update: "the crash bang crunch FX on the way through the bunker ceiling"
+	if (Template->BunkerBuster.bValid && Projectile.State == EGenMissileState::KillSelf && Frame % uint32(Template->BunkerBuster.CrashThroughFXFrames) == 1)
+	{
+		Logic->DoFXObj(Template->BunkerBuster.CrashThroughFX, *this);
 	}
 	const FGenWeaponTemplate& W = *Projectile.Weapon;
 	const FGenObject* Victim = Projectile.Victim != GenInvalidObjectID ? Logic->FindObject(Projectile.Victim) : nullptr;
@@ -2467,8 +2907,23 @@ void FGenObject::UpdateProjectile(uint32 Frame)
 	}
 	if (Victim)
 	{
-		// Keep tracking a moving victim; projectiles aim at the center of its geometry, not its feet.
-		Projectile.End = Victim->Position + FVector3f(0.f, 0.f, Victim->Template->GeometryHeight * 0.5f);
+		const FVector3f VictimCenter = Victim->Position + FVector3f(0.f, 0.f, Victim->Template->GeometryHeight * 0.5f);
+		if (Projectile.bMissile)
+		{
+			// Keep tracking a moving victim; projectiles aim at the center of its geometry, not its feet.
+			Projectile.End = VictimCenter;
+		}
+		else if (Template->DumbProjectile.FlightPathAdjustPerFrame > 0.f)
+		{
+			// DumbProjectileBehavior::update: a shell's aim follows only as far as the module lets it, and most
+			// don't: fired at where the victim was, it comes down there.
+			const FVector3f Delta = VictimCenter - Projectile.End;
+			const float Moved = Delta.Size();
+			if (Moved * Moved > 0.1f)
+			{
+				Projectile.End += Delta / Moved * FMath::Min(Moved, Template->DumbProjectile.FlightPathAdjustPerFrame);
+			}
+		}
 	}
 	if (Projectile.bThrust)
 	{
@@ -2530,7 +2985,29 @@ void FGenObject::UpdateProjectile(uint32 Frame)
 				break;
 			}
 		}
+		if (bDetonate && !bHitVictim && !Projectile.bMissile && !Victim->ContainsPoint(NewPos))
+		{
+			// The end of a shell's flight, and the victim has moved on: a blast at that spot, nothing more.
+			Projectile.Victim = GenInvalidObjectID;
+			Victim = nullptr;
+		}
 		bHitVictim |= bDetonate; // (at the end of its flight it is in the victim's middle)
+	}
+	// DumbProjectileBehavior::projectileHandleCollision: what stands in the way of the shot before that.
+	{
+		FVector3f At;
+		if (const FGenObject* Other = FindProjectileCollision(W, Position, NewPos, At))
+		{
+			NewPos = At;
+			bDetonate = true;
+			bHitVictim = false;
+			Projectile.Victim = GenInvalidObjectID; // (handleProjectileDetonation: a blast where it is, not a hit on the victim)
+			if (Template->DumbProjectile.GarrisonHitKillCount > 0 && !Projectile.bNoDamage && ProjectileClearsGarrison(Other->ID))
+			{
+				Position = NewPos;
+				return;
+			}
+		}
 	}
 	if (Template->DumbProjectile.GarrisonHitKillCount > 0 && !Projectile.bNoDamage)
 	{
@@ -2575,6 +3052,10 @@ void FGenObject::UpdateProjectile(uint32 Frame)
 		if (!Projectile.bNoDamage)
 		{
 			Logic->DealDamage(W, Logic->FindObject(Projectile.Launcher) ? Projectile.Launcher : ID, Projectile.Victim, Position, true);
+			if (Template->BunkerBuster.bValid || Template->NeutronShell.bValid)
+			{
+				OnBlastDeath();
+			}
 		}
 		bPendingDestroy = true;
 	}

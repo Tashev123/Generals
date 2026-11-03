@@ -95,8 +95,14 @@ void FGenSkirmishAI::InitScripts()
 	{
 		UE_LOG(LogGenerals, Warning, TEXT("AI player %d: no skirmish scripts for '%s'"), Player, *PlayerName);
 	}
-	Lib.GetTeams(PlayerName, Protos);
-	Teams[0]->Proto = FindProto(TEXT("team") + PlayerName);
+	TArray<FGenTeamProto> Mine;
+	Lib.GetTeams(PlayerName, Mine);
+	TF.AddProtos(Mine, Player);
+	if (const int32 Proto = TF.FindProto(TEXT("team") + PlayerName); Proto != INDEX_NONE)
+	{
+		// Player::setDefaultTeam: this player's default team is an instance of its own "team<name>" definition.
+		TF.EnsureDefaultTeam(Player).Proto = Proto;
+	}
 
 	const int32 FPS = GenLogic::GetLogicFPS();
 	auto Index = [this, FPS](FGenScript& S)
@@ -360,9 +366,20 @@ bool FGenSkirmishAI::EvaluateConditions(const FGenScript& Script, FGenTeam* This
 	return false;
 }
 
-bool FGenSkirmishAI::EvaluateProductionCondition(FGenTeamProto& Proto)
+bool FGenSkirmishAI::EvaluateProductionCondition(int32 ProtoIndex)
 {
-	// TeamPrototype::evaluateProductionCondition
+	// TeamPrototype::evaluateProductionCondition. In a mission the map's engine owns the scripts, so this only asks
+	// there; what is below is a skirmish player's own copy.
+	if (bCampaign)
+	{
+		FGenMapScripts* Engine = Logic->GetMapScripts();
+		return Engine && Engine->EvaluateProductionCondition(ProtoIndex);
+	}
+	if (!Protos.IsValidIndex(ProtoIndex))
+	{
+		return false;
+	}
+	FGenTeamProto& Proto = Protos[ProtoIndex];
 	if (Proto.bConditionAlwaysFalse)
 	{
 		return false;
@@ -878,19 +895,20 @@ void FGenSkirmishAI::TeamFollowApproachPath(FGenTeam& Team, const FString& Label
 		return;
 	}
 	TArray<FVector2f> Path;
+	int32 LoopBackTo = -1;
 	if (bMoveToStartOnly)
 	{
 		Path.Add(FVector2f(Way->Location.X, Way->Location.Y));
 	}
 	else
 	{
-		Map->GetWaypointPath(*Way, Path);
+		LoopBackTo = Map->GetWaypointPath(*Way, Path); // the state keeps going round a path that closes back into itself
 	}
-	ForEachMember(Team, [&Path](FGenObject& O)
+	ForEachMember(Team, [&Path, LoopBackTo](FGenObject& O)
 	{
 		if (O.CanMove())
 		{
-			O.CommandFollowPath(Path);
+			O.CommandFollowPath(Path, LoopBackTo);
 		}
 	});
 }
@@ -970,6 +988,31 @@ void FGenSkirmishAI::ExecuteAction(const FGenScriptAction& A)
 		ObjectTypeLists.FindOrAdd(Str(P, 0)).AddUnique(Str(P, 1));
 		ResolvedTypes.Remove(Str(P, 0));
 		break;
+	case EGenScriptAction::A_SET_ATTACK_PRIORITY_THING:
+	{
+		// ScriptEngine::setPriorityThing: the sets belong to the game, whichever player's script fills them.
+		FGenAttackPriority& Set = Logic->FindOrAddAttackPriority(Str(P, 0));
+		for (const FGenThingTemplate* T : ResolveTypes(Str(P, 1)))
+		{
+			Set.Things.Add(T->Canonical(), Int(P, 2));
+			Set.MaxPriority = FMath::Max(Set.MaxPriority, Int(P, 2));
+		}
+		break;
+	}
+	case EGenScriptAction::A_TEAM_APPLY_ATTACK_PRIORITY_SET:
+		// ScriptActions::updateTeamAttackPrioritySet
+		if (FGenTeam* Team = GetTeamNamed(Str(P, 0)))
+		{
+			if (const FGenAttackPriority* Set = Logic->FindAttackPriority(Str(P, 1)))
+			{
+				if (Protos.IsValidIndex(Team->Proto))
+				{
+					Protos[Team->Proto].AttackPriorityName = Set->Name;
+				}
+				ForEachMember(*Team, [Set](FGenObject& O) { O.AttackInfo = Set; });
+			}
+		}
+		break;
 
 	// --- the player ---
 	case EGenScriptAction::A_PLAYER_GIVE_MONEY:
@@ -988,11 +1031,19 @@ void FGenSkirmishAI::ExecuteAction(const FGenScriptAction& A)
 		break;
 	}
 	case EGenScriptAction::A_PLAYER_ENABLE_UNIT_CONSTRUCTION:
-		if (GetPlayerNamed(Str(P, 0)) == Player) { bCanBuildUnits = true; }
-		break;
 	case EGenScriptAction::A_PLAYER_ENABLE_BASE_CONSTRUCTION:
-		if (GetPlayerNamed(Str(P, 0)) == Player) { bCanBuildBase = true; }
+	{
+		// Player::setCanBuildUnits / setCanBuildBase - on the player, which the AI reads from there. Each one sets
+		// only its own flag, and for whichever side the script names, not only for the one whose copy of the engine
+		// is running.
+		const int32 Who = GetPlayerNamed(Str(P, 0));
+		if (Who != INDEX_NONE)
+		{
+			if (A.Type == EGenScriptAction::A_PLAYER_ENABLE_UNIT_CONSTRUCTION) { Logic->SetCanBuildUnits(Who, true); }
+			else { Logic->SetCanBuildBase(Who, true); }
+		}
 		break;
+	}
 	case EGenScriptAction::A_PLAYER_SELL_EVERYTHING:
 		if (GetPlayerNamed(Str(P, 0)) == Player)
 		{

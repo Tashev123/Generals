@@ -118,7 +118,7 @@ void FGenObject::UpdateProduction(uint32 Frame)
 {
 	// ProductionUpdate::update. (An airfield's hangar doors are its parking spaces' business: they stand
 	// open for as long as an aircraft is at home - FGenParkingPlace::UpdateDoors.)
-	const bool bDoors = Template->NumDoorAnimations > 0 && !Parking;
+	const bool bDoors = Template->NumDoorAnimations > 0 && (!Parking || Parking->IsFlightDeck());
 	if (bDoors)
 	{
 		UpdateFactoryDoors(Frame);
@@ -546,17 +546,24 @@ float UGenGameLogic::CalcTimeToBuild(const FGenThingTemplate& Template, int32 Pl
 	return FMath::Max(1.f, Time);
 }
 
+uint8 UGenGameLogic::GetBuildable(const FGenThingTemplate& Template) const
+{
+	const uint8* Override = BuildableOverrides.Find(&Template);
+	return Override ? *Override : Template.Buildable;
+}
+
 bool UGenGameLogic::CanMake(int32 Player, const FGenThingTemplate& Template, FString* OutWhy, bool bCheckMoney) const
 {
 	const FGenGameData& GD = FGenGameData::Get();
 	// Player::canBuild: "Buildable = No" never; Only_By_AI for the computer alone; Ignore_Prerequisites without them.
-	if (Template.Buildable == 1 || (Template.Buildable == 2 && Players.IsValidIndex(Player) && !Players[Player].bSkirmishAI))
+	const uint8 Buildable = GetBuildable(Template);
+	if (Buildable == 1 || (Buildable == 2 && Players.IsValidIndex(Player) && !Players[Player].bSkirmishAI))
 	{
 		if (OutWhy) { *OutWhy = TEXT("Not available"); }
 		return false;
 	}
 	static const TArray<TArray<FString>> NoPrerequisites;
-	for (const TArray<FString>& AnyOf : Template.Buildable == 3 ? NoPrerequisites : Template.Prerequisites)
+	for (const TArray<FString>& AnyOf : Buildable == 3 ? NoPrerequisites : Template.Prerequisites)
 	{
 		bool bHave = false;
 		for (FGenObjectID Id : ObjectOrder)
@@ -1400,6 +1407,12 @@ void UGenGameLogic::FinishSell(const FGenObject& Building)
 		return;
 	}
 	// A site that was never finished gives everything back.
+	// BuildAssistant::update: "0 is the init, and means you have no override."
+	if (!Building.IsUnderConstruction() && Building.GetTemplate()->RefundValue != 0)
+	{
+		Deposit(Building.GetOwner(), Building.GetTemplate()->RefundValue);
+		return;
+	}
 	const float Share = Building.IsUnderConstruction() ? 1.f : FGenGameData::Get().SellPercentage;
 	Deposit(Building.GetOwner(), FMath::RoundToInt32(float(CalcCostToBuild(Building.GetOwner(), *Building.GetTemplate())) * Share));
 }
@@ -1428,6 +1441,28 @@ void UGenGameLogic::CancelAllProduction(FGenObject& Building)
 
 void UGenGameLogic::SpawnProducedUnit(const FGenObject& Factory, const FGenThingTemplate& Unit, int32 ExitDoor)
 {
+	if (FGenParkingPlace* PP = Factory.GetParking(); PP && PP->IsFlightDeck())
+	{
+		// FlightDeckBehavior::exitObjectViaDoor: up on the lift, and along the deck to the first free space.
+		if (FGenObject* U = CreateObject(&Unit, Factory.GetOwner(), Factory.GetPosition(), Factory.GetOrientation()))
+		{
+			U->Producer = Factory.GetID();
+			FVector3f Pos;
+			float Angle = 0.f;
+			FGenParkingInfo Info;
+			if (!PP->TakeFirstFreeSpace(U->GetID(), Pos, Angle) || !PP->ReserveSpace(U->GetID(), Unit.JetParkingOffset, &Info))
+			{
+				DestroyObject(U->GetID());
+				return;
+			}
+			U->SetPosition(Pos);
+			U->SetOrientation(Angle);
+			U->SnapshotPrevious();
+			U->SetJetState(EGenJetState::TaxiFromHangar, Frame);
+			UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [jet f%u] #%u %s comes up on #%u's deck at (%.0f, %.0f)"), Frame, U->GetID(), *Unit.Name, Factory.GetID(), Pos.X, Pos.Y);
+		}
+		return;
+	}
 	if (FGenParkingPlace* PP = Factory.GetParking())
 	{
 		// ParkingPlaceBehavior::exitObjectViaDoor: a plane appears in its hangar and taxis to its parking

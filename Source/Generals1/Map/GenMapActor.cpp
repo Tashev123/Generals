@@ -5,6 +5,7 @@
 #include "Logic/GenGameData.h"
 #include "Map/GenBridges.h"
 #include "Map/GenMapData.h"
+#include "Map/GenRandomMap.h"
 #include "Map/GenRoads.h"
 #include "Map/GenTerrain.h"
 #include "Map/GenWater.h"
@@ -46,6 +47,7 @@ AGenMapActor::AGenMapActor()
 		return L;
 	};
 	Sun = MakeLight(TEXT("Sun"), true);
+	Sun->ForwardShadingPriority = 1; // (the one light translucent things and fog go by: the others only fill in)
 	Sun->SetDynamicShadowCascades(4);
 	Sun->SetDynamicShadowDistanceMovableLight(60000.f);
 	Fill1 = MakeLight(TEXT("Fill1"), false);
@@ -121,14 +123,17 @@ bool AGenMapActor::LoadMapByName(const FString& Name)
 	}
 
 	const double Start = FPlatformTime::Seconds();
-	const FString Folder = FString::Printf(TEXT("Maps\\%s"), *Name);
+	// (A generated map is made here from its name; its map.ini is that of an official map of its kind.)
+	const bool bRandom = GenRandomMap::IsRandomName(Name);
+	const FString Folder = bRandom ? GenRandomMap::GetMapIniFolder(Name) : FString::Printf(TEXT("Maps\\%s"), *Name);
 	TSharedPtr<FGenMapData> NewMap = MakeShared<FGenMapData>();
-	if (!NewMap->LoadFromVfs(Folder / (Name + TEXT(".map"))))
+	if (bRandom ? !GenRandomMap::Generate(Name, *NewMap) : !NewMap->LoadFromVfs(Folder / (Name + TEXT(".map"))))
 	{
 		return false;
 	}
 	Map = NewMap;
 	GD.ApplyMapIni(Folder);
+	MapFolder = Folder;
 	FGenWaterSettings::LoadForMap(Folder);
 
 	Terrain->Build(*Map);
@@ -282,7 +287,10 @@ void AGenMapActor::BuildSkyBox()
 	}
 	// The height fog stops short of it: its pictures are the distance already (and it would be all fog).
 	Fog->SetFogCutoffDistance(0.9f * Mesh->BoundsMax.X * Scale);
-	UE_LOG(LogGenerals, Log, TEXT("Sky box: new_skybox.w3d, %d faces, scale %.1f"), Positions.Num(), GD.SkyBoxScale);
+	// (Its sides are as far as the box is wide, wherever the camera goes; its top comes nearer as the camera climbs, a scene's never very high.)
+	constexpr float HighestCameraCm = 1000.f * GenCoords::UnitsToCm;
+	SkyBoxDistance = 0.9f * FMath::Min(Mesh->BoundsMax.X * Scale, Mesh->BoundsMax.Z * Scale + GD.SkyBoxPositionZ * GenCoords::UnitsToCm - HighestCameraCm);
+	UE_LOG(LogGenerals, Log, TEXT("Sky box: new_skybox.w3d, %d faces, scale %.1f, from %.0f units away"), Positions.Num(), GD.SkyBoxScale, SkyBoxDistance / GenCoords::UnitsToCm);
 }
 
 void AGenMapActor::UpdateSkyBox(const FVector& CameraLocation)
@@ -291,6 +299,14 @@ void AGenMapActor::UpdateSkyBox(const FVector& CameraLocation)
 	{
 		// "pos = camera position; pos.Z = SkyBoxPositionZ"
 		SkyBox->SetWorldLocation(FVector(CameraLocation.X, CameraLocation.Y, FGenGameData::Get().SkyBoxPositionZ * GenCoords::UnitsToCm));
+	}
+}
+
+void AGenMapActor::SetSkyBoxVisible(bool bVisible)
+{
+	if (SkyBox)
+	{
+		SkyBox->SetVisibility(bVisible);
 	}
 }
 
@@ -334,11 +350,21 @@ UGenModelComponent* AGenMapActor::SpawnObjectVisual(const FGenThingTemplate& Tem
 	return MC;
 }
 
+void AGenMapActor::RebuildWater()
+{
+	if (Water && Map)
+	{
+		Water->Build(*Map);
+	}
+}
+
 UGenModelComponent* AGenMapActor::CreateObjectVisual(const FGenThingTemplate& Template, const FLinearColor& HouseColor)
 {
 	const FGenDrawModule* Draw = Template.PrimaryDraw();
 	const FString Model = Draw ? Draw->DefaultModel() : FString();
-	if (Model.IsEmpty())
+	// (No model, but flames or smoke of its own: a fire wall's segment, a flare. They go where the object is.)
+	const bool bOnlySystems = Model.IsEmpty() && Draw && Draw->States.ContainsByPredicate([](const FGenModelConditionState& S) { return S.ParticleBones.Num() > 0; });
+	if (Model.IsEmpty() && !bOnlySystems)
 	{
 		return nullptr;
 	}
@@ -348,7 +374,7 @@ UGenModelComponent* AGenMapActor::CreateObjectVisual(const FGenThingTemplate& Te
 	MC->SetupAttachment(RootComponent);
 	MC->RegisterComponent();
 	MC->SetHouseColor(HouseColor);
-	if (!MC->SetModel(Model))
+	if (!bOnlySystems && !MC->SetModel(Model))
 	{
 		MC->DestroyComponent();
 		return nullptr;

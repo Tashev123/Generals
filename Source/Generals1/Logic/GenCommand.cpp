@@ -43,6 +43,7 @@ const TCHAR* FGenCommand::TypeName(EGenCommandType Type)
 	case EGenCommandType::ForceAttackGround: return TEXT("ForceAttackGround");
 	case EGenCommandType::SwitchWeapon: return TEXT("SwitchWeapon");
 	case EGenCommandType::CreateFormation: return TEXT("CreateFormation");
+	case EGenCommandType::Scatter: return TEXT("Scatter");
 	case EGenCommandType::Land: return TEXT("Land");
 	case EGenCommandType::Attack: return TEXT("Attack");
 	case EGenCommandType::SteerGunship: return TEXT("SteerGunship");
@@ -69,6 +70,7 @@ const TCHAR* FGenCommand::TypeName(EGenCommandType Type)
 	case EGenCommandType::QueueUpgrade: return TEXT("QueueUpgrade");
 	case EGenCommandType::PurchaseScience: return TEXT("PurchaseScience");
 	case EGenCommandType::Cheat: return TEXT("Cheat");
+	case EGenCommandType::NoteSelection: return TEXT("NoteSelection");
 	case EGenCommandType::Session: return TEXT("Session");
 	default: return TEXT("None");
 	}

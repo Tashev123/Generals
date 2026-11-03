@@ -21,6 +21,7 @@
 #include "Net/GenNetSubsystem.h"
 #include "Map/GenMapActor.h"
 #include "Map/GenMapData.h"
+#include "Map/GenRandomMap.h"
 #include "W3D/GenModelComponent.h"
 #include "Generals1.h"
 #include "Engine/World.h"
@@ -59,6 +60,8 @@ namespace
 
 void AGenGameMode::StartPlay()
 {
+	// The engine's on-screen notes to developers are not for the player's screen.
+	GAreScreenMessagesEnabled = false;
 	// (Who is where, and who hits what, is the game logic's own business: the engine's physics has
 	// nothing to step, and stepping nothing still takes its share of every frame.)
 	if (UWorld* World = GetWorld())
@@ -93,6 +96,17 @@ void AGenGameMode::StartPlay()
 		return;
 	}
 
+	// -GenRandomMapTest=N: the random map generator tests itself (GenRandomMap.h). All this run does, no screen either.
+	int32 RandomMapTest = 0;
+	if (FParse::Value(FCommandLine::Get(), TEXT("GenRandomMapTest="), RandomMapTest))
+	{
+		Phase = EGenGamePhase::Server;
+		FGenShellData::Get().Initialize();
+		GenRandomMap::RunSelfTest(RandomMapTest);
+		FPlatformMisc::RequestExit(false, TEXT("GenRandomMapTest done"));
+		return;
+	}
+
 	// Reuse a map actor placed in the level (editor preview), otherwise spawn one.
 	for (TActorIterator<AGenMapActor> It(GetWorld()); It; ++It)
 	{
@@ -111,6 +125,14 @@ void AGenGameMode::StartPlay()
 	if (FParse::Value(FCommandLine::Get(), TEXT("GenReplay="), ReplayPath))
 	{
 		StartReplay(ReplayPath);
+		return;
+	}
+	// (-GenLoad=file: a test going straight to a saved game.)
+	static bool bLoadSwitchTaken = false;
+	if (!bLoadSwitchTaken && FParse::Value(FCommandLine::Get(), TEXT("GenLoad="), ReplayPath))
+	{
+		bLoadSwitchTaken = true;
+		BeginFromSave(ReplayPath, false);
 		return;
 	}
 
@@ -169,22 +191,45 @@ void AGenGameMode::StartPlay()
 	const TCHAR* Cmd = FCommandLine::Get();
 	const bool bDirect = !MapName.IsEmpty() || FParse::Value(Cmd, TEXT("GenMap="), MapName) || !ShotPath.IsEmpty() || FParse::Param(Cmd, TEXT("GenNoMenu"))
 		|| FParse::Value(Cmd, TEXT("GenFaction="), Ignored) || FParse::Value(Cmd, TEXT("GenEnemy="), Ignored)
-		|| FParse::Value(Cmd, TEXT("GenObject="), Ignored) || FParse::Value(Cmd, TEXT("GenModel="), Ignored);
+		|| FParse::Value(Cmd, TEXT("GenObject="), Ignored) || FParse::Value(Cmd, TEXT("GenModel="), Ignored)
+		|| FParse::Value(Cmd, TEXT("GenCampaign="), Ignored);
 	const bool bMenuTest = FParse::Value(Cmd, TEXT("GenTestMenu="), Ignored, false);
 	UGenSkirmishSetup* Setup = UGenSkirmishSetup::Get(this);
 	if (Setup && (bMenuTest || !bDirect))
 	{
 		Setup->EnsureLoaded();
+		if (!Setup->PendingLoad.IsEmpty())
+		{
+			const FString SavedGame = MoveTemp(Setup->PendingLoad);
+			Setup->PendingLoad.Reset();
+			Setup->bStartAtOnce = false;
+			if (BeginFromSave(SavedGame, true))
+			{
+				return;
+			}
+		}
 		if (Setup->bStartAtOnce)
 		{
 			// "Restart": the same game again.
 			Setup->bStartAtOnce = false;
-			FRandomStream Random = MakeSetupRandom();
-			TArray<FGenSkirmishSlot> Slots;
-			ShellError = Setup->Resolve(Random, Slots);
-			if (ShellError.IsEmpty() && BeginGame(Setup->Map, Slots, Setup->StartingCash, true))
+			if (!Setup->RestartCampaign.IsEmpty())
 			{
-				return;
+				const FString Campaign = MoveTemp(Setup->RestartCampaign);
+				Setup->RestartCampaign.Reset();
+				if (BeginCampaign(Campaign, Setup->RestartMission, Setup->RestartDifficulty, true))
+				{
+					return;
+				}
+			}
+			else
+			{
+				FRandomStream Random = MakeSetupRandom();
+				TArray<FGenSkirmishSlot> Slots;
+				ShellError = Setup->Resolve(Random, Slots);
+				if (ShellError.IsEmpty() && BeginGame(Setup->Map, Slots, Setup->StartingCash, true))
+				{
+					return;
+				}
 			}
 		}
 		Phase = EGenGamePhase::Menu;
@@ -209,6 +254,15 @@ void AGenGameMode::StartPlay()
 		return;
 	}
 
+	// -GenCampaign=USA [-GenMission=Mission01] [-GenDifficulty=Hard]: a campaign mission at once.
+	FString CampaignName, MissionName;
+	if (FParse::Value(Cmd, TEXT("GenCampaign="), CampaignName))
+	{
+		FParse::Value(Cmd, TEXT("GenMission="), MissionName);
+		BeginCampaign(CampaignName, MissionName, FGenMatchSettings::FromCommandLine().DefaultDifficulty, false);
+		return;
+	}
+
 	// A test run: the local player against one opponent.
 	if (MapName.IsEmpty())
 	{
@@ -226,6 +280,7 @@ void AGenGameMode::StartPlay()
 	FGenSkirmishSlot& Enemy = Slots.AddDefaulted_GetRef();
 	Enemy.Faction = EnemyFaction;
 	Enemy.StartPosition = 1;
+	FParse::Value(Cmd, TEXT("GenEnemyStart="), Enemy.StartPosition); // (a start position counted from 0: Player_N_Start is N - 1)
 	// -GenBots=N: that many computer players in all (the first is the one above), sides in turn.
 	int32 Bots = 1;
 	FParse::Value(Cmd, TEXT("GenBots="), Bots);
@@ -353,8 +408,10 @@ bool AGenGameMode::BeginGame(const FString& MapName, const TArray<FGenSkirmishSl
 
 	// -GenObject=Template1,Template2,... spawns local player units in a row in front of the camera.
 	FString ObjectList;
+	int32 ObjectRank = -1; // -GenObjectRank=N: they start at that rank (0 regular ... 3 heroic).
 	if (FParse::Value(FCommandLine::Get(), TEXT("GenObject="), ObjectList, false))
 	{
+		FParse::Value(FCommandLine::Get(), TEXT("GenObjectRank="), ObjectRank);
 		TArray<FString> Names;
 		ObjectList.ParseIntoArray(Names, TEXT(","));
 		FVector Gen = GenCoords::FromUE(Cam->GetTarget());
@@ -392,13 +449,15 @@ bool AGenGameMode::BeginGame(const FString& MapName, const TArray<FGenSkirmishSl
 				const float Y = bPlaced ? FCString::Atof(*PlaceY) : float(Gen.Y);
 				if (Count == 1)
 				{
-					Logic->CreateObject(T, Whose, FVector3f(X, Y, Logic->GetGroundHeight(X, Y)), FMath::DegreesToRadians(SingleAngle));
+					FGenObject* O = Logic->CreateObject(T, Whose, FVector3f(X, Y, Logic->GetGroundHeight(X, Y)), FMath::DegreesToRadians(SingleAngle));
+					if (O && ObjectRank >= 0) { O->SetVeterancyLevel(ObjectRank, false); }
 				}
 				const float Spacing = BlockSpacing > 0.f ? BlockSpacing : FMath::Max(14.f, T->GetBoundingCircleRadius() * 2.5f);
 				for (int32 n = 0; n < Count && Count > 1; ++n)
 				{
 					const float BX = X + (float(n % 12) - 5.5f) * Spacing, BY = Y + (float(n / 12) - float((Count - 1) / 12) * 0.5f) * Spacing;
-					Logic->CreateObject(T, Whose, FVector3f(BX, BY, Logic->GetGroundHeight(BX, BY)), FMath::DegreesToRadians(BlockAngle));
+					FGenObject* O = Logic->CreateObject(T, Whose, FVector3f(BX, BY, Logic->GetGroundHeight(BX, BY)), FMath::DegreesToRadians(BlockAngle));
+					if (O && ObjectRank >= 0) { O->SetVeterancyLevel(ObjectRank, false); }
 				}
 			}
 			else
@@ -560,6 +619,137 @@ bool AGenGameMode::StartReplay(const FString& InPath)
 	}
 	Logic->PlaceSetupObjects(SetupObjects);
 	return true;
+}
+
+bool AGenGameMode::CanSaveGame() const
+{
+	const UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	return Logic && Logic->IsRunning() && !Logic->IsNetworkGame() && !Logic->IsPlayingBack() && Logic->GetRecording() && !bResumingSave && !Logic->IsGameOver();
+}
+
+bool AGenGameMode::SaveGame(const FString& InPath)
+{
+	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	if (!CanSaveGame())
+	{
+		return false;
+	}
+	Logic->WaitForStep();
+	const FGenMatchSettings& Match = Logic->GetMatchSettings();
+	FGenSavedGame Game;
+	const FDateTime Now = FDateTime::Now();
+	if (!Match.Campaign.IsEmpty())
+	{
+		Game.Title = FString::Printf(TEXT("%s %s"), *Match.Campaign, *Match.Mission);
+	}
+	else
+	{
+		const FGenMapInfo* MapInfo = FGenShellData::Get().FindMap(Match.Map);
+		Game.Title = FString::Printf(TEXT("Skirmish: %s"), MapInfo ? *MapInfo->DisplayName : *Match.Map);
+	}
+	Game.Date = Now.ToString(TEXT("%Y-%m-%d %H:%M"));
+	Game.SortKey = Now.ToString(TEXT("%Y%m%d%H%M%S"));
+	Game.Frame = Logic->GetFrame();
+	APlayerController* PC = GetWorld()->GetFirstPlayerController();
+	if (const AGenCameraPawn* Cam = PC ? Cast<AGenCameraPawn>(PC->GetPawn()) : nullptr)
+	{
+		Game.CameraTarget = Cam->GetTarget();
+		Game.CameraYaw = Cam->GetYaw();
+		Game.CameraHeight = Cam->GetHeight();
+	}
+	if (const AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC))
+	{
+		GenPC->GetPlayerSelections(Game.Selection, Game.Groups);
+	}
+	Game.Replay = *Logic->GetRecording();
+	Game.Replay.BuildId = GenBuild::GetBuildId();
+	Game.Replay.DataHash = GenBuild::GetDataHash();
+	const FString Path = !InPath.IsEmpty() ? InPath : FGenSavedGame::GetFolder() / (Game.SortKey + TEXT(".gensave"));
+	IFileManager::Get().MakeDirectory(*FPaths::GetPath(Path), true);
+	const bool bSaved = Game.Save(Path);
+	UE_LOG(LogGenerals, Log, TEXT("Saved game: %s at frame %u, %d orders -> %s%s"), *Game.Title, Game.Frame, Game.Replay.Commands.Num(), *Path, bSaved ? TEXT("") : TEXT(" (NOT SAVED)"));
+	if (bSaved)
+	{
+		Logic->AddScreenMessage(TEXT("Game saved"));
+	}
+	return bSaved;
+}
+
+void AGenGameMode::RequestLoadGame(const FString& Path)
+{
+	if (bReloading)
+	{
+		return;
+	}
+	if (UGenSkirmishSetup* Setup = UGenSkirmishSetup::Get(this))
+	{
+		Setup->PendingLoad = Path;
+		ReloadLevel();
+	}
+}
+
+bool AGenGameMode::BeginFromSave(const FString& Path, bool bFromMenu)
+{
+	FString Why;
+	if (!ResumeSave.Load(Path, &Why))
+	{
+		UE_LOG(LogGenerals, Error, TEXT("Saved game '%s': %s"), *Path, *Why);
+		ShellError = FString::Printf(TEXT("The saved game can't be loaded: %s"), *Why);
+		return false;
+	}
+	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	if (!Logic)
+	{
+		return false;
+	}
+	if (ResumeSave.Replay.BuildId != GenBuild::GetBuildId() || ResumeSave.Replay.DataHash != GenBuild::GetDataHash())
+	{
+		UE_LOG(LogGenerals, Warning, TEXT("Saved game: made by another build of the game (%s, data %08x; this one is %s, data %08x) - it may come out differently"),
+			*ResumeSave.Replay.BuildId, ResumeSave.Replay.DataHash, *GenBuild::GetBuildId(), GenBuild::GetDataHash());
+	}
+	const FGenMatchSettings Settings = ResumeSave.Replay.Settings;
+	const TArray<FGenSetupObject> SetupObjects = ResumeSave.Replay.SetupObjects;
+	const int32 Viewer = ResumeSave.Replay.RecordedBy;
+	Logic->SetPlayback(MakeUnique<FGenReplay>(MoveTemp(ResumeSave.Replay)));
+	ResumeSave.Replay = FGenReplay();
+	if (!BeginMatch(Settings, bFromMenu, Viewer))
+	{
+		return false;
+	}
+	if (bFromMenu)
+	{
+		SetMenuScreen(Settings.Campaign.IsEmpty() ? EGenMenuScreen::Skirmish : EGenMenuScreen::Campaign);
+	}
+	Logic->PlaceSetupObjects(SetupObjects);
+	Logic->BeginResume(ResumeSave.Frame);
+	bResumingSave = true;
+	UE_LOG(LogGenerals, Log, TEXT("Saved game: %s, playing up to frame %u"), *ResumeSave.Title, ResumeSave.Frame);
+	return true;
+}
+
+void AGenGameMode::FinishResumeSave()
+{
+	bResumingSave = false;
+	APlayerController* PC = GetWorld()->GetFirstPlayerController();
+	if (AGenCameraPawn* Cam = PC ? Cast<AGenCameraPawn>(PC->GetPawn()) : nullptr)
+	{
+		Cam->SetScriptHold(false);
+		Cam->SetTarget(ResumeSave.CameraTarget);
+		Cam->SetHeight(ResumeSave.CameraHeight);
+		Cam->AddYaw(ResumeSave.CameraYaw - Cam->GetYaw());
+	}
+	if (AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC))
+	{
+		GenPC->SetPlayerSelections(ResumeSave.Selection, ResumeSave.Groups);
+		if (AGenHUD* HUD = Cast<AGenHUD>(GenPC->GetHUD()))
+		{
+			HUD->ClearMilitaryCaption();
+		}
+	}
+	if (UGenAudioManager* Audio = UGenAudioManager::Get(this))
+	{
+		Audio->StopAllVoices();
+	}
 }
 
 void AGenGameMode::SaveReplay()
@@ -865,6 +1055,10 @@ void AGenGameMode::TogglePause()
 
 void AGenGameMode::ReloadLevel()
 {
+	// (Once. UEngine::LoadMap draws the old world's screen one more time while it loads, and the click that brought
+	// us here is still a click then: a second reload behind this one would find the restart's details used up, and
+	// end on the menu.)
+	bReloading = true;
 	// A fresh world: nothing of the old game is left to clean up.
 	const FString Level = UWorld::RemovePIEPrefix(GetWorld()->GetOutermost()->GetName());
 	UGameplayStatics::OpenLevel(this, FName(*Level), true, OptionsString);
@@ -873,14 +1067,32 @@ void AGenGameMode::ReloadLevel()
 void AGenGameMode::RestartGame()
 {
 	const UGenGameLogic* Logic = UGenGameLogic::Get(this);
-	if (Logic && Logic->IsNetworkGame())
+	if (bReloading || (Logic && Logic->IsNetworkGame()))
 	{
 		return; // (a network game isn't one player's to start over)
 	}
 	if (UGenSkirmishSetup* Setup = UGenSkirmishSetup::Get(this))
 	{
 		Setup->bStartAtOnce = bStartedFromMenu;
+		Setup->RestartCampaign = Logic && Logic->IsCampaign() ? Logic->GetMatchSettings().Campaign : FString();
+		Setup->RestartMission = Logic ? Logic->GetMatchSettings().Mission : FString();
+		Setup->RestartDifficulty = Logic ? Logic->GetMatchSettings().DefaultDifficulty : 1;
 	}
+	ReloadLevel();
+}
+
+void AGenGameMode::PlayNextMission(const FString& Mission)
+{
+	const UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	UGenSkirmishSetup* Setup = UGenSkirmishSetup::Get(this);
+	if (bReloading || !Logic || !Logic->IsCampaign() || !Setup)
+	{
+		return;
+	}
+	Setup->bStartAtOnce = bStartedFromMenu;
+	Setup->RestartCampaign = Logic->GetMatchSettings().Campaign;
+	Setup->RestartMission = Mission;
+	Setup->RestartDifficulty = Logic->GetMatchSettings().DefaultDifficulty;
 	ReloadLevel();
 }
 
@@ -920,6 +1132,10 @@ void AGenGameMode::LogScores() const
 
 void AGenGameMode::ExitToMenu()
 {
+	if (bReloading)
+	{
+		return;
+	}
 	if (UGenSkirmishSetup* Setup = UGenSkirmishSetup::Get(this))
 	{
 		Setup->bStartAtOnce = false;
@@ -1044,6 +1260,10 @@ void AGenGameMode::Tick(float DeltaSeconds)
 		return;
 	}
 	UGenGameLogic* Logic = UGenGameLogic::Get(this);
+	if (bResumingSave && (!Logic || !Logic->IsResuming()))
+	{
+		FinishResumeSave();
+	}
 	// The recording is written every two minutes as well as at the end: a crash loses no more than that.
 	if (Phase == EGenGamePhase::Playing && Logic && Logic->IsRunning())
 	{
@@ -1060,7 +1280,9 @@ void AGenGameMode::Tick(float DeltaSeconds)
 		if (++LoadingTicks >= 3)
 		{
 			const UGenSkirmishSetup* Setup = UGenSkirmishSetup::Get(this);
-			if (!Setup || !BeginGame(Setup->Map, PendingSlots, Setup->StartingCash, true))
+			const FString Campaign = MoveTemp(PendingCampaign);
+			PendingCampaign.Reset();
+			if (!Campaign.IsEmpty() ? !BeginCampaign(Campaign, PendingMission, PendingDifficulty, true) : (!Setup || !BeginGame(Setup->Map, PendingSlots, Setup->StartingCash, true)))
 			{
 				Phase = EGenGamePhase::Menu;
 			}
@@ -1070,7 +1292,7 @@ void AGenGameMode::Tick(float DeltaSeconds)
 	{
 		// The game is decided for the local player: "victory" or "defeat" stands for a moment, then the score.
 		const bool bLost = Logic->IsPlayerDefeated(Logic->GetLocalPlayer());
-		if (Logic->IsGameOver() || (bLost && !bWatching))
+		if (Logic->IsGameOverAnnounced() || (bLost && !bWatching && !Logic->IsGameOver()))
 		{
 			DecidedSeconds += DeltaSeconds;
 			if (DecidedSeconds >= ScoreScreenDelay)
@@ -1107,6 +1329,10 @@ void AGenGameMode::Tick(float DeltaSeconds)
 		{
 			Audio->Update(DeltaSeconds);
 		}
+	}
+	if (Phase == EGenGamePhase::Playing || Phase == EGenGamePhase::Score)
+	{
+		TickCampaign(DeltaSeconds);
 	}
 	RunTestAutomation(DeltaSeconds);
 }
@@ -1432,7 +1658,7 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 			// The steps that change the game by hand are orders like the others (UGenGameLogic::ExecCheat), so that
 			// a replay of the test has them at the same frame.
 			static const TCHAR* const CheatSteps[] = { TEXT("grant"), TEXT("kill"), TEXT("skill"), TEXT("aiskill"), TEXT("hunt"), TEXT("damage"),
-				TEXT("vet"), TEXT("destroy"), TEXT("money") };
+				TEXT("vet"), TEXT("destroy"), TEXT("money"), TEXT("script"), TEXT("runscript") };
 			if (Algo::FindByPredicate(CheatSteps, [&What](const TCHAR* S) { return What.Equals(S, ESearchCase::IgnoreCase); }))
 			{
 				Logic->IssueCheat(FString::Join(TArrayView<const FString>(Parts).RightChop(1), TEXT(",")));
@@ -1910,6 +2136,10 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 			{
 				if (UGenAudioManager* Audio = Logic->GetAudio()) { Audio->PlayMusic(Arg); }
 			}
+			else if (What.Equals(TEXT("save"), ESearchCase::IgnoreCase))
+			{
+				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: save %s: %s"), Logic->GetFrame(), *Arg, SaveGame(Arg) ? TEXT("done") : TEXT("FAILED"));
+			}
 			else if (What.Equals(TEXT("exec"), ESearchCase::IgnoreCase))
 			{
 				// "frame,exec,console command": e.g. "stat dumpave -num=300 -ms=0.1" (the engine's own timers, to the log)
@@ -1953,6 +2183,51 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 				}
 				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: camera to (%.0f, %.0f), %d units there"), Logic->GetFrame(), At.X, At.Y, BestNum);
 			}
+			else if (What.Equals(TEXT("shot"), ESearchCase::IgnoreCase) && Parts.Num() >= 3)
+			{
+				// "frame,shot,file.png": a picture of the view now, while the game goes on (for a whole scene in one run).
+				FScreenshotRequest::RequestScreenshot(Parts[2], false, false);
+			}
+			else if (What.Equals(TEXT("bone"), ESearchCase::IgnoreCase) && Parts.Num() >= 4)
+			{
+				// "frame,bone,Type,BoneName": where that bone of that object is now, and where it is on the screen.
+				for (FGenObjectID Id : Logic->GetObjectIDs())
+				{
+					const FGenObject* O = Logic->FindObject(Id);
+					if (O && !O->IsDestroyed() && O->GetTemplate()->Name.Equals(Parts[2], ESearchCase::IgnoreCase))
+					{
+						FVector3f At;
+						const bool bHave = Logic->GetNamedBonePosition(*O, Parts[3], At);
+						FVector2D Pixel(-1.0, -1.0);
+						const FVector3f Ref = O->GetPosition();
+						if (bHave && Logic->GetMapActor())
+						{
+							PC->ProjectWorldLocationToScreen(Logic->GetMapActor()->GetActorTransform().TransformPosition(GenCoords::ToUE(At.X, At.Y, At.Z)), Pixel, false);
+						}
+						int32 VX = 0, VY = 0;
+						PC->GetViewportSize(VX, VY);
+						FVector3f Eye = FVector3f::ZeroVector;
+						if (PC->PlayerCameraManager && Logic->GetMapActor())
+						{
+							Eye = FVector3f(GenCoords::FromUE(Logic->GetMapActor()->GetActorTransform().InverseTransformPosition(PC->PlayerCameraManager->GetCameraLocation())));
+						}
+						UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: bone #%u %s %s: %s at (%.0f, %.0f, %.0f), pixel (%.0f, %.0f) of %d x %d, object at (%.0f, %.0f, %.0f), camera at (%.0f, %.0f, %.0f)"), Logic->GetFrame(), Id, *Parts[2], *Parts[3],
+							bHave ? TEXT("found") : TEXT("NOT FOUND"), At.X, At.Y, At.Z, Pixel.X, Pixel.Y, VX, VY, Ref.X, Ref.Y, Ref.Z, Eye.X, Eye.Y, Eye.Z);
+					}
+				}
+			}
+			else if (What.Equals(TEXT("camto"), ESearchCase::IgnoreCase) && Parts.Num() >= 4)
+			{
+				// "frame,camto,x,y[,height]": the view goes there (once the scripts have let go of the camera).
+				if (AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC))
+				{
+					GenPC->LookAt(FVector3f(FCString::Atof(*Parts[2]), FCString::Atof(*Parts[3]), 0.f));
+					if (Parts.Num() >= 5)
+					{
+						if (AGenCameraPawn* CamPawn = Cast<AGenCameraPawn>(PC->GetPawn())) { CamPawn->SetHeight(FCString::Atof(*Parts[4])); }
+					}
+				}
+			}
 			else if (What.Equals(TEXT("formation"), ESearchCase::IgnoreCase))
 			{
 				// "frame,formation[,Kind or Type]": Ctrl+F for everything of ours that moves (of that kind or type).
@@ -1968,6 +2243,10 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 				}
 				Logic->IssueCreateFormation(Units);
 				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: formation of %d units"), Logic->GetFrame(), Units.Num());
+			}
+			else if (What.Equals(TEXT("holdspace"), ESearchCase::IgnoreCase))
+			{
+				bTestHoldSpace = true; // (as the key held down: skips a mission's intro)
 			}
 			else if (What.Equals(TEXT("move"), ESearchCase::IgnoreCase) && Parts.Num() >= 4)
 			{
@@ -2185,6 +2464,22 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 				Logic->IssueSteerGunship(Ships, FVector3f(At.X, At.Y, 0.f));
 				UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: steer %d gunship(s) to (%.0f, %.0f)"), Logic->GetFrame(), Ships.Num(), At.X, At.Y);
 			}
+			else if (What.Equals(TEXT("barmouse"), ESearchCase::IgnoreCase) && Parts.Num() >= 4)
+			{
+				// "frame,barmouse,x,y[,x,y...]": whether the bar takes the mouse on these pixels of the screen and which of its
+				// buttons is there; the mouse stays on the last one (the button lit, its tooltip).
+				AGenPlayerController* GenPC = Cast<AGenPlayerController>(PC);
+				for (int32 i = 2; GenPC && i + 1 < Parts.Num(); i += 2)
+				{
+					const FVector2D Pixel(FCString::Atof(*Parts[i]), FCString::Atof(*Parts[i + 1]));
+					const FGenControlBar& Bar = GenPC->GetControlBar();
+					const FGenBarButton* B = Bar.HitTest(Pixel);
+					const FString Name = !B ? FString(TEXT("no button")) : B->Button ? B->Button->Name : B->bGeneralsToggle ? FString(TEXT("the general's"))
+						: B->System == EGenBarSystem::Options ? FString(TEXT("options")) : B->System == EGenBarSystem::IdleWorker ? FString(TEXT("idle worker")) : FString(TEXT("a button"));
+					UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: bar mouse at (%.0f, %.0f): %s, %s"), Logic->GetFrame(), Pixel.X, Pixel.Y, Bar.IsOverPanel(Pixel) ? TEXT("over the bar") : TEXT("over the world"), *Name);
+					GenPC->SetTestMouse(Pixel);
+				}
+			}
 			else if (What.Equals(TEXT("selkey"), ESearchCase::IgnoreCase))
 			{
 				// "frame,selkey,what[,n]": a selection key - create / select / add / view with a group's number
@@ -2233,6 +2528,9 @@ void AGenGameMode::RunTestAutomation(float DeltaSeconds)
 					}
 					UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: pickscan #%u %s (radius %.1f, the middle nine are within it): across [%s] up [%s]; a pick takes %.0f microseconds among %d objects"),
 						Logic->GetFrame(), Best->GetID(), *Best->GetTemplate()->Name, R, *Across, *Up, (FPlatformTime::Seconds() - Began) * 1.e6 / 20.0, Logic->GetObjectIDs().Num());
+					const FVector UEAt = GenCoords::ToUE(P.X, P.Y, P.Z);
+					UE_LOG(LogGenerals, Log, TEXT("Test powers f%u: pickscan #%u kinds %d, unselectable %d, contained %d, logic at (%.0f, %.0f, %.0f) cm, %s"), Logic->GetFrame(), Best->GetID(),
+						Best->IsKindOf(TEXT("SELECTABLE")) ? 1 : 0, Best->IsSelectable() ? 0 : 1, Best->IsContained() ? 1 : 0, UEAt.X, UEAt.Y, UEAt.Z, *Logic->DescribeDrawablePick(Best->GetID()));
 				}
 				else
 				{

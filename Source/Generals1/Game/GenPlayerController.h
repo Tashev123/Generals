@@ -61,6 +61,17 @@ public:
 	virtual void PlayerTick(float DeltaTime) override;
 
 	const TArray<FGenObjectID>& GetSelection() const { return Selection; }
+	/** What a saved game keeps of the player's: the selection and the hotkey squads. */
+	void GetPlayerSelections(TArray<FGenObjectID>& OutSelection, TArray<FGenObjectID> (&OutGroups)[10]) const
+	{
+		OutSelection = Selection;
+		for (int32 i = 0; i < 10; ++i) { OutGroups[i] = Groups[i]; }
+	}
+	void SetPlayerSelections(const TArray<FGenObjectID>& InSelection, const TArray<FGenObjectID> (&InGroups)[10])
+	{
+		Selection = InSelection;
+		for (int32 i = 0; i < 10; ++i) { Groups[i] = InGroups[i]; }
+	}
 	/** InGameUI::getMousedOverDrawableID: what the cursor is on (it shows its health bar), if anything. */
 	FGenObjectID GetMousedOver() const { return MousedOver; }
 	/** How long the cursor has been on it (its name comes up after Mouse.ini's TooltipDelayTime). */
@@ -96,11 +107,15 @@ public:
 	/** Off during unattended test runs, so the real mouse can't scroll the camera or issue orders. */
 	void SetGenInputEnabled(bool bEnabled) { bGenInputEnabled = bEnabled; }
 	bool IsGenInputEnabled() const { return bGenInputEnabled; }
+	/** DISABLE_INPUT / ENABLE_INPUT of a map's scripts: no orders and no selection while they show something. */
+	void SetScriptInputDisabled(bool bDisabled) { if (bDisabled && !bScriptInputOff) { Selection.Reset(); } bScriptInputOff = bDisabled; }
 	bool GetDragBox(FVector2D& OutA, FVector2D& OutB) const;
 
 	// --- for the HUD ---
 	const FGenControlBar& GetControlBar() const { return ControlBar; }
-	const FVector2D& GetMousePos() const { return MouseNow; }
+	const FVector2D& GetMousePos() const { return bTestMouse ? TestMousePos : MouseNow; }
+	/** Test automation (a run has no mouse): the interface takes the mouse to be on this pixel from now on. */
+	void SetTestMouse(const FVector2D& Pixel) { TestMousePos = Pixel; bTestMouse = true; }
 	/** The building being placed, where, and whether it may go there. */
 	const FGenThingTemplate* GetPlacement(FVector3f& OutPos, float& OutAngle, bool& bOutLegal) const;
 	/** Performs a command bar click (also used by the test automation). */
@@ -161,7 +176,7 @@ private:
 	enum class EClickAction : uint8
 	{
 		Nothing, Dock, Enter, Repair, GetRepaired, SetRally, Land, ResumeConstruction, SelectOwn, SteerPower, Attack, Move, SelectOther, Deselect,
-		ForceAttackObject, ForceAttackGround, ImpossibleAttack, AddWaypoint, Salvage
+		ForceAttackObject, ForceAttackGround, ImpossibleAttack, AddWaypoint, Salvage, CaptureBuilding
 	};
 	struct FClickEval
 	{
@@ -223,6 +238,9 @@ private:
 
 	TArray<FGenObjectID> Selection;
 	bool bGenInputEnabled = true;
+	bool bScriptInputOff = false;
+	/** A scene is on: nothing selected, nothing under the mouse, no mouse (ScriptActions::doDisableInput). */
+	void EnterSceneInput();
 	FGenControlBar ControlBar;
 
 	// Building placement (after clicking a construction button)
@@ -273,6 +291,8 @@ private:
 	bool bBoxSelecting = false;
 	FVector2D LeftStart = FVector2D::ZeroVector;
 	FVector2D MouseNow = FVector2D::ZeroVector;
+	FVector2D TestMousePos = FVector2D::ZeroVector;
+	bool bTestMouse = false;
 
 	// right mouse
 	bool bRightDown = false;

@@ -149,6 +149,29 @@ void FGenObject::LaunchMissile(uint32 Frame, const FQuat4f* LaunchRotation)
 		Frame, ID, *Template->Name, Dir.X, Dir.Y, Dir.Z, InitialVelocity, M.End.X, M.End.Y, M.End.Z, M.bTracking ? TEXT(", following its target") : TEXT(""));
 }
 
+void FGenObject::ProjectileNowJammed()
+{
+	// MissileAIUpdate::projectileNowJammed: "There is no coming back from being jammed": off to somewhere near where it was going.
+	static const int32 Jammed = GenConditions::Index(TEXT("JAMMED"));
+	if (!Projectile.bActive || ModelConditions.Test(Jammed))
+	{
+		return;
+	}
+	SetModelCondition(Jammed, true);
+	const FGenObject* Goal_ = Projectile.bTracking ? Logic->FindObject(Projectile.Victim) : nullptr;
+	FVector3f Where = Goal_ ? Goal_->GetPosition() : (Projectile.bThrust ? Projectile.OriginalTarget : Projectile.End);
+	const float Scatter = Template->MissileDistanceScatterWhenJammed;
+	FRandomStream& Rand = Logic->GetRandom();
+	Where.X += Rand.FRandRange(-Scatter, Scatter);
+	Where.Y += Rand.FRandRange(-Scatter, Scatter);
+	Where.Z = Logic->GetGroundHeight(Where.X, Where.Y);
+	Projectile.bTracking = false;
+	Projectile.Victim = GenInvalidObjectID;
+	Projectile.OriginalTarget = Where;
+	Projectile.End = Where;
+	UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [jam f%u] #%u %s is jammed: now for (%.0f, %.0f)"), Logic->GetFrame(), ID, *Template->Name, Where.X, Where.Y);
+}
+
 void FGenObject::DetonateMissile(uint32 Frame)
 {
 	// MissileAIUpdate::detonate / WeaponStore::handleProjectileDetonation: effects and damage are positional.
@@ -164,12 +187,20 @@ void FGenObject::DetonateMissile(uint32 Frame)
 	if (!M.bNoDamage)
 	{
 		Logic->DealDamage(W, Logic->FindObject(M.Launcher) ? M.Launcher : ID, M.Victim, Position, true);
+		if (Template->BunkerBuster.bValid || Template->NeutronShell.bValid)
+		{
+			OnBlastDeath();
+		}
 	}
 	// "Delay destroying the object ... to let the contrail catch up."
 	bHidden = true;
 	Velocity = FVector3f::ZeroVector;
 	M.State = EGenMissileState::KillSelf;
 	M.StateFrame = Frame;
+	if (W.bMissileCallsOnDie)
+	{
+		Kill(TEXT("DETONATED"), GenInvalidObjectID); // MissileAIUpdate::detonate: getDieOnDetonate
+	}
 	UE_CLOG(Logic->IsTracing(), LogGenerals, Log, TEXT("  [missile f%u] #%u %s goes off at (%.0f, %.0f, %.0f)"), Frame, ID, *Template->Name, Position.X, Position.Y, Position.Z);
 }
 
@@ -223,18 +254,22 @@ void FGenObject::UpdateMissile(uint32 Frame, const FGenObject* Victim)
 		}
 		[[fallthrough]];
 	case EGenMissileState::Ignition:
+	{
 		// doIgnitionState: the engine lights, the exhaust shows, the warhead is armed.
 		StateMaxAccel = M.MaxAccel;
 		Logic->DoFXObj(Template->MissileIgnitionFX, *this);
-		if (!M.Weapon->ProjectileExhaust.IsEmpty())
+		const FGenObject* LauncherObj = Logic->FindObject(M.Launcher);
+		const FString& Exhaust = M.Weapon->GetProjectileExhaust(LauncherObj ? LauncherObj->GetVeterancyLevel() : 0);
+		if (!Exhaust.IsEmpty())
 		{
-			Logic->AttachParticleSystem(M.Weapon->ProjectileExhaust, ID);
+			Logic->AttachParticleSystem(Exhaust, ID);
 		}
 		M.bArmed = true;
 		M.FuelExpires = Template->MissileFuelLifetime > 0 ? Frame + uint32(Template->MissileFuelLifetime) : MAX_uint32;
 		M.State = EGenMissileState::AttackNoTurn;
 		M.StateFrame = Frame;
 		break;
+	}
 
 	case EGenMissileState::AttackNoTurn:
 	case EGenMissileState::Attack:
@@ -451,6 +486,21 @@ void FGenObject::UpdateMissile(uint32 Frame, const FGenObject* Victim)
 					}
 					return;
 				}
+			}
+		}
+		// MissileAIUpdate::projectileHandleCollision: what stands in the way of it.
+		if (M.State != EGenMissileState::KillSelf)
+		{
+			FVector3f At;
+			if (const FGenObject* Other = FindProjectileCollision(*M.Weapon, OldPos, Position, At))
+			{
+				Position = At;
+				M.Victim = GenInvalidObjectID;
+				if (!(Template->DumbProjectile.GarrisonHitKillCount > 0 && ProjectileClearsGarrison(Other->ID)))
+				{
+					DetonateMissile(Frame);
+				}
+				return;
 			}
 		}
 		if (M.State == EGenMissileState::Kill)

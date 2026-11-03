@@ -103,9 +103,11 @@ enum class EGenUpgradeEffect : uint8
 struct GENERALS1_API FGenUpgradeModule
 {
 	EGenUpgradeEffect Effect = EGenUpgradeEffect::Other;
+	bool bVeterancyAutoHeal = false;        // the AutoHeal every object inherits, not the object's own
 	FString ModuleType;
 	TArray<FString> TriggeredBy;
 	TArray<FString> ConflictsWith;
+	TArray<FString> RemovesUpgrades;        // UpgradeMuxData: taken away (so they can be had again) when this one runs
 	bool bRequiresAllTriggers = false;
 	float AddMaxHealth = 0.f;               // MaxHealthUpgrade
 	FString ChangeType;                     // SAME_CURRENTHEALTH, PRESERVE_RATIO, ADD_CURRENT_HEALTH_TOO
@@ -139,6 +141,7 @@ struct GENERALS1_API FGenAutoHeal
 	bool bStartsActive = false;
 	bool bSingleBurst = false;      // one pulse, then done (the Emergency Repair marker)
 	bool bAffectsWholePlayer = false;
+	bool bSkipSelf = false;         // SkipSelfForHealing
 	TArray<FString> KindOf;         // only these are healed (any of)
 	TArray<FString> ForbiddenKindOf;
 };
@@ -186,6 +189,7 @@ struct GENERALS1_API FGenCrateCollide
 enum class EGenPowerModule : uint8
 {
 	Other,          // shown in the command bar, but cannot be used yet
+	FireWeapon,     // FireWeaponPower: the unit fires so many shots at the spot (the battleships of USA 2)
 	OCL,            // OCLSpecialPower: runs an ObjectCreationList (a plane with a payload, units out of nowhere, a marker)
 	CashHack,       // takes money from the owner of the targeted supply center
 	CashBounty,     // passive: a share of the cost of everything this player destroys
@@ -211,9 +215,12 @@ struct GENERALS1_API FGenSpecialPowerModule
 	TArray<TPair<FString, int32>> UpgradeMoney;
 	float Bounty = 0.f;                         // CashBountyPower: share of the victim's cost
 	int32 Duration = 0;                         // SpyVisionSpecialPower: BaseDuration, frames
+	int32 BonusDurationPerCaptured = 0;         // ... this much more for each one held inside ...
+	int32 MaxDuration = 0;                      // ... up to this
 	FString InitiateSound;                      // SpecialAbility: what the unit says when sent to do it
 	float CleanupMoveRange = 0.f;               // CleanupAreaPower: MaxMoveDistanceFromLocation
 	FString DetonationObject;                   // BaikonurLaunchPower
+	int32 MaxShotsToFire = 1;                   // FireWeaponPower
 };
 
 /**
@@ -314,12 +321,15 @@ public:
 	static FGenUpgradeData& Get();
 
 	bool Initialize();
+	void ApplyMapIni(const TArray<TSharedPtr<FGenIniBlock>>& Blocks);
 
 	const FGenUpgradeTemplate* FindUpgrade(const FString& Name) const;
 	const FGenScience* FindScience(const FString& Name) const;
 	const FGenSpecialPowerTemplate* FindPower(const FString& Name) const;
 	/** Rank 1 is index 0. */
 	const TArray<FGenRank>& GetRanks() const { return Ranks; }
+	/** -GenDumpStats: what is held of upgrades, sciences, ranks and powers. */
+	void DumpStats(TArray<FString>& Out) const;
 
 	// Module parsing for object templates (called from FGenGameData).
 	/** True if the block is an upgrade-triggered module (has TriggeredBy) of a kind listed in EGenUpgradeEffect. */
@@ -333,6 +343,9 @@ public:
 
 private:
 	bool bInitialized = false;
+	void ParsePower(const FGenIniBlock& B);
+	TMap<FString, FGenUpgradeTemplate> MapIniSavedUpgrades; // what the loaded map's map.ini changed
+	TMap<FString, FGenSpecialPowerTemplate> MapIniSavedPowers;
 	TMap<FString, FGenUpgradeTemplate> Upgrades;        // key: lowercase name
 	TMap<FString, FGenScience> Sciences;
 	TMap<FString, FGenSpecialPowerTemplate> Powers;

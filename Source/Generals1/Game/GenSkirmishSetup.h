@@ -105,6 +105,11 @@ public:
 	// --- carried from one load of the level to the next ---
 	/** "Restart": the next load starts the same game at once instead of showing the menu. */
 	bool bStartAtOnce = false;
+	/** ... and when that game was a campaign mission, which (with its difficulty). */
+	FString RestartCampaign, RestartMission;
+	/** "Load game": the next load plays this saved game. */
+	FString PendingLoad;
+	int32 RestartDifficulty = 1;
 	/** Test automation (-GenTestMenu): how far the script has got. */
 	double TestSeconds = 0.0;
 	int32 TestStepsDone = 0;

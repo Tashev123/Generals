@@ -37,7 +37,7 @@ public:
 		Closed,             // a gap a cell wide beside a structure, shut (the original's CELL_IMPASSABLE: "impassable except for aircraft")
 	};
 
-	void Build(const FGenMapData& Map, const TArray<FGenBridgeInfo>& InBridges = TArray<FGenBridgeInfo>());
+	void Build(const FGenMapData& Map, const TArray<FGenBridgeInfo>& InBridges = TArray<FGenBridgeInfo>(), bool bCellsOffTheMap = false);
 	/** Called every few hundred cells of a search and of the labelling of regions: the simulation's thread
 	 *  lets the game thread have its turn there. (Nothing may search, or change what is passable, from in there.) */
 	void SetYield(void (*InYield)(void*), void* InContext) { YieldFn = InYield; YieldContext = InContext; }
@@ -68,6 +68,8 @@ public:
 
 	/** Adds/removes a structure footprint (reference counted per cell, and the cell records which object
 	 *  it belongs to). */
+	/** Pathfinder::classifyMapObstacle's water side: the cells in that area, after its water level has changed. */
+	void RefreshWater(const FGenMapData& Map, const FBox2f& Area);
 	void AddObstacle(const FGenObject& Obj);
 	void RemoveObstacle(const FGenObject& Obj);
 	/** Pathfinder::classifyFence: the cells under a fence, which only what can crush drives through. */
@@ -135,10 +137,14 @@ public:
 	/** Same, with an extra condition on the spot (adjustTargetDestination: e.g. "within weapon range of the target"). */
 	bool AdjustUnitDestination(FGenObjectID Id, float Radius, uint32 Surfaces, FVector2f& InOutPos, TFunctionRef<bool(const FVector2f&)> Accept, int32 Layer = 0,
 		FGenObjectID IgnoreObstacleID = GenInvalidObjectID) const;
-	/** FindPath that treats cells held by other stationary units (widened by this unit's size) as blocked. */
+	/** FindPath that treats cells held by other stationary units (widened by this unit's size) as blocked -
+	 *  those that IsObstacle says are in this unit's way. */
 	bool FindPathAroundUnits(FGenObjectID Id, float Radius, const FVector2f& Start, const FVector2f& Goal, uint32 Surfaces, TArray<FVector2f>& OutPath,
-		int32 StartLayer = 0, int32 GoalLayer = 0, TArray<uint8>* OutLayers = nullptr,
-		FGenObjectID IgnoreObstacleID = GenInvalidObjectID) const;
+		int32 StartLayer, int32 GoalLayer, TArray<uint8>* OutLayers, FGenObjectID IgnoreObstacleID, TFunctionRef<bool(FGenObjectID)> IsObstacle) const;
+	/** What stands parked on a path (the cells a unit of that size crosses, not those it starts in): the highest
+	 *  that Kind gives any of them, 0 for none. */
+	int32 WorstParkedOnPath(FGenObjectID Id, float Radius, const FVector2f& Start, const TArray<FVector2f>& Path, const TArray<uint8>& PathLayers,
+		FGenObjectID IgnoreObstacleID, TFunctionRef<int32(FGenObjectID)> Kind) const;
 	/** Pathfinder::getRadiusAndCenter: half-size in cells of a unit's footprint, and whether it is centered in a cell. */
 	static void GetRadiusAndCenter(float BoundingCircleRadius, int32& OutRadius, bool& bOutCenter);
 
@@ -174,6 +180,11 @@ private:
 	};
 
 	bool CanPass(int32 X, int32 Y, uint32 Surfaces, int32 Layer = 0) const;
+	/** Pathing around units: is the one parked there in the way? */
+	bool IsAvoidedUnit(FGenObjectID U) const
+	{
+		return U != GenInvalidObjectID && U != AvoidSelf && U != ObstacleToIgnore && (!AvoidTest || (*AvoidTest)(U));
+	}
 	/** The node of a cell: the ground's own index, or a place among a bridge's cells. -1: there is no such cell. */
 	int32 NodeIndex(int32 Layer, int32 X, int32 Y) const;
 	void NodeToCell(int32 Node, int32& OutLayer, int32& OutX, int32& OutY) const;
@@ -240,6 +251,7 @@ private:
 	// Set only for the duration of FindPathAroundUnits.
 	mutable FGenObjectID AvoidSelf = GenInvalidObjectID;
 	mutable int32 AvoidRadius = -1;  // < 0: units are ignored
+	mutable const TFunctionRef<bool(FGenObjectID)>* AvoidTest = nullptr;
 
 	// Set only for the duration of one search or destination test: Pathfinder's m_ignoreObstacleID, the
 	// object whose footprint may be crossed - the one the unit is going into.

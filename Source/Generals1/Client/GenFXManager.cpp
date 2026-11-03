@@ -86,11 +86,129 @@ void UGenFXManager::Deinitialize()
 	Super::Deinitialize();
 }
 
+static TAutoConsoleVariable<int32> CVarGenSnow(TEXT("gen.Snow"), 1, TEXT("1: snow falls on the maps whose weather asks for it. 0: it doesn't."));
+static TAutoConsoleVariable<int32> CVarGenSnowMax(TEXT("gen.SnowMax"), 40000, TEXT("The most snow flakes drawn in a frame."));
+
+void UGenFXManager::LoadWeather()
+{
+	Snow = FSnow();
+	const auto Apply = [this](const TArray<TSharedPtr<FGenIniBlock>>& Blocks)
+	{
+		for (const TSharedPtr<FGenIniBlock>& B : Blocks)
+		{
+			if (!B->Keyword.Equals(TEXT("Weather"), ESearchCase::IgnoreCase))
+			{
+				continue;
+			}
+			if (B->Find(TEXT("SnowEnabled"))) { Snow.bEnabled = B->GetBool(TEXT("SnowEnabled")); }
+			if (B->Find(TEXT("SnowTexture"))) { Snow.Texture = B->GetString(TEXT("SnowTexture")); }
+			Snow.BoxDimensions = B->GetFloat(TEXT("SnowBoxDimensions"), Snow.BoxDimensions);
+			Snow.Density = B->GetFloat(TEXT("SnowBoxDensity"), Snow.Density);
+			Snow.FrequencyScaleX = B->GetFloat(TEXT("SnowFrequencyScaleX"), Snow.FrequencyScaleX);
+			Snow.FrequencyScaleY = B->GetFloat(TEXT("SnowFrequencyScaleY"), Snow.FrequencyScaleY);
+			Snow.Amplitude = B->GetFloat(TEXT("SnowAmplitude"), Snow.Amplitude);
+			Snow.Velocity = B->GetFloat(TEXT("SnowVelocity"), Snow.Velocity);
+			Snow.PointSize = B->GetFloat(TEXT("SnowPointSize"), Snow.PointSize);
+			Snow.MaxPointSize = B->GetFloat(TEXT("SnowMaxPointSize"), Snow.MaxPointSize);
+			Snow.MinPointSize = B->GetFloat(TEXT("SnowMinPointSize"), Snow.MinPointSize);
+		}
+	};
+	TArray<TSharedPtr<FGenIniBlock>> Blocks;
+	GenIni::ParseFile(TEXT("Data\\INI\\Default\\Weather.ini"), Blocks);
+	GenIni::ParseFile(TEXT("Data\\INI\\Weather.ini"), Blocks);
+	Apply(Blocks);
+	if (MapActor && !MapActor->MapFolder.IsEmpty())
+	{
+		Blocks.Reset();
+		GenIni::ParseFile(MapActor->MapFolder / TEXT("map.ini"), Blocks);
+		Apply(Blocks);
+	}
+	if (Snow.bEnabled)
+	{
+		// SnowManager::updateIniSettings: "a table of random starting positions for each particle" (what is drawn only).
+		FRandomStream R(int32(GetTypeHash(MapActor ? MapActor->MapName : FString())));
+		Snow.StartingHeights.SetNumUninitialized(64 * 64);
+		for (float& H : Snow.StartingHeights)
+		{
+			H = float(R.RandRange(0, FMath::Max(1, int32(Snow.BoxDimensions)) - 1));
+		}
+		UE_LOG(LogGenerals, Log, TEXT("Snow: %s, box %.0f, density %.2f, falling %.1f a second"), *Snow.Texture, Snow.BoxDimensions, Snow.Density, Snow.Velocity);
+	}
+}
+
+void UGenFXManager::RenderSnow(const FVector& CamPos, const FVector& Right, const FVector& Up, const FVector& Forward, double TanX, double TanY)
+{
+	// W3DSnowManager::render (positions in the game's units here, then drawn in Unreal's).
+	GEN_PERF_SCOPE("R.FX.Snow");
+	if (!Snow.bEnabled || !bSnowVisible || Snow.StartingHeights.Num() == 0 || CVarGenSnow.GetValueOnGameThread() == 0)
+	{
+		return;
+	}
+	const double Cm = GenCoords::UnitsToCm;
+	const FVector3f Cam(GenCoords::FromUE(CamPos));
+	const float Spacing = 1.f / FMath::Max(Snow.Density, 0.001f);
+	const int32 Half = FMath::FloorToInt32(Snow.BoxDimensions / Spacing * 0.5f);
+	const int32 CX = FMath::FloorToInt32(Cam.X / Spacing), CY = FMath::FloorToInt32(Cam.Y / Spacing);
+	const float Ceiling = Cam.Z + Snow.BoxDimensions * 0.5f;
+	const float FullTime = Snow.BoxDimensions / FMath::Max(Snow.Velocity, 0.001f);
+	const float Time = FMath::Fmod(float(ClientTime / 30.0), FullTime);
+	const float Traveled = Time * Snow.Velocity + FMath::Fmod(Cam.Z, Snow.BoxDimensions);
+	FBatch& B = Batches[GetBatch(Snow.Texture, EGenParticleShader::Alpha, true, false)];
+	// Point sprites of SnowPointSize * height / distance pixels within their limits; at the original's 600 lines, so
+	// that they come out the same on any screen (2 * tan(fov / 2) * distance is what the view's height takes in there).
+	const double ViewPerDepth = 2.0 * TanY / 600.0;
+	const FLinearColor White(1.f, 1.f, 1.f, 1.f);
+	const int32 Block = 16;
+	const int32 Cap = CVarGenSnowMax.GetValueOnGameThread();
+	int32 Drawn = 0;
+	for (int32 by = CY - Half; by < CY + Half && Drawn < Cap; by += Block)
+	{
+		for (int32 bx = CX - Half; bx < CX + Half && Drawn < Cap; bx += Block)
+		{
+			// (renderSubBox: "very few off-screen particles end up getting rendered")
+			const FVector3f BlockCenter((float(bx) + Block * 0.5f) * Spacing, (float(by) + Block * 0.5f) * Spacing, Cam.Z);
+			const FVector D = GenCoords::ToUE(BlockCenter.X, BlockCenter.Y, BlockCenter.Z) - CamPos;
+			const double Reach = (double(Block) * Spacing * 0.75 + Snow.BoxDimensions * 0.5 + Snow.Amplitude) * Cm;
+			const double BlockDepth = FVector::DotProduct(D, Forward);
+			if (BlockDepth < -Reach || FMath::Abs(FVector::DotProduct(D, Right)) > FMath::Max(BlockDepth, 0.0) * TanX + Reach * 1.5
+				|| FMath::Abs(FVector::DotProduct(D, Up)) > FMath::Max(BlockDepth, 0.0) * TanY + Reach * 1.5)
+			{
+				continue;
+			}
+			for (int32 y = by; y < by + Block && y < CY + Half; ++y)
+			{
+				for (int32 x = bx; x < bx + Block && x < CX + Half; ++x)
+				{
+					const int32 Noise = ((x + 100000) & 63) + ((y + 100000) & 63) * 64;
+					const float H = Ceiling - FMath::Fmod(Traveled + Snow.StartingHeights[Noise], Snow.BoxDimensions);
+					FVector3f P(float(x) * Spacing, float(y) * Spacing, H);
+					P.X += Snow.Amplitude * FMath::Sin(H * Snow.FrequencyScaleX + float(x));
+					P.Y += Snow.Amplitude * FMath::Sin(H * Snow.FrequencyScaleY + float(y));
+					const FVector Center = GenCoords::ToUE(P.X, P.Y, P.Z);
+					const FVector ToFlake = Center - CamPos;
+					const double Depth = FVector::DotProduct(ToFlake, Forward);
+					if (Depth < 30.0)
+					{
+						continue;
+					}
+					const double Pixels = FMath::Clamp(double(Snow.PointSize) * 600.0 / (Depth / Cm), double(Snow.MinPointSize), double(Snow.MaxPointSize));
+					const double Half3D = Pixels * ViewPerDepth * Depth * 0.5;
+					const FVector AxX = Right * Half3D, AxY = Up * Half3D;
+					AddQuad(B.Vertices, B.UVs, B.Colors, Center - AxX + AxY, Center - AxX - AxY, Center + AxX - AxY, Center + AxX + AxY, White, White);
+					++Drawn;
+				}
+			}
+		}
+	}
+	GEN_PERF_COUNT("R.FX.Snow#", Drawn);
+}
+
 void UGenFXManager::Start(AGenMapActor* InMapActor, UGenGameLogic* InLogic)
 {
 	MapActor = InMapActor;
 	Logic = InLogic;
 	FGenFXData::Get().Initialize();
+	LoadWeather();
 	Particles.Reset();
 	Particles.ObjectTransform = [this](FGenObjectID Id, FTransform3f& Out)
 	{
@@ -304,12 +422,14 @@ FGenParticleSystem* UGenFXManager::CreateAttachedSystem(const FString& TemplateN
 	return Sys;
 }
 
-void UGenFXManager::CreateSystemAt(const FString& TemplateName, const FVector3f& Pos)
+uint32 UGenFXManager::CreateSystemAt(const FString& TemplateName, const FVector3f& Pos)
 {
 	if (FGenParticleSystem* Sys = MapActor ? Particles.Create(TemplateName) : nullptr)
 	{
 		Sys->SetPosition(Pos);
+		return Sys->GetID();
 	}
+	return 0;
 }
 
 void UGenFXManager::OnObjectDestroyed(FGenObjectID Object)
@@ -355,6 +475,25 @@ void UGenFXManager::AddLightPulse(const FVector3f& Pos, const FLinearColor& Colo
 	P.IncreaseFrames = IncreaseFrames;
 	P.DecreaseFrames = DecreaseFrames;
 	P.StartTime = ClientTime;
+}
+
+void UGenFXManager::ShakeAt(const FVector3f& Epicenter, float Radius, float Amplitude)
+{
+	const FGenFXData& Data = FGenFXData::Get();
+	APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr;
+	const AGenCameraPawn* Cam = PC ? Cast<AGenCameraPawn>(PC->GetPawn()) : nullptr;
+	if (!Cam || Radius <= 0.f)
+	{
+		return;
+	}
+	const FVector View = GenCoords::FromUE(Cam->GetTarget());
+	const float Dist = FVector2f(Epicenter.X - float(View.X), Epicenter.Y - float(View.Y)).Size();
+	if (Dist < Radius)
+	{
+		const float Angle = Particles.GetRandom().FRandRange(0.f, 2.f * PI);
+		ShakeDir = FVector2f(FMath::Cos(Angle), FMath::Sin(Angle));
+		ShakeIntensity = FMath::Min(ShakeIntensity + Amplitude * (1.f - Dist / Radius), Data.MaxShakeIntensity);
+	}
 }
 
 void UGenFXManager::Shake(const FVector3f& Epicenter, int32 Type)
@@ -533,7 +672,10 @@ int32 UGenFXManager::GetBatch(const FString& Texture, EGenParticleShader Shader,
 	}
 
 	UMaterialInstanceDynamic* MID = nullptr;
-	if (UMaterialInterface* Base = GetParticleMaterial(Shader))
+	// (W3DParticleSystemManager: a texture named SMUD* is no picture but a place where the picture behind shimmers.)
+	UMaterialInterface* SmudgeBase = Texture.StartsWith(TEXT("SMUD"), ESearchCase::IgnoreCase)
+		? LoadObject<UMaterialInterface>(nullptr, TEXT("/Game/Generals/Materials/M_Smudge.M_Smudge")) : nullptr;
+	if (UMaterialInterface* Base = SmudgeBase ? SmudgeBase : GetParticleMaterial(Shader))
 	{
 		MID = UMaterialInstanceDynamic::Create(Base, this);
 		if (UTexture2D* Tex = Texture.IsEmpty() ? nullptr : UGenAssetSubsystem::Get()->GetTexture(Texture))
@@ -680,6 +822,7 @@ void UGenFXManager::RenderParticles()
 	}
 
 	GEN_PERF_COUNT("R.FX.SystemsOutOfView#", NumCulled);
+	RenderSnow(CamPos, Right, Up, Forward, TanX, TanY);
 
 	if (Tracers.Num() > 0)
 	{

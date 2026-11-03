@@ -125,7 +125,8 @@ void UGenAudioManager::Start(AGenMapActor* InMapActor, UGenGameLogic* InLogic)
 	MusicTrackNumber = 0;
 	MusicNextStart = 10.0;
 	PlayMusic(FString());
-	if (Logic && !FParse::Param(FCommandLine::Get(), TEXT("GenNoMusic")))
+	// (A campaign mission's scripts choose its music: MUSIC_SET_TRACK.)
+	if (Logic && !Logic->IsCampaign() && !FParse::Param(FCommandLine::Get(), TEXT("GenNoMusic")))
 	{
 		const TArray<FGenPlayer>& Players = Logic->GetPlayers();
 		const int32 Local = Logic->GetLocalPlayer();
@@ -201,10 +202,10 @@ float UGenAudioManager::GetEffectiveVolume(const FVoice& Voice) const
 	}
 	if (Voice.bPositional)
 	{
-		return OutputGain * Voice.Volume * S.Default3DSoundVolume * ZoomVolume * GetRangeScale(*Voice.Info, Voice.Pos);
+		return OutputGain * Voice.Volume * S.Default3DSoundVolume * ZoomVolume * ScriptSoundVolume * GetRangeScale(*Voice.Info, Voice.Pos);
 	}
 	// Relative2DVolume: "if less than 0, 2D volumes will be 100% - x%, while 3D sounds will be 100%".
-	return OutputGain * Voice.Volume * S.DefaultSoundVolume * (S.Relative2DVolume < 0.f ? 1.f + S.Relative2DVolume : 1.f);
+	return OutputGain * Voice.Volume * S.DefaultSoundVolume * (S.Relative2DVolume < 0.f ? 1.f + S.Relative2DVolume : 1.f) * (Voice.bSpeech ? 1.f : ScriptSoundVolume);
 }
 
 float UGenAudioManager::GetUserScale(const FVoice& Voice)
@@ -227,7 +228,7 @@ void UGenAudioManager::ApplyUserVolumes()
 {
 	if (MusicComponent && MusicWave)
 	{
-		MusicComponent->SetVolumeMultiplier(FMath::Max(MusicBaseVolume * UserVolumes.Master * UserVolumes.Music, 0.0001f));
+		MusicComponent->SetVolumeMultiplier(FMath::Max(MusicBaseVolume * ScriptMusicVolume * UserVolumes.Master * UserVolumes.Music, 0.0001f));
 	}
 	for (const FVoice& V : Voices)
 	{
@@ -282,12 +283,29 @@ uint32 UGenAudioManager::PlayUI(const FString& Event, int32 Player)
 	return AddEvent(Request);
 }
 
+uint32 UGenAudioManager::PlaySpeech(const FString& Event, bool bAllowOverlap)
+{
+	FRequest Request;
+	Request.Info = FGenAudioData::Get().Find(Event);
+	Request.bUninterruptable = !bAllowOverlap;
+	const uint32 Handle = AddEvent(Request);
+	if (Handle != 0 && Request.bUninterruptable && Request.Info->SoundType == EGenAudioType::Streaming)
+	{
+		UninterruptableSpeech = Handle;
+	}
+	return Handle;
+}
+
 uint32 UGenAudioManager::AddEvent(const FRequest& Request)
 {
 	// AudioManager::addAudioEvent
 	if (!Request.Info || !MapActor || bSuspended)
 	{
 		return 0;
+	}
+	if (const float* Override = ScriptEventVolumes.Find(Request.Info->Name); Override && *Override <= 0.f)
+	{
+		return 0; // addAudioEvent: "cull muted audio"
 	}
 	if (!IsInGameThread())
 	{
@@ -298,6 +316,15 @@ uint32 UGenAudioManager::AddEvent(const FRequest& Request)
 	if (!ShouldPlayLocally(*Request.Info, Request.Player))
 	{
 		return 0; // AHSV_NotForLocal
+	}
+	// "if we're currently playing uninterruptable speech, then disallow the addition of this sample"
+	if (UninterruptableSpeech != 0 && Request.Info->SoundType == EGenAudioType::Streaming)
+	{
+		if (IsPlaying(UninterruptableSpeech))
+		{
+			return 0;
+		}
+		UninterruptableSpeech = 0;
 	}
 	if (Request.Info->DelayMax > 0.f && Request.FireTime == 0.0)
 	{
@@ -434,6 +461,14 @@ uint32 UGenAudioManager::StartVoice(const FRequest& Request)
 	const bool bPositional = IsPositional(Request);
 	const bool bStream = Info.SoundType == EGenAudioType::Streaming;
 	const bool bInterrupt = (Info.Control & GenAudioControl::Interrupt) != 0;
+	if (bStream && Request.bUninterruptable)
+	{
+		// MilesAudioManager::stopAllSpeech
+		for (int32 i = Voices.Num() - 1; i >= 0; --i)
+		{
+			if (Voices[i].bStream) { StopVoiceAt(i); }
+		}
+	}
 	FVector3f Pos = Request.Pos;
 	const FGenObject* Obj = Logic && Request.Object != GenInvalidObjectID ? Logic->FindObject(Request.Object) : nullptr;
 	if (Obj)
@@ -616,6 +651,10 @@ uint32 UGenAudioManager::StartVoice(const FRequest& Request)
 	V.Pos = Pos;
 	V.Object = Request.Object;
 	V.Volume = Info.Volume * Random.FRandRange(1.f + FMath::Min(Info.VolumeShift, 0.f), 1.f); // "volume shifts are between 0 and 1"
+	if (const float* Override = ScriptEventVolumes.Find(Info.Name))
+	{
+		V.Volume = *Override; // addAudioEvent: "audioEvent->setVolume(it->second)"
+	}
 	V.Pitch = FMath::Clamp(Random.FRandRange(Info.PitchShiftMin, Info.PitchShiftMax), 0.1f, 4.f);
 	V.StartTime = Now;
 	V.bLoop = bLoop && LoopCount == 0;
@@ -960,7 +999,7 @@ void UGenAudioManager::Eva(const TCHAR* EventName)
 		return;
 	}
 	const FGenEvaEvent* Event = FGenAudioData::Get().FindEva(EventName);
-	if (!Event || Event->Priority <= 0 || !MapActor)
+	if (!Event || Event->Priority <= 0 || !MapActor || !bEvaEnabled)
 	{
 		return;
 	}
@@ -1076,8 +1115,9 @@ void UGenAudioManager::PlayMusic(const FString& Track)
 	MusicPlaying = Info->Name;
 	MusicComponent->SetSound(Wave);
 	// (A music track goes to the speakers as it is, each side at its own level: no gain to make up.)
-	MusicBaseVolume = Info->Volume * FGenAudioData::Get().GetSettings().DefaultMusicVolume;
-	MusicComponent->SetVolumeMultiplier(FMath::Max(MusicBaseVolume * UserVolumes.Master * UserVolumes.Music, 0.0001f));
+	const float* VolumeOverride = ScriptEventVolumes.Find(Info->Name);
+	MusicBaseVolume = (VolumeOverride ? *VolumeOverride : Info->Volume) * FGenAudioData::Get().GetSettings().DefaultMusicVolume;
+	MusicComponent->SetVolumeMultiplier(FMath::Max(MusicBaseVolume * ScriptMusicVolume * UserVolumes.Master * UserVolumes.Music, 0.0001f));
 	MusicComponent->Play();
 	UE_CLOG(bTrace, LogGenerals, Log, TEXT("  [audio f%u] music: %s (%s, %d Hz, %d channels)"), Logic ? Logic->GetFrame() : 0, *Info->Name, *Info->Filename,
 		int32(Wave->GetSampleRateForCurrentPlatform()), Wave->NumChannels);
@@ -1225,4 +1265,54 @@ bool UGenAudioManager::DumpDecoded(const FString& SoundOrPath, const FString& Ou
 	Out.Append(reinterpret_cast<const uint8*>("data"), 4); U32(DataBytes);
 	Out.Append(reinterpret_cast<const uint8*>(Pcm.Samples.GetData()), int32(DataBytes));
 	return FFileHelper::SaveArrayToFile(Out, *OutWavPath);
+}
+
+void UGenAudioManager::SetScriptEventVolume(const FString& Event, float Volume)
+{
+	if (Volume < 0.f)
+	{
+		ScriptEventVolumes.Remove(Event);
+		return;
+	}
+	ScriptEventVolumes.Add(Event, Volume);
+	// adjustVolumeOfPlayingAudio
+	for (FVoice& V : Voices)
+	{
+		if (V.Info && V.Info->Name.Equals(Event, ESearchCase::IgnoreCase))
+		{
+			V.Volume = Volume;
+		}
+	}
+	ApplyUserVolumes();
+}
+
+void UGenAudioManager::StopAllVoices()
+{
+	for (int32 i = Voices.Num() - 1; i >= 0; --i)
+	{
+		StopVoiceAt(i);
+	}
+}
+
+void UGenAudioManager::StopDisabledVoices()
+{
+	for (int32 i = Voices.Num() - 1; i >= 0; --i)
+	{
+		const float* Override = Voices[i].Info ? ScriptEventVolumes.Find(Voices[i].Info->Name) : nullptr;
+		if (Override && *Override <= 0.f)
+		{
+			StopVoiceAt(i);
+		}
+	}
+}
+
+void UGenAudioManager::PlayScriptTrack(const FString& Track)
+{
+	MusicPrefix.Reset();
+	LoopTrack.Reset();
+	if (FParse::Param(FCommandLine::Get(), TEXT("GenNoMusic")))
+	{
+		return;
+	}
+	PlayMusic(Track);
 }
